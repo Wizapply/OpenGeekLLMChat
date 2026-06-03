@@ -223,6 +223,18 @@ config.json から HTTPサーバーや llama-server の細かな設定を調整�
 - **DuckDB ロック調停**: 学習中は Node.js 側で CHECKPOINT + DB接続クローズ → Python が排他ロックで読み込み → 完了後自動再オープン
 - **派生列自動復元**: LLM が `date_year: 2026, date_month: 4, date_day: 20` のような派生列を直接渡しても、サーバー送信前に `date: "2026-04-20"` に自動修正
 
+### 🎮 強化学習 (RL) - オフライン学習 & リアルタイム外部API
+`/ml.html` の「🎮 強化学習」タブで、エージェント (方策) を学習・評価・運用できる。アルゴリズムは **DQN / Double DQN (DDQN) / CQL / Behavior Cloning (BC)** に対応 (価値ベース off-policy + オフラインRL/模倣学習)。
+
+- **オフラインRL (データテーブルから学習)**: DuckDB テーブルに記録した経験ログ (状態・行動・報酬・次状態・done) から方策を学習 (`rl_runner.py`)。遷移ベース (next_state あり) と contextual bandit (next_state なし) の両方に対応。`📈 学習曲線` で損失推移、`🔍 方策を評価` でログ行動との一致率・行動分布を確認。
+- **オンラインRL (リアルタイム/外部API)**: 常駐ワーカー (`rl_online_server.py`) がモデルをメモリ保持し、HTTP で `act` (推論) / `learn` (経験投入+即時勾配更新) をループ実行。外部プログラム (Python 等) から強化学習ループを回せる。学習済みエージェントを「ウォームスタート」してオンライン継続学習も可能。
+- **外部API の流れ**: `POST /ml/rl/online/create` (新規 spec / `fromAgent` でウォームスタート) → `POST /ml/rl/models/<name>/act` (state→action, `epsilon` で ε-greedy) → `/learn` (経験投入) → `/checkpoint` (保存)。認証は `Authorization: Bearer <token>` 方式 (権限 `ml:read` / `ml:write`)。
+  - 例: Windows PC 上の MuJoCo 倒立振子 (InvertedPendulum) を環境にして、**物理シミュレーションは手元・行動決定と学習はサーバ側API**に委譲する構成が可能 (act で離散行動を取得、learn で経験を投入)。
+- **UI の統一**: オフライン (📊) / オンライン (⚡) のエージェントカードは共通で `📈 学習曲線` `🔍 方策を評価` `⚡ オンライン操作/化` ボタンを持ち、クリックで右パネルが切り替わる同一の操作感。
+  - オンラインの `📈 学習曲線` = reward/loss EMA のライブ推移 (パネル表示中にサンプリング)、`🔍 方策を評価` = 状態を入力して act(ε=0) の Q値・推奨行動をバーで可視化。
+- **📝 操作ログ**: 評価・act・learn・チェックポイント・削除などの操作結果を、右パネル下部に時系列で常時表示。
+- **自動チェックポイント**: オンラインワーカーは 500ステップ または 60秒ごとに最新の重みを `ml/rl_models/<name>/` (`model.pt` / `config.json` / `metrics.json`) へ自動保存。サーバ再起動後は次回 `act` 時にディスクから自動再ロード。
+
 ### 🔧 外部API: ツール対応モード (エージェント機能)
 通常の外部APIは llama-server を直接公開する「素のLLM」モードですが、**ツール対応モード** ではWebチャットと同じツール群を外部プログラムからも使えます。
 
@@ -732,6 +744,9 @@ opengeek-llm-chat/
 ├── ml_runner.py                # 機械学習(ML)学習実行 (PyTorch MLP/LSTM)
 ├── ml_predict.py               # 機械学習(ML)推論実行 (subprocess単発)
 ├── ml_common.py                # 機械学習の共通前処理ロジック (学習・推論で共有)
+├── rl_runner.py                # 強化学習(RL)オフライン学習 (DuckDB→PyTorch DQN/DDQN/CQL/BC)
+├── rl_online_server.py         # 強化学習(RL)オンライン常駐ワーカー (act/learn HTTP API)
+├── rl_common.py                # 強化学習の共通ロジック (Qネット構築・状態エンコード・損失計算)
 ├── agent_proxy.js              # 外部API用ツール対応モード (OpenAI互換 + エージェントループ)
 ├── public/
 │   ├── index.html              # React SPA（チャットUI）
@@ -909,6 +924,9 @@ opengeek-llm-chat/
 | `imageModels[].vae` | VAEモデルの絶対パス（任意、品質向上） |
 | `imageModels[].extraArgs` | sd-server に渡す追加引数（例: `["--type", "f16"]`） |
 | `ml.enabled` | 機械学習機能 ON/OFF。`true` で `/ml.html` UI と LLMツール (ml_*) を有効化、要 `npm install duckdb` |
+| `ml.onlinePort` | 強化学習(RL)オンライン常駐ワーカー (`rl_online_server.py`) の localhost ポート、デフォルト 11600 |
+| `ml.onlineIdleMs` | オンラインワーカーのアイドル自動停止時間 (ms)、0 で常駐 (停止しない) |
+| `ml.onlineReadyTimeoutMs` | オンラインワーカー起動完了待ちタイムアウト、デフォルト 60000ms |
 | `ml.apiTokens[].name` | API トークンの名前 (識別用) |
 | `ml.apiTokens[].token` | トークン文字列 (推奨: ml.html の「📡 API」タブから生成) |
 | `ml.apiTokens[].permissions` | 権限配列。`"ml:read"` / `"ml:write"` / `"*"` |

@@ -2224,6 +2224,69 @@ function LossChart({ metrics, height = 200 }) {
   return <canvas ref={ref} style={{ width: '100%', height, display: 'block' }} />;
 }
 
+// ─── オンラインRL 用: 単系列のライブ折れ線グラフ (reward EMA / loss EMA の推移) ───
+function OnlineSeriesChart({ data, color = '#7c4dff', height = 110 }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    const cv = ref.current;
+    const arr = (data || []).filter(v => v != null && isFinite(v));
+    if (!cv || arr.length === 0) return;
+    const dpr = window.devicePixelRatio || 1;
+    const W = cv.clientWidth, H = height;
+    cv.width = W * dpr; cv.height = H * dpr;
+    const ctx = cv.getContext('2d'); ctx.scale(dpr, dpr); ctx.clearRect(0, 0, W, H);
+    const pad = { l: 56, r: 10, t: 10, b: 18 };
+    const plotW = W - pad.l - pad.r, plotH = H - pad.t - pad.b;
+    let yMin = Math.min(...arr), yMax = Math.max(...arr);
+    if (yMin === yMax) { yMax = yMax + 1; yMin = yMin - 1; }
+    const n = arr.length;
+    const x = i => pad.l + (n <= 1 ? 0 : (i / (n - 1)) * plotW);
+    const y = v => pad.t + plotH - ((v - yMin) / (yMax - yMin || 1)) * plotH;
+    const css = getComputedStyle(document.documentElement);
+    const cBorder = (css.getPropertyValue('--border') || '#2a2a3e').trim();
+    const cMuted = (css.getPropertyValue('--text-muted') || '#888').trim();
+    ctx.strokeStyle = cBorder; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pad.l, pad.t); ctx.lineTo(pad.l, pad.t + plotH); ctx.lineTo(pad.l + plotW, pad.t + plotH); ctx.stroke();
+    ctx.fillStyle = cMuted; ctx.font = '10px monospace'; ctx.textAlign = 'right';
+    for (let k = 0; k <= 3; k++) {
+      const v = yMin + (yMax - yMin) * k / 3, yy = y(v);
+      ctx.fillText(v.toFixed(2), pad.l - 5, yy + 3);
+      ctx.strokeStyle = 'rgba(128,128,128,0.12)';
+      ctx.beginPath(); ctx.moveTo(pad.l, yy); ctx.lineTo(pad.l + plotW, yy); ctx.stroke();
+    }
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+    arr.forEach((v, i) => { i === 0 ? ctx.moveTo(x(i), y(v)) : ctx.lineTo(x(i), y(v)); });
+    ctx.stroke();
+  }, [data, color, height]);
+  return <canvas ref={ref} style={{ width: '100%', height, display: 'block' }} />;
+}
+
+// ─── オンラインRL 用: act の Q値を行動ごとの横棒で可視化 (方策の評価) ───
+function QValueBars({ qValues, chosen }) {
+  const entries = Object.entries(qValues || {});
+  if (entries.length === 0) return null;
+  const vals = entries.map(([, v]) => v);
+  const min = Math.min(...vals), max = Math.max(...vals);
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div className="rl-panel-title" style={{ fontSize: 12 }}>Q値（各行動の推定価値・★が推奨）</div>
+      {entries.map(([k, v]) => {
+        const w = max === min ? 100 : ((v - min) / (max - min)) * 100;
+        const isChosen = String(k) === String(chosen);
+        return (
+          <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '3px 0', fontFamily: 'var(--font-mono)', fontSize: 11 }}>
+            <span style={{ width: 72, textAlign: 'right', color: isChosen ? 'var(--accent)' : 'var(--text-secondary)', fontWeight: isChosen ? 700 : 400 }}>{k}{isChosen ? ' ★' : ''}</span>
+            <div style={{ flex: 1, background: 'var(--border)', borderRadius: 6, height: 14 }}>
+              <div style={{ width: `${Math.max(2, w)}%`, height: '100%', borderRadius: 6, background: isChosen ? 'var(--accent)' : 'rgba(124,77,255,0.4)' }} />
+            </div>
+            <span style={{ width: 64, color: 'var(--text-muted)' }}>{v}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // オフラインRL のオフライン評価結果 (方策一致率・行動分布・推薦サンプル) を表示
 function DatasetEvalResult({ result }) {
   const labels = result.actionLabels || [];
@@ -2298,11 +2361,21 @@ function RLView({ showToast }) {
   // ⚡ オンライン学習
   const [onlineFor, setOnlineFor] = useState(null);     // オンラインパネル対象
   const [onlineStatus, setOnlineStatus] = useState(null);
+  const [onlineHist, setOnlineHist] = useState([]);     // [{step, loss, reward}] パネル表示中のEMA推移
+  const [evalOnline, setEvalOnline] = useState(false);  // 評価パネルがオンライン用か
+  const [onlineEvalResult, setOnlineEvalResult] = useState(null); // オンライン評価(act, ε=0)の結果
   const [actInput, setActInput] = useState('{}');       // act/learn 用 state(JSON)
   const [actResult, setActResult] = useState(null);
   const [learnInput, setLearnInput] = useState({ action: '', reward: '' });
   const [onlineBusy, setOnlineBusy] = useState(false);
   const logRef = useRef(null);
+  // ─── 操作ログ (act/learn/評価/削除/オンライン化 などの結果を時系列で表示) ───
+  const [opLog, setOpLog] = useState([]);
+  const opLogRef = useRef(null);
+  const appendLog = (msg) => {
+    const t = new Date().toLocaleTimeString();
+    setOpLog(prev => [...prev.slice(-300), `[${t}] ${msg}`]);
+  };
 
   useEffect(() => {
     loadAlgos();
@@ -2324,6 +2397,18 @@ function RLView({ showToast }) {
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [liveLog]);
+
+  useEffect(() => {
+    if (opLogRef.current) opLogRef.current.scrollTop = opLogRef.current.scrollHeight;
+  }, [opLog]);
+
+  // オンライン操作 or オンライン学習曲線パネル表示中は状態を定期取得して EMA 推移をサンプリング
+  useEffect(() => {
+    const liveName = onlineFor || (chartFor && chartFor.online ? chartFor.name : null);
+    if (!liveName) return;
+    const t = setInterval(() => refreshOnlineStatus(liveName), 3000);
+    return () => clearInterval(t);
+  }, [onlineFor, chartFor]);
 
   async function loadAlgos() {
     try {
@@ -2356,22 +2441,40 @@ function RLView({ showToast }) {
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
       showToast('キャンセルしました', 'success');
-    } catch (e) { showToast(`失敗: ${e.message}`, 'error'); }
+      appendLog('⏹ 学習をキャンセルしました');
+    } catch (e) { showToast(`失敗: ${e.message}`, 'error'); appendLog(`❌ キャンセル失敗: ${e.message}`); }
   }
 
-  async function showChart(name) {
-    setEvalResult(null); setEvalFor(null); setOnlineFor(null);
+  async function showChart(name, online) {
+    setEvalResult(null); setEvalFor(null); setOnlineFor(null); setOnlineEvalResult(null);
+    if (online) {
+      // オンライン: サーバに損失履歴が無いため、このセッションで取得した EMA 推移を表示
+      setOnlineHist([]);
+      setChartFor({ name, online: true });
+      appendLog(`📈 学習推移を表示(オンライン): ${name}`);
+      refreshOnlineStatus(name);
+      return;
+    }
     try {
       const r = await fetch(`/ml/rl/models/${encodeURIComponent(name)}/metrics`);
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
-      setChartFor({ name, metrics: d });
-    } catch (e) { showToast(`取得失敗: ${e.message}`, 'error'); }
+      setChartFor({ name, metrics: d, online: false });
+      appendLog(`📈 学習曲線を表示: ${name} (最終損失 ${d.finalLoss ?? '-'})`);
+    } catch (e) { showToast(`取得失敗: ${e.message}`, 'error'); appendLog(`❌ 学習曲線取得失敗: ${name} (${e.message})`); }
   }
 
-  async function runEval(name) {
+  async function runEval(name, online) {
+    setChartFor(null); setEvalResult(null); setOnlineFor(null); setOnlineEvalResult(null);
+    if (online) {
+      // オンライン: データセットが無いので、状態を与えて act(ε=0) のQ値で方策を確認する
+      setEvalOnline(true); setEvalFor(name);
+      appendLog(`🔍 方策を評価(オンライン)を開く: ${name}`);
+      return;
+    }
     if (running) { showToast('学習中は評価できません', 'error'); return; }
-    setChartFor(null); setEvalResult(null); setOnlineFor(null); setEvalFor(name); setEvaluating(true);
+    setEvalOnline(false); setEvalFor(name); setEvaluating(true);
+    appendLog(`🔍 評価開始: ${name} (5エピソード)`);
     try {
       const r = await fetch(`/ml/rl/models/${encodeURIComponent(name)}/eval`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -2380,8 +2483,26 @@ function RLView({ showToast }) {
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
       setEvalResult(d);
-    } catch (e) { showToast(`評価失敗: ${e.message}`, 'error'); setEvalFor(null); }
+      appendLog(`🔍 評価完了: ${name} · 方策一致率 ${Math.round((d.policyAgreement || 0) * 100)}% · ログ平均報酬 ${d.loggedMeanReward ?? '-'}`);
+    } catch (e) { showToast(`評価失敗: ${e.message}`, 'error'); appendLog(`❌ 評価失敗: ${name} (${e.message})`); setEvalFor(null); }
     finally { setEvaluating(false); }
+  }
+
+  // オンライン方策評価: 状態を1件与えて act(ε=0) のQ値・推奨行動を取得
+  async function doEvalAct() {
+    const state = parseActState(); if (state === null) return;
+    setOnlineBusy(true);
+    try {
+      const r = await fetch(`/ml/rl/models/${encodeURIComponent(evalFor)}/act`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ state, epsilon: 0 }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      setOnlineEvalResult(d);
+      appendLog(`🔍 act評価 ${evalFor}: action=${d.action} · Q={${Object.entries(d.qValues || {}).map(([k, v]) => `${k}:${v}`).join(', ')}}`);
+    } catch (e) { showToast(`評価失敗: ${e.message}`, 'error'); appendLog(`❌ act評価失敗: ${evalFor} (${e.message})`); }
+    finally { setOnlineBusy(false); }
   }
 
   async function deleteAgent(name) {
@@ -2391,6 +2512,7 @@ function RLView({ showToast }) {
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
       showToast('削除しました', 'success');
+      appendLog(`🗑 エージェント削除: ${name}`);
       if (chartFor && chartFor.name === name) setChartFor(null);
       if (evalFor === name) { setEvalResult(null); setEvalFor(null); }
       if (onlineFor === name) setOnlineFor(null);
@@ -2410,19 +2532,31 @@ function RLView({ showToast }) {
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
       showToast('オンライン化しました', 'success');
+      appendLog(`⚡ オンライン化(ウォームスタート読み込み): ${name}`);
       openOnline(name);
-    } catch (e) { showToast(`オンライン化失敗: ${e.message}`, 'error'); }
+    } catch (e) { showToast(`オンライン化失敗: ${e.message}`, 'error'); appendLog(`❌ オンライン化失敗: ${name} (${e.message})`); }
     finally { setOnlineBusy(false); }
   }
   function openOnline(name) {
     setChartFor(null); setEvalFor(null); setActResult(null);
+    setOnlineHist([]);
     setOnlineFor(name);
+    appendLog(`⚡ オンライン操作パネルを開く: ${name}`);
     refreshOnlineStatus(name);
   }
   async function refreshOnlineStatus(name) {
     try {
       const r = await fetch(`/ml/rl/models/${encodeURIComponent(name)}/online/status`);
-      setOnlineStatus(await r.json());
+      const d = await r.json();
+      setOnlineStatus(d);
+      // EMA 推移をサンプリング (totalSteps が進んだときだけ追加)
+      if (d && !d.error && d.totalSteps != null) {
+        setOnlineHist(prev => {
+          const last = prev[prev.length - 1];
+          if (last && last.step === d.totalSteps) return prev;
+          return [...prev.slice(-300), { step: d.totalSteps, loss: d.lossEMA, reward: d.rewardEMA }];
+        });
+      }
     } catch (e) { setOnlineStatus({ error: e.message }); }
   }
   function parseActState() {
@@ -2441,7 +2575,8 @@ function RLView({ showToast }) {
       if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
       setActResult(d);
       setLearnInput(li => ({ ...li, action: d.action }));
-    } catch (e) { showToast(`act失敗: ${e.message}`, 'error'); }
+      appendLog(`🎯 act ${onlineFor}: action=${d.action}${d.explored ? ' (探索)' : ''} · Q={${Object.entries(d.qValues || {}).map(([k, v]) => `${k}:${v}`).join(', ')}}`);
+    } catch (e) { showToast(`act失敗: ${e.message}`, 'error'); appendLog(`❌ act失敗: ${onlineFor} (${e.message})`); }
     finally { setOnlineBusy(false); }
   }
   async function doLearn() {
@@ -2458,8 +2593,9 @@ function RLView({ showToast }) {
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
       showToast(`学習しました (totalSteps=${d.totalSteps})`, 'success');
+      appendLog(`📥 learn ${onlineFor}: action=${learnInput.action}, reward=${reward} → loss=${d.loss ?? '-'}, totalSteps=${d.totalSteps ?? '-'}, buffer=${d.bufferSize ?? '-'}`);
       refreshOnlineStatus(onlineFor);
-    } catch (e) { showToast(`learn失敗: ${e.message}`, 'error'); }
+    } catch (e) { showToast(`learn失敗: ${e.message}`, 'error'); appendLog(`❌ learn失敗: ${onlineFor} (${e.message})`); }
     finally { setOnlineBusy(false); }
   }
   async function checkpointOnline() {
@@ -2469,7 +2605,8 @@ function RLView({ showToast }) {
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
       showToast('チェックポイントを保存しました', 'success');
-    } catch (e) { showToast(`保存失敗: ${e.message}`, 'error'); }
+      appendLog(`💾 チェックポイント保存: ${onlineFor} (totalSteps=${d.totalSteps ?? '-'})`);
+    } catch (e) { showToast(`保存失敗: ${e.message}`, 'error'); appendLog(`❌ チェックポイント保存失敗: ${onlineFor} (${e.message})`); }
     finally { setOnlineBusy(false); }
   }
 
@@ -2526,8 +2663,8 @@ function RLView({ showToast }) {
                 </div>
               )}
               <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
-                {!m.online && <button className="btn small" onClick={() => showChart(m.name)}>📈 学習曲線</button>}
-                {!m.online && <button className="btn small primary" onClick={() => runEval(m.name)} disabled={!!running || evaluating}>🔍 方策を評価</button>}
+                <button className="btn small" onClick={() => showChart(m.name, m.online)}>📈 学習曲線</button>
+                <button className="btn small primary" onClick={() => runEval(m.name, m.online)} disabled={!m.online && (!!running || evaluating)}>🔍 方策を評価</button>
                 {m.online
                   ? <button className="btn small primary" onClick={() => openOnline(m.name)}>⚡ オンライン操作</button>
                   : <button className="btn small" onClick={() => enableOnline(m.name)} disabled={onlineBusy}>⚡ オンライン化</button>}
@@ -2550,32 +2687,76 @@ function RLView({ showToast }) {
           {!running && chartFor && (
             <div className="rl-panel">
               <div className="rl-panel-title">
-                📈 学習曲線: {chartFor.name}
+                📈 {chartFor.online ? '学習推移（オンライン）' : '学習曲線'}: {chartFor.name}
                 <button className="btn small" style={{ float: 'right' }} onClick={() => setChartFor(null)}>✕ 閉じる</button>
               </div>
-              <LossChart metrics={chartFor.metrics} />
-              <div className="rl-chart-legend">
-                <span><span className="lg-line" style={{ background: 'var(--accent)' }}></span>{chartFor.metrics.lossName || '学習損失'} (エポック毎)</span>
-              </div>
-              <div className="rl-agent-meta" style={{ marginTop: 8 }}>
-                {RL_ALGO_SHORT[chartFor.metrics.algo] || chartFor.metrics.algo || 'DQN'} ·
-                方式 <b>{chartFor.metrics.datasetMode === 'transition' ? '遷移' : 'バンディット'}</b> ·
-                最終損失 <b>{chartFor.metrics.finalLoss}</b> ·
-                方策一致率 <b>{Math.round((chartFor.metrics.policyAgreement || 0) * 100)}%</b> ·
-                推定価値(平均maxQ) <b>{chartFor.metrics.meanQ}</b> ·
-                ログ平均報酬 {chartFor.metrics.loggedMeanReward} ·
-                {chartFor.metrics.nTransitions}件 · {chartFor.metrics.elapsedSec}秒
-              </div>
+              {chartFor.online ? (
+                onlineHist.length < 2 ? (
+                  <div className="empty-state" style={{ padding: 20, fontSize: 13 }}>
+                    学習が進むと reward / loss の推移が表示されます。<br />
+                    外部API（act/learn ループ）で学習中、または「⚡ オンライン操作」で learn を実行すると、totalSteps の増加に合わせて伸びていきます。
+                  </div>
+                ) : (
+                  <div>
+                    <div style={{ fontSize: 11, color: 'var(--text-secondary)', margin: '2px 0' }}>報酬EMA (reward EMA)</div>
+                    <OnlineSeriesChart data={onlineHist.map(h => h.reward)} color="#7c4dff" />
+                    <div style={{ fontSize: 11, color: 'var(--text-secondary)', margin: '6px 0 2px' }}>損失EMA (loss EMA)</div>
+                    <OnlineSeriesChart data={onlineHist.map(h => h.loss)} color="#ff9800" />
+                    <div className="rl-agent-meta" style={{ marginTop: 8 }}>
+                      totalSteps <b>{onlineStatus?.totalSteps ?? '-'}</b> · buffer <b>{onlineStatus?.bufferSize ?? '-'}</b> ·
+                      reward(EMA) <b>{onlineStatus?.rewardEMA ?? '-'}</b> · loss(EMA) <b>{onlineStatus?.lossEMA ?? '-'}</b>
+                    </div>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>
+                      ※ サーバは履歴を保存しないため、パネル表示中に取得した値の推移です（{onlineHist.length}点・3秒間隔）。
+                    </div>
+                  </div>
+                )
+              ) : (
+                <div>
+                  <LossChart metrics={chartFor.metrics} />
+                  <div className="rl-chart-legend">
+                    <span><span className="lg-line" style={{ background: 'var(--accent)' }}></span>{chartFor.metrics.lossName || '学習損失'} (エポック毎)</span>
+                  </div>
+                  <div className="rl-agent-meta" style={{ marginTop: 8 }}>
+                    {RL_ALGO_SHORT[chartFor.metrics.algo] || chartFor.metrics.algo || 'DQN'} ·
+                    方式 <b>{chartFor.metrics.datasetMode === 'transition' ? '遷移' : 'バンディット'}</b> ·
+                    最終損失 <b>{chartFor.metrics.finalLoss}</b> ·
+                    方策一致率 <b>{Math.round((chartFor.metrics.policyAgreement || 0) * 100)}%</b> ·
+                    推定価値(平均maxQ) <b>{chartFor.metrics.meanQ}</b> ·
+                    ログ平均報酬 {chartFor.metrics.loggedMeanReward} ·
+                    {chartFor.metrics.nTransitions}件 · {chartFor.metrics.elapsedSec}秒
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
           {!running && evalFor && (
             <div className="rl-panel">
               <div className="rl-panel-title">
-                🔍 方策評価: {evalFor}
-                <button className="btn small" style={{ float: 'right' }} onClick={() => { setEvalResult(null); setEvalFor(null); }}>✕ 閉じる</button>
+                🔍 方策評価: {evalFor}{evalOnline ? '（オンライン）' : ''}
+                <button className="btn small" style={{ float: 'right' }} onClick={() => { setEvalResult(null); setOnlineEvalResult(null); setEvalFor(null); }}>✕ 閉じる</button>
               </div>
-              {evaluating ? (
+              {evalOnline ? (
+                <div>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 4 }}>状態 (JSON, 例: {`{"hour":22,"segment":"C"}`})</div>
+                  <textarea className="textarea" value={actInput} onChange={e => setActInput(e.target.value)} rows={2}
+                    spellCheck="false" style={{ width: '100%', minHeight: 52 }} />
+                  <div className="toolbar" style={{ marginTop: 6 }}>
+                    <button className="btn small primary" onClick={doEvalAct} disabled={onlineBusy}>🔍 この状態を評価 (act ε=0)</button>
+                  </div>
+                  {onlineEvalResult ? (
+                    <div className="rl-agent-meta" style={{ marginTop: 8 }}>
+                      推奨行動: <b>{onlineEvalResult.action}</b>{onlineEvalResult.explored ? ' (探索)' : ''}
+                      <QValueBars qValues={onlineEvalResult.qValues} chosen={onlineEvalResult.action} />
+                    </div>
+                  ) : (
+                    <div className="empty-state" style={{ padding: 16, fontSize: 12 }}>
+                      状態を入力して「この状態を評価」を押すと、各行動のQ値（推定価値）と推奨行動が表示されます。
+                    </div>
+                  )}
+                </div>
+              ) : evaluating ? (
                 <div className="empty-state" style={{ padding: 24 }}>⏳ 評価を実行中...</div>
               ) : evalResult ? (
                 <DatasetEvalResult result={evalResult} />
@@ -2604,6 +2785,10 @@ function RLView({ showToast }) {
                 </div>
               ) : <div className="empty-state" style={{ padding: 16 }}>⏳ 取得中...</div>}
 
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', margin: '0 0 8px' }}>
+                📈 学習推移グラフ・🔍 Q値の評価は、上の「📈 学習曲線」「🔍 方策を評価」ボタンから開けます。
+              </div>
+
               <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 4 }}>状態 (JSON, 例: {`{"hour":22,"segment":"C"}`})</div>
               <textarea className="textarea" value={actInput} onChange={e => setActInput(e.target.value)} rows={2}
                 spellCheck="false" style={{ width: '100%', minHeight: 52 }} />
@@ -2613,8 +2798,8 @@ function RLView({ showToast }) {
               </div>
               {actResult && (
                 <div className="rl-agent-meta" style={{ marginTop: 6 }}>
-                  推奨行動: <b>{actResult.action}</b>{actResult.explored ? ' (探索)' : ''} ·
-                  Q値: {Object.entries(actResult.qValues || {}).map(([k, v]) => `${k}=${v}`).join(', ')}
+                  推奨行動: <b>{actResult.action}</b>{actResult.explored ? ' (探索)' : ''}
+                  <QValueBars qValues={actResult.qValues} chosen={actResult.action} />
                 </div>
               )}
               <div style={{ borderTop: '1px solid var(--border)', margin: '10px 0 8px' }}></div>
@@ -2664,6 +2849,16 @@ function RLView({ showToast }) {
               </div>
             </div>
           )}
+
+          {/* ─── 📝 操作ログ (常時表示・操作の結果を時系列で記録) ─── */}
+          <div className="rl-panel" style={{ marginTop: 12 }}>
+            <div className="rl-panel-title">📝 操作ログ
+              <button className="btn small" style={{ float: 'right' }} onClick={() => setOpLog([])}>クリア</button>
+            </div>
+            <pre ref={opLogRef} className="train-log rl-log" style={{ maxHeight: 200 }}>
+              {opLog.length ? opLog.join('\n') : '(ここに act / learn / 評価 / 学習曲線 / オンライン化 / 削除 などの操作結果が時系列で表示されます)'}
+            </pre>
+          </div>
         </div>
       </div>
 
