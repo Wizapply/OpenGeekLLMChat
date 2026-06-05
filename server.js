@@ -3157,6 +3157,231 @@ app.post('/config/restore', requireAuth, jsonParser, (req, res) => {
   }
 });
 
+// ─── HuggingFace GGUF モデルのダウンロード & セットアップ ───
+// huggingface.co の GGUF リンクを渡すと、モデルディレクトリにダウンロードして
+// config.json の chatModels に自動登録する（1ボタンセットアップ）。
+// 進捗は modelDownloadJob にキャッシュし、/config/model-download/status で取得。
+let modelDownloadJob = null;
+// { id, status:'downloading'|'done'|'error', phase, fileName, modelName,
+//   downloadedBytes, totalBytes, percent, error, addedModel, startedAt, finishedAt }
+
+// 新規モデルの保存先ディレクトリを決定（既存モデルと同じ場所を優先）
+function getModelsDir() {
+  const candidates = [];
+  for (const m of (appConfig.chatModels || [])) {
+    if (m && m.path) candidates.push(path.dirname(m.path));
+  }
+  if (appConfig.embeddingModel && appConfig.embeddingModel.path) {
+    candidates.push(path.dirname(appConfig.embeddingModel.path));
+  }
+  for (const d of candidates) {
+    try { if (fs.existsSync(d)) return d; } catch {}
+  }
+  const fallback = candidates[0] || path.join(__dirname, 'models');
+  try { fs.mkdirSync(fallback, { recursive: true }); } catch {}
+  return fallback;
+}
+
+// HuggingFace の blob URL を resolve（ダウンロード可能）URLに正規化
+function normalizeHfUrl(u) {
+  if (!u || typeof u !== 'string') return { error: 'URLが空です' };
+  let url;
+  try { url = new URL(u.trim()); } catch { return { error: 'URLの形式が不正です' }; }
+  if (url.protocol !== 'https:') return { error: 'https のURLを指定してください' };
+  if (url.hostname !== 'huggingface.co' && !url.hostname.endsWith('.huggingface.co')) {
+    return { error: 'huggingface.co のURLのみ対応しています' };
+  }
+  // /blob/ → /resolve/ （ブラウザのプレビューURLでも動くように）
+  url.pathname = url.pathname.replace('/blob/', '/resolve/');
+  return { url: url.toString() };
+}
+
+// host に応じた HTTP ヘッダ（認証トークンは huggingface.co 宛のみ送る）
+function hfRequestHeaders(urlStr, token) {
+  const h = { 'User-Agent': 'OpenGeekLLMChat-Downloader' };
+  try {
+    const host = new URL(urlStr).hostname;
+    if (token && host === 'huggingface.co') h['Authorization'] = `Bearer ${token}`;
+  } catch {}
+  return h;
+}
+
+// リダイレクト追従つきのファイルダウンロード（大容量GGUF対応・進捗コールバック）
+function downloadToFile(urlStr, destPath, opts, redirectCount) {
+  opts = opts || {};
+  redirectCount = redirectCount || 0;
+  return new Promise((resolve, reject) => {
+    if (redirectCount > 8) return reject(new Error('リダイレクトが多すぎます'));
+    const mod = urlStr.startsWith('https:') ? https : http;
+    const req = mod.get(urlStr, { headers: hfRequestHeaders(urlStr, opts.token) }, (res) => {
+      // リダイレクト（HF resolve → CDN署名URL等）
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        res.resume();
+        let next;
+        try { next = new URL(res.headers.location, urlStr).toString(); }
+        catch { return reject(new Error('リダイレクト先URLが不正です')); }
+        return resolve(downloadToFile(next, destPath, opts, redirectCount + 1));
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error(`HTTP ${res.statusCode}（ダウンロード先にアクセスできません。URL/権限を確認してください）`));
+      }
+      const total = parseInt(res.headers['content-length'] || '0', 10);
+      let downloaded = 0;
+      const tmpPath = destPath + '.part';
+      const out = fs.createWriteStream(tmpPath);
+      res.on('data', (chunk) => {
+        downloaded += chunk.length;
+        if (opts.onProgress) opts.onProgress(downloaded, total);
+      });
+      res.on('error', (e) => { out.destroy(); try { fs.unlinkSync(tmpPath); } catch {} reject(e); });
+      res.pipe(out);
+      out.on('finish', () => {
+        out.close(() => {
+          try { fs.renameSync(tmpPath, destPath); resolve({ total: total || downloaded, downloaded }); }
+          catch (e) { reject(e); }
+        });
+      });
+      out.on('error', (e) => { try { fs.unlinkSync(tmpPath); } catch {} reject(e); });
+    });
+    req.on('error', reject);
+    req.setTimeout(0); // 大容量ダウンロードのためソケットタイムアウト無効
+  });
+}
+
+// config.json の chatModels にモデルを追記（同名/同パスは上書き）し、バックアップも作成
+function addModelToConfig(info) {
+  const raw = fs.readFileSync(CONFIG_FILE, 'utf-8');
+  const cfg = JSON.parse(raw);
+  if (!Array.isArray(cfg.chatModels)) cfg.chatModels = [];
+  const ctx = Number.isFinite(info.ctx) && info.ctx > 0 ? info.ctx : 4096;
+  const ngl = Number.isFinite(info.ngl) ? info.ngl : 99;
+  const entry = {
+    name: info.name,
+    path: info.path,
+    ctx,
+    ngl,
+    extraArgs: info.mmprojPath ? ['--mmproj', info.mmprojPath] : [],
+  };
+  const existing = cfg.chatModels.find(m => m.name === entry.name || m.path === entry.path);
+  if (existing) {
+    Object.assign(existing, entry);
+  } else {
+    cfg.chatModels.push(entry);
+  }
+  // バックアップ（最新10件保持）
+  try {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    fs.copyFileSync(CONFIG_FILE, `${CONFIG_FILE}.bak.${ts}`);
+    const dir = path.dirname(CONFIG_FILE);
+    const base = path.basename(CONFIG_FILE);
+    fs.readdirSync(dir)
+      .filter(f => f.startsWith(`${base}.bak.`))
+      .map(f => ({ f, t: fs.statSync(path.join(dir, f)).mtimeMs }))
+      .sort((a, b) => b.t - a.t)
+      .slice(10)
+      .forEach(b => { try { fs.unlinkSync(path.join(dir, b.f)); } catch {} });
+  } catch {}
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
+  return entry;
+}
+
+// ダウンロード進捗の取得
+app.get('/config/model-download/status', requireAuth, (req, res) => {
+  res.json(modelDownloadJob || { status: 'idle' });
+});
+
+// ダウンロード開始（即座にjobIdを返し、ダウンロードはバックグラウンド実行）
+app.post('/config/model-download', requireAuth, jsonParser, (req, res) => {
+  const ip = getIP(req);
+  if (modelDownloadJob && modelDownloadJob.status === 'downloading') {
+    return res.status(409).json({ error: '既にダウンロード中のモデルがあります。完了までお待ちください。' });
+  }
+  const body = req.body || {};
+  const norm = normalizeHfUrl(body.url);
+  if (norm.error) return res.status(400).json({ error: norm.error });
+  const url = norm.url;
+  let fileName;
+  try { fileName = decodeURIComponent(path.basename(new URL(url).pathname)); }
+  catch { return res.status(400).json({ error: 'ファイル名を特定できませんでした' }); }
+  if (!/\.gguf$/i.test(fileName)) {
+    return res.status(400).json({ error: 'GGUFファイル(.gguf)のURLを指定してください' });
+  }
+
+  // mmproj（Vision用、任意）
+  let mmprojNorm = null, mmprojFile = null;
+  if (body.mmprojUrl && String(body.mmprojUrl).trim()) {
+    mmprojNorm = normalizeHfUrl(body.mmprojUrl);
+    if (mmprojNorm.error) return res.status(400).json({ error: 'mmproj: ' + mmprojNorm.error });
+    try { mmprojFile = decodeURIComponent(path.basename(new URL(mmprojNorm.url).pathname)); }
+    catch { return res.status(400).json({ error: 'mmproj: ファイル名を特定できませんでした' }); }
+  }
+
+  const modelsDir = getModelsDir();
+  const destPath = path.join(modelsDir, fileName);
+  const mmprojPath = mmprojFile ? path.join(modelsDir, mmprojFile) : null;
+  const modelName = (body.name && String(body.name).trim()) || fileName.replace(/\.gguf$/i, '');
+  const ctx = parseInt(body.ctx, 10);
+  const ngl = parseInt(body.ngl, 10);
+  const token = (body.hfToken && String(body.hfToken).trim()) || appConfig.hfToken || process.env.HF_TOKEN || '';
+
+  const job = {
+    id: Date.now().toString(36),
+    status: 'downloading',
+    phase: 'model',
+    fileName,
+    modelName,
+    modelsDir,
+    downloadedBytes: 0,
+    totalBytes: 0,
+    percent: 0,
+    error: null,
+    addedModel: null,
+    startedAt: Date.now(),
+    finishedAt: null,
+  };
+  modelDownloadJob = job;
+  log(ip, `MODEL DOWNLOAD START: ${modelName} <- ${url}`);
+  res.json({ ok: true, jobId: job.id, fileName, modelName, modelsDir });
+
+  // バックグラウンド実行
+  (async () => {
+    try {
+      const onProgress = (d, t) => {
+        job.downloadedBytes = d;
+        job.totalBytes = t;
+        job.percent = t ? Math.floor((d / t) * 100) : 0;
+      };
+      await downloadToFile(url, destPath, { token, onProgress });
+
+      if (mmprojNorm) {
+        job.phase = 'mmproj';
+        job.downloadedBytes = 0; job.totalBytes = 0; job.percent = 0;
+        await downloadToFile(mmprojNorm.url, mmprojPath, { token, onProgress });
+      }
+
+      job.phase = 'register';
+      const added = addModelToConfig({
+        name: modelName,
+        path: destPath,
+        ctx: Number.isFinite(ctx) ? ctx : undefined,
+        ngl: Number.isFinite(ngl) ? ngl : undefined,
+        mmprojPath,
+      });
+      job.addedModel = added;
+      job.status = 'done';
+      job.percent = 100;
+      job.finishedAt = Date.now();
+      log(ip, `MODEL DOWNLOAD DONE: ${modelName} (${fileName}) -> registered`);
+    } catch (e) {
+      job.status = 'error';
+      job.error = e.message;
+      job.finishedAt = Date.now();
+      log(ip, `MODEL DOWNLOAD FAILED: ${e.message}`);
+    }
+  })();
+});
+
 // ─── サーバー再起動 ───
 // systemd の Restart=always (または on-failure) に依存して、プロセスを終了 → 自動復活する方式。
 // 起動方法に応じた挙動:
@@ -6464,6 +6689,9 @@ server.listen(PORT, '0.0.0.0', async () => {
   // 起動時にGPUデータ取得
   await updateGpuData();
 
+  // 起動時に llama.cpp バージョンを1回取得（バックグラウンド、失敗しても起動は継続）
+  updateLlamaVersion();
+
   // 初期モデル名のみ決定（実際のロードは最初のリクエスト時）
   // 優先順位: 1) settings.json の前回モデル, 2) defaultModel, 3) chatModels[0]
   if (chatModels.length > 0) {
@@ -6498,7 +6726,60 @@ async function updateGpuData() {
   gpuUpdating = true;
   try { cachedGpuData = await queryGpu(); } finally { gpuUpdating = false; }
 }
+
+// ─── llama.cpp バージョン検出（起動時に1回だけ取得してキャッシュ） ───
+// llama-server --version の出力（stderr）例:
+//   version: 4589 (abc1234)
+//   built with cc (GCC) ... for x86_64-linux-gnu
+// バイナリは再起動まで変わらないので毎秒取る必要はなく、起動時に1回取得すれば十分。
+let cachedLlamaVersion = null; // { build, commit, raw } または null
+
+function detectLlamaVersion() {
+  return new Promise((resolve) => {
+    const ls = appConfig.llamaServer;
+    const binPath = ls && ls.binPath;
+    if (!binPath) { resolve(null); return; }
+    let out = '';
+    let done = false;
+    const finish = (val) => { if (!done) { done = true; resolve(val); } };
+    try {
+      const proc = spawn(binPath, ['--version'], { timeout: 5000 });
+      // --version は stderr に出力されることが多いが、念のため両方を見る
+      proc.stdout.on('data', (d) => { out += d.toString(); });
+      proc.stderr.on('data', (d) => { out += d.toString(); });
+      proc.on('error', () => finish(null));
+      proc.on('close', () => {
+        const m = out.match(/version:\s*(\d+)\s*(?:\(([0-9a-f]+)\))?/i);
+        if (m) {
+          finish({ build: m[1], commit: m[2] || '', raw: m[0].trim() });
+        } else {
+          // 念のため最初の非空行を生で保持
+          const line = out.split('\n').map(s => s.trim()).find(Boolean);
+          finish(line ? { build: '', commit: '', raw: line } : null);
+        }
+      });
+    } catch {
+      finish(null);
+    }
+  });
+}
+
+async function updateLlamaVersion() {
+  try {
+    cachedLlamaVersion = await detectLlamaVersion();
+    if (cachedLlamaVersion) {
+      log('-', `llama.cpp version: ${cachedLlamaVersion.raw}`);
+    }
+  } catch { /* 取得失敗時は null のまま */ }
+}
+
 function buildGpuSseData() {
-  return [{ label: 'localhost', host: '127.0.0.1', port: appConfig.llamaServer.chatPort, gpus: cachedGpuData }];
+  return [{
+    label: 'localhost',
+    host: '127.0.0.1',
+    port: appConfig.llamaServer.chatPort,
+    gpus: cachedGpuData,
+    llamaVersion: cachedLlamaVersion,
+  }];
 }
 setInterval(updateGpuData, GPU_INTERVAL);

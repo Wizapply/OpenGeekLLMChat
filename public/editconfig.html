@@ -45,6 +45,16 @@ function App() {
   const [restartInfo, setRestartInfo] = useState(null);  // {isSystemd, pid, uptime}
   const [restarting, setRestarting] = useState(false);   // 再起動中フラグ
   const [restartDone, setRestartDone] = useState(false); // 再起動完了(手動リロードボタン表示用)
+  // ─── HuggingFace GGUF モデルダウンロード ───
+  const [dlUrl, setDlUrl] = useState('');
+  const [dlName, setDlName] = useState('');
+  const [dlCtx, setDlCtx] = useState('');
+  const [dlNgl, setDlNgl] = useState('');
+  const [dlMmproj, setDlMmproj] = useState('');
+  const [dlToken, setDlToken] = useState('');
+  const [dlAdvanced, setDlAdvanced] = useState(false);
+  const [dlJob, setDlJob] = useState(null); // サーバーの進捗ジョブ
+  const dlPollRef = useRef(null);
   const textareaRef = useRef(null);
 
   // 認証チェック
@@ -68,6 +78,16 @@ function App() {
     loadConfig();
     loadBackups();
     loadRestartInfo();
+    // リロード時に進行中のダウンロードがあれば表示を復帰
+    (async () => {
+      try {
+        const data = await (await fetch('/config/model-download/status')).json();
+        if (data && data.status === 'downloading') {
+          setDlJob(data);
+          pollModelDownload();
+        }
+      } catch {}
+    })();
   }, [authenticated]);
 
   // テキスト変更時にJSON構文チェック
@@ -217,6 +237,67 @@ function App() {
     } finally { setSaving(false); }
   }
 
+  // ─── HuggingFace GGUF モデルのダウンロード & セットアップ ───
+  function formatBytes(n) {
+    if (!n || n <= 0) return '0 B';
+    const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(n) / Math.log(1024));
+    return `${(n / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${u[i]}`;
+  }
+
+  function pollModelDownload() {
+    if (dlPollRef.current) clearInterval(dlPollRef.current);
+    dlPollRef.current = setInterval(async () => {
+      try {
+        const r = await fetch('/config/model-download/status');
+        const data = await r.json();
+        setDlJob(data);
+        if (data.status === 'done' || data.status === 'error' || data.status === 'idle') {
+          clearInterval(dlPollRef.current);
+          dlPollRef.current = null;
+          if (data.status === 'done') {
+            setSuccess(`✓ モデル「${data.modelName}」をダウンロードして config.json に登録しました。本体を再起動すると使用できます。`);
+            setDlUrl(''); setDlName(''); setDlCtx(''); setDlNgl(''); setDlMmproj('');
+            await loadConfig();   // エディタに最新のconfig.jsonを反映
+            await loadBackups();
+          } else if (data.status === 'error') {
+            setError(`モデルのダウンロードに失敗しました: ${data.error || '不明なエラー'}`);
+          }
+        }
+      } catch (e) {
+        // ネットワーク一時エラーは無視して次のポーリングを待つ
+      }
+    }, 1000);
+  }
+
+  async function startModelDownload() {
+    if (!dlUrl.trim()) { setError('HuggingFace の GGUF URL を入力してください'); return; }
+    setError(''); setSuccess('');
+    try {
+      const r = await fetch('/config/model-download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: dlUrl.trim(),
+          name: dlName.trim() || undefined,
+          ctx: dlCtx ? parseInt(dlCtx, 10) : undefined,
+          ngl: dlNgl ? parseInt(dlNgl, 10) : undefined,
+          mmprojUrl: dlMmproj.trim() || undefined,
+          hfToken: dlToken.trim() || undefined,
+        }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || 'ダウンロード開始に失敗しました');
+      setDlJob({ status: 'downloading', phase: 'model', percent: 0, modelName: data.modelName, fileName: data.fileName });
+      pollModelDownload();
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
+  // アンマウント時にポーリング停止
+  useEffect(() => () => { if (dlPollRef.current) clearInterval(dlPollRef.current); }, []);
+
   function formatJson() {
     if (parseError) { setError('構文エラーがあるためフォーマットできません'); return; }
     try {
@@ -281,6 +362,7 @@ function App() {
         <div className="nav-links">
           <a className="nav-link" href="/">💬 チャット</a>
           <a className="nav-link" href="/tuning.html">🧠 ファインチューニング</a>
+          <a className="nav-link" href="/ml.html">🤖 機械学習</a>
         </div>
         <div className="sidebar-section">
           <div className="section-title">ファイル</div>
@@ -320,6 +402,70 @@ function App() {
               <div className="empty-hint" style={{ marginTop: 8 }}>クリックで復元</div>
             </div>
           )}
+
+          {/* ── HuggingFace GGUF モデル追加 ── */}
+          <div className="section-title" style={{ marginTop: 16 }}>モデル追加 (HuggingFace GGUF)</div>
+          <div className="model-dl">
+            <input
+              className="input model-dl-input"
+              type="text"
+              placeholder="https://huggingface.co/.../model.gguf"
+              value={dlUrl}
+              onChange={e => setDlUrl(e.target.value)}
+              disabled={dlJob && dlJob.status === 'downloading'}
+            />
+            <button
+              className="link-btn"
+              style={{ fontSize: 10, marginBottom: 8, alignSelf: 'flex-start' }}
+              onClick={() => setDlAdvanced(!dlAdvanced)}
+            >
+              {dlAdvanced ? '詳細を隠す' : '詳細オプション'}
+            </button>
+            {dlAdvanced && (
+              <div className="model-dl-advanced">
+                <input className="input model-dl-input" type="text" placeholder="表示名 (省略時はファイル名)"
+                  value={dlName} onChange={e => setDlName(e.target.value)} disabled={dlJob && dlJob.status === 'downloading'} />
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <input className="input model-dl-input" type="number" placeholder="ctx (例 8192)"
+                    value={dlCtx} onChange={e => setDlCtx(e.target.value)} disabled={dlJob && dlJob.status === 'downloading'} />
+                  <input className="input model-dl-input" type="number" placeholder="ngl (例 99)"
+                    value={dlNgl} onChange={e => setDlNgl(e.target.value)} disabled={dlJob && dlJob.status === 'downloading'} />
+                </div>
+                <input className="input model-dl-input" type="text" placeholder="mmproj URL (Vision用・任意)"
+                  value={dlMmproj} onChange={e => setDlMmproj(e.target.value)} disabled={dlJob && dlJob.status === 'downloading'} />
+                <input className="input model-dl-input" type="password" placeholder="HF トークン (非公開モデル用・任意)"
+                  value={dlToken} onChange={e => setDlToken(e.target.value)} disabled={dlJob && dlJob.status === 'downloading'} />
+              </div>
+            )}
+            <button
+              className="btn primary"
+              style={{ width: '100%', justifyContent: 'center' }}
+              onClick={startModelDownload}
+              disabled={(dlJob && dlJob.status === 'downloading') || !dlUrl.trim()}
+            >
+              {dlJob && dlJob.status === 'downloading' ? '⬇ ダウンロード中...' : '⬇ ダウンロード & 追加'}
+            </button>
+
+            {dlJob && dlJob.status === 'downloading' && (
+              <div className="model-dl-progress">
+                <div className="model-dl-progress-label">
+                  {dlJob.phase === 'mmproj' ? 'mmproj ダウンロード中' : dlJob.phase === 'register' ? 'config.json に登録中' : 'モデルダウンロード中'}
+                  {' '}{dlJob.percent || 0}%
+                </div>
+                <div className="model-dl-bar">
+                  <div className="model-dl-bar-fill" style={{ width: `${dlJob.percent || 0}%` }} />
+                </div>
+                {dlJob.totalBytes > 0 && (
+                  <div className="model-dl-progress-meta">
+                    {formatBytes(dlJob.downloadedBytes)} / {formatBytes(dlJob.totalBytes)}
+                  </div>
+                )}
+              </div>
+            )}
+            <div className="empty-hint" style={{ marginTop: 8 }}>
+              GGUF の「resolve」または「blob」URL に対応。登録後は本体を再起動すると選択できます。
+            </div>
+          </div>
         </div>
       </aside>
 

@@ -1770,6 +1770,23 @@ onClick={() => {
 チャット選択しても閉じない（PCではエリア固定）
 ```
 
+### サイドバー内パネルのドラッグリサイズ
+
+左サイドバーの **チャット履歴** と **ドキュメント** はそれぞれスクロール領域を持つが、固定の高さ配分（履歴 220px 固定）だと、履歴が多い/添付が多いユーザーで使い勝手が変わる。そこで境界に1本のリサイズハンドルを置き、ドラッグで配分を変えられるようにした。
+
+- **1ハンドルで両方を調整**: チャット履歴パネルの高さを state（インライン `height`）で制御し、ドキュメントパネルは `flex: 1` で残りを埋める。履歴を伸ばせばドキュメントが縮む、という相対調整が1本のハンドルで成立する（個別に2本置く必要がない）
+- **Pointer Events で実装**: `onPointerDown` → `window` に `pointermove`/`pointerup` を張る方式。`mouse`/`touch` を統一的に扱え、ハンドルには `touch-action: none` でスクロール干渉を防ぐ
+- **クランプ**: 高さは `max(120, min(startH + delta, window.innerHeight - 260))` に制限し、枠が潰れたり画面外へ出たりしないようにする
+- **永続化**: 確定値を `localStorage('chatHistoryHeight')` に保存。次回ロード時に復元するため、初期 state も localStorage から読む
+
+```javascript
+const onMove = (ev) => {
+  const delta = ev.clientY - startY;
+  const maxH = Math.max(160, window.innerHeight - 260);
+  setChatHistoryHeight(Math.max(120, Math.min(startH + delta, maxH)));
+};
+```
+
 ---
 
 ## ⚙️ 大きなリクエスト・並列制御・HTTP設定
@@ -2703,6 +2720,15 @@ gpu.power = amdVal(power.current_socket_power ?? power.socket_power ?? power.ave
 
 将来の `amd-smi` で名前が変わっても、新しい名前を `??` チェーンに追加するだけで対応可能。
 
+### llama.cpp バージョンの表示
+
+GPUモニタ上部に、稼働中の `llama-server` のビルド番号・コミットハッシュ（例: `b4589 (abc1234)`）をカード表示する。どのビルドで動いているかを UI から即確認できると、不具合報告・機能差分の切り分けに役立つ。
+
+- **取得タイミング**: 起動時（`server.listen` のコールバック）に `detectLlamaVersion()` を1回だけ実行してキャッシュ。バイナリは本体再起動まで変わらないため、毎秒取得する必要はない
+- **取得方法**: `spawn(binPath, ['--version'])` の出力（多くの環境で **stderr** に出る）を読み、`/version:\s*(\d+)\s*(?:\(([0-9a-f]+)\))?/` でビルド番号とコミットを抽出。マッチしなければ最初の非空行を生で保持するフォールバック
+- **配信**: 既存の GPU SSE（`buildGpuSseData()`）の host グループに `llamaVersion` フィールドを同梱して配信。新規エンドポイントを増やさず、フロントは `gpuData[].llamaVersion` を読むだけ
+- **失敗耐性**: 取得失敗時は `null` のままにし、フロントはカード自体を非表示（GPU未検出環境でも他の表示に影響しない）
+
 ---
 
 ## 🎨 CSS分離の設計
@@ -2856,10 +2882,49 @@ UX的に「設定」へのアクセスは目立ちすぎず・隠しすぎず難
 
 ホバー時の `animation: spin-slow 4s linear infinite;` で「クリック可能で何か起きそう」を視覚的に伝える。
 
+なお `tuning.html` / `ml.html` も同じ歯車「⚙ 設定」ボタンを持ち、`editconfig.html` へ遷移できる（スタイルは共通の `tuning-styles.css` の `.sidebar-settings-btn`）。各管理画面間のナビゲーションを統一する狙い。
+
+### HuggingFace GGUF モデルのワンボタン導入
+
+設定画面から「HuggingFace の GGUF リンク → ダウンロード → `chatModels` 登録」までを1ボタンで完結させる。SSH でモデルを `wget` して config.json を手で書く手間を、ブラウザ操作に置き換える。
+
+```
+[editconfig.html]
+   │  POST /config/model-download          ← { url, name?, ctx?, ngl?, mmprojUrl?, hfToken? }
+   │     → 即 jobId を返し、ダウンロードはバックグラウンド実行
+   │  GET  /config/model-download/status   ← 1秒間隔ポーリングで進捗取得
+   ▼
+[Express server: modelDownloadJob（単一ジョブ）]
+   │  1. normalizeHfUrl(): /blob/ → /resolve/ 変換、huggingface.co 限定
+   │  2. getModelsDir(): 既存モデルと同じフォルダを自動検出
+   │  3. downloadToFile(): リダイレクト追従 + 進捗コールバック、.part に書いて完了時 rename
+   │  4. (任意) mmproj も同様にダウンロード
+   │  5. addModelToConfig(): config.json をバックアップ後、chatModels に追記/上書き
+   ▼
+[フロント: 完了検知 → loadConfig() でエディタ更新 → 「本体を再起動」で反映]
+```
+
+#### 設計判断
+
+- **進捗はサーバー側 `modelDownloadJob` にキャッシュ、フロントはポーリング**: SSE でも実装できるが、GGUF は数GB単位で長時間かかるため「ページを再読込しても進捗を復帰できる」ことを優先。状態をサーバーに1つ持ち、`GET /status` で誰が見ても同じ進捗を返す方式にした。フロントは初期ロード時に `status` を見て `downloading` なら表示を復帰する
+- **同時実行は1件に制限**: 帯域とディスクの観点から、`downloading` 中の再投入は 409 を返す
+- **リダイレクト手動追従**: Node の `http/https.get` は 30x を自動追従しないため、`Location` を辿る再帰実装（最大8回）。HF の `resolve` は CDN（`cdn-lfs...`）の署名URLへリダイレクトする
+- **認証トークンはホスト限定**: `Authorization: Bearer` を付けるのは `huggingface.co` 宛のみ。CDN 署名URLにトークンを送らない（署名はクエリに含まれるため不要、かつ情報漏洩防止）
+- **`.part` → rename**: ダウンロード中は `xxx.gguf.part` に書き込み、`fs.renameSync` で確定。中断時に壊れた `.gguf` が残らない（同一FS内の rename はアトミック）
+- **保存先の自動決定 `getModelsDir()`**: `chatModels[].path` の dirname（実在する最初のもの）→ `embeddingModel.path` の dirname → なければ `<__dirname>/models`。既存モデルと同じ場所に揃え、無ければ `mkdir -p`
+- **登録は既存の保存ロジックを再利用**: `addModelToConfig()` も config.json バックアップ（最新10件保持）を行うため、`POST /config/raw` と一貫した安全性。同名/同パスのエントリは上書き（再ダウンロード時の重複を防ぐ）
+- **反映はあえて即時にしない**: 書き込むのは config.json のみで、稼働中の `chatModels`（メモリ）は触らない。既存の「設定変更は本体再起動で反映」というモデルに合わせ、ユーザーが明示的に「🔄 本体を再起動」するまで現行プロセスに影響を与えない
+
+#### 入力検証
+
+- `huggingface.co`（およびサブドメイン）以外のホストは拒否（任意URLからの取得＝SSRF・任意ファイル取得を防ぐ）
+- 拡張子 `.gguf` 必須。`https` 限定
+- ファイル名は URL パスの `basename` のみ採用（保存先は常に `getModelsDir()` 配下なのでパストラバーサル不可）
+
 ### セキュリティ考慮
 
 - **認証必須**: 全エンドポイント `requireAuth`、Cookie 共有
-- **入力検証**: JSON構文 + 必須キー + パストラバーサル対策
+- **入力検証**: JSON構文 + 必須キー + パストラバーサル対策。モデルDLは huggingface.co + `.gguf` 限定
 - **`password` ハッシュも表示される**: editconfig.html を見る = 実質admin。複数人運用時は別ロール検討
 - **再起動権限の集中**: 設定編集者 = サーバー再起動権限を持つ。これは意図的なシンプル設計
 
@@ -3290,6 +3355,16 @@ PostProcessDialog で量子化レベル選択時、モデル名からサイズ�
 ## 🤖 機械学習 (ML) 機能の設計
 
 `/ml.html` 配下で、データテーブル管理・SQL分析・PyTorch学習・推論を統合提供。LLM チャットからは5つのMLツール経由でも利用可能。
+
+### サイドバーの統計表示
+
+各タブの中身は別コンポーネント（`ModelTrainView` / `ImageTrainView` / `RLView`）が自分のデータを持つが、サイドバーには横断的な件数サマリを出したい。そこでトップの `App` が認証後に `loadStats()` を実行し、4エンドポイントを `Promise.all` で並列取得して件数だけを保持する。
+
+- 🧠 モデル数 = `/ml/models` の `models[]`
+- 🖼️ 画像データセット = `/ml/image/datasets` の `datasets[]` / 画像学習モデル = `/ml/image/custom-models` の `models[]`
+- 🎮 強化学習エージェント = `/ml/rl/models` の `models[]`
+
+各取得は `try/catch` で失敗を 0 に丸め、1つのエンドポイントが落ちても他の件数表示を止めない。重い処理ではないが、件数は概況把握用なので取得は画面表示時の1回（学習直後に即時更新したい場合はリロード）。
 
 ### 全体アーキテクチャ
 

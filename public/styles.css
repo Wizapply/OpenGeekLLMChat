@@ -522,11 +522,39 @@
 
   /* ── Chat History ── */
   .chat-history-panel {
-    border-bottom: 1px solid var(--border);
     display: flex;
     flex-direction: column;
-    max-height: 220px;
+    /* 高さは JS(state) からインラインで指定。ドラッグでリサイズ可能 */
     flex-shrink: 0;
+    min-height: 120px;
+    overflow: hidden;
+  }
+
+  /* チャット履歴とドキュメントの境界のリサイズハンドル */
+  .sidebar-resize-handle {
+    height: 8px;
+    flex-shrink: 0;
+    cursor: row-resize;
+    position: relative;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    touch-action: none;  /* タッチでのスクロール干渉を防ぐ */
+  }
+  .sidebar-resize-handle::before {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    width: 32px;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--border);
+    transition: background 0.15s;
+  }
+  .sidebar-resize-handle:hover::before,
+  .sidebar-resize-handle:active::before {
+    background: var(--accent);
   }
 
   .chat-history-header {
@@ -1280,6 +1308,39 @@
     font-size: 10px;
     color: var(--text-muted);
     margin-top: 6px;
+  }
+
+  .llama-version-card {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 8px 12px;
+    margin-bottom: 12px;
+  }
+
+  .llama-version-icon {
+    font-size: 14px;
+    line-height: 1;
+  }
+
+  .llama-version-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+  }
+
+  .llama-version-value {
+    margin-left: auto;
+    font-size: 12px;
+    font-weight: 500;
+    font-family: var(--font-mono);
+    color: var(--accent);
+    line-height: 1;
   }
 
   /* ── Chat Area ── */

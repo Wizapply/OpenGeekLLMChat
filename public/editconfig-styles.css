@@ -53,7 +53,7 @@ body {
 
 .app-layout {
   display: grid;
-  grid-template-columns: 260px minmax(0, 1fr);
+  grid-template-columns: 280px minmax(0, 1fr);
   height: 100vh;
   height: 100dvh;
 }
@@ -182,6 +182,50 @@ body {
   color: var(--text-muted);
   text-align: center;
   padding: 4px;
+}
+
+/* ── HuggingFace GGUF モデルダウンロード ── */
+.model-dl {
+  display: flex;
+  flex-direction: column;
+}
+.model-dl-input {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 12px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+}
+.model-dl-advanced {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 4px;
+}
+.model-dl-progress {
+  margin-top: 10px;
+}
+.model-dl-progress-label {
+  font-size: 11px;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+.model-dl-bar {
+  height: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.model-dl-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+.model-dl-progress-meta {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  margin-top: 4px;
 }
 
 /* ── メイン ── */

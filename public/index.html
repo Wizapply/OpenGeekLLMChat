@@ -736,6 +736,12 @@ function App() {
   const [chatDragActive, setChatDragActive] = useState(false);  // チャット欄D&D
   const [serverDragActive, setServerDragActive] = useState(false);  // サーバーファイルD&D
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  // チャット履歴パネルの高さ（ドラッグでリサイズ可能、localStorageに永続化）
+  const [chatHistoryHeight, setChatHistoryHeight] = useState(() => {
+    if (typeof window === 'undefined') return 220;
+    const saved = parseInt(window.localStorage.getItem('chatHistoryHeight'), 10);
+    return Number.isFinite(saved) && saved > 0 ? saved : 220;
+  });
   const [embeddingJobs, setEmbeddingJobs] = useState([]); // { name, current, total }
   const [gpuData, setGpuData] = useState([]);
   const [gpuPanelOpen, setGpuPanelOpen] = useState(false);
@@ -3175,6 +3181,38 @@ function App() {
     });
   }, [messages]);
 
+  // ─── サイドバー パネルのリサイズ ───
+  // チャット履歴パネルとドキュメントパネルの境界をドラッグして高さを調整。
+  // チャット履歴の高さを変えると、残りをドキュメントパネル(flex:1)が埋める。
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('chatHistoryHeight', String(chatHistoryHeight));
+    }
+  }, [chatHistoryHeight]);
+
+  const startHistoryResize = useCallback((e) => {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startH = chatHistoryHeight;
+    const onMove = (ev) => {
+      const delta = ev.clientY - startY;
+      // 上限はウィンドウ高からドキュメント枠等の最小確保分を引いた値
+      const maxH = Math.max(160, window.innerHeight - 260);
+      const h = Math.max(120, Math.min(startH + delta, maxH));
+      setChatHistoryHeight(h);
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+    };
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'row-resize';
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }, [chatHistoryHeight]);
+
   // ─── チャット履歴管理 ───
   async function loadChatList() {
     try {
@@ -4325,7 +4363,7 @@ ${conversationText}
         </div>
 
         {/* ── Chat History ── */}
-        <div className="chat-history-panel">
+        <div className="chat-history-panel" style={{ height: chatHistoryHeight }}>
           <div className="chat-history-header">
             <span className="chat-history-title">チャット履歴</span>
             <button className="new-chat-btn" onClick={() => { newChat(); if (window.innerWidth <= 768) setSidebarOpen(false); }}>+ 新規</button>
@@ -4371,6 +4409,15 @@ ${conversationText}
             )}
           </div>
         </div>
+
+        {/* ── リサイズハンドル（チャット履歴 / ドキュメントの境界） ── */}
+        <div
+          className="sidebar-resize-handle"
+          onPointerDown={startHistoryResize}
+          title="ドラッグして高さを調整"
+          role="separator"
+          aria-orientation="horizontal"
+        />
 
         {/* Server Files input (hidden, used by right sidebar button) */}
         <input
@@ -4897,6 +4944,20 @@ ${conversationText}
 
           {rightPanelTab === 'gpu' && (
             <>
+              {(() => {
+                const lv = gpuData.find(g => g.llamaVersion)?.llamaVersion;
+                if (!lv) return null;
+                const label = lv.build
+                  ? `b${lv.build}${lv.commit ? ` (${lv.commit})` : ''}`
+                  : lv.raw;
+                return (
+                  <div className="llama-version-card" title={lv.raw}>
+                    <span className="llama-version-icon">🦙</span>
+                    <span className="llama-version-label">llama.cpp</span>
+                    <span className="llama-version-value">{label}</span>
+                  </div>
+                );
+              })()}
               {tokenSpeed && (
                 <div className="inference-speed-card">
                   <div className="inference-speed-label">推論速度（直近平均）</div>
