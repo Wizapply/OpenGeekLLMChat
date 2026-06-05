@@ -697,6 +697,16 @@ function App() {
     topK: 40,
     topP: 0.9,
     temperature: 0.7,
+    // 繰り返し/思考ループ対策 (サーバーの /config 値で上書きされる)
+    repeatPenalty: 1.1,
+    repeatLastN: 320,
+    presencePenalty: 0,
+    frequencyPenalty: 0,
+    dryMultiplier: 0.8,
+    dryBase: 1.75,
+    dryAllowedLength: 2,
+    dryPenaltyLastN: -1,
+    chatMaxTokens: 8192,
     transcribe: { enabled: false },
   });
 
@@ -1192,6 +1202,17 @@ function App() {
         top_k: appConfig.topK,
         top_p: appConfig.topP,
         temperature: appConfig.temperature,
+        // 繰り返し/思考ループ対策 (Qwen3 等の thinking ループ防止)
+        repeat_penalty: appConfig.repeatPenalty,
+        repeat_last_n: appConfig.repeatLastN,
+        presence_penalty: appConfig.presencePenalty,
+        frequency_penalty: appConfig.frequencyPenalty,
+        dry_multiplier: appConfig.dryMultiplier,
+        dry_base: appConfig.dryBase,
+        dry_allowed_length: appConfig.dryAllowedLength,
+        dry_penalty_last_n: appConfig.dryPenaltyLastN,
+        // 暴走ループの安全網: 1応答あたりの最大トークン
+        max_tokens: appConfig.agentContext?.largePredict || appConfig.chatMaxTokens || 8192,
         // llama.cpp拡張: cache_promptで高速化
         cache_prompt: true,
       };
@@ -3636,10 +3657,19 @@ function App() {
       }
 
       const llamaOptions = {
-        max_tokens: appConfig.agentContext?.largePredict || 8192,
+        max_tokens: appConfig.agentContext?.largePredict || appConfig.chatMaxTokens || 8192,
         top_k: appConfig.topK,
         top_p: appConfig.topP,
         temperature: appConfig.temperature,
+        // 繰り返し/思考ループ対策
+        repeat_penalty: appConfig.repeatPenalty,
+        repeat_last_n: appConfig.repeatLastN,
+        presence_penalty: appConfig.presencePenalty,
+        frequency_penalty: appConfig.frequencyPenalty,
+        dry_multiplier: appConfig.dryMultiplier,
+        dry_base: appConfig.dryBase,
+        dry_allowed_length: appConfig.dryAllowedLength,
+        dry_penalty_last_n: appConfig.dryPenaltyLastN,
         cache_prompt: true,
       };
 

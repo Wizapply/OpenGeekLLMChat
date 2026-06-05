@@ -3715,6 +3715,123 @@ app.use('/ml', (req, res, next) => {
 
 ---
 
+## 🎮 強化学習 (RL) 機能の設計
+
+機械学習 (ML) が「教師あり学習 (回帰・分類・時系列)」だったのに対し、強化学習 (RL) は
+**「状態 → 行動 → 報酬」の経験から方策 (policy) を学習**する。アルゴリズムは
+価値ベース off-policy の **DQN / Double DQN (DDQN)**、オフラインRL の **CQL**、
+模倣学習の **Behavior Cloning (BC)** をサポートする。行動空間は**離散**を前提とする
+(連続制御を扱う場合は外部側で離散化する)。
+
+### 全体構成
+
+```
+                    server.js (Node.js / Express)
+                          │  /ml/rl/* エンドポイント (requireAuth + ml:read/ml:write)
+        ┌─────────────────┴───────────────────┐
+        │ オフライン (バッチ学習)               │ オンライン (リアルタイム)
+        ▼                                     ▼
+  rl_runner.py (subprocess)            rl_online_server.py (常駐ワーカー :11600)
+   DuckDB テーブル → 経験再生            メモリ常駐 Agent (qnet/target/optimizer)
+   → 学習 → model.pt / metrics.json     replay buffer + Welford 実行統計
+        │                                HTTP: /act /learn /checkpoint /load_offline
+        └──────────────┬──────────────────────┘
+                       ▼
+              rl_common.py (共通)
+   build_qnet / encode_state_dict / compute_loss
+   ※ オフラインとオンラインで前処理・損失の挙動を一致させる (乖離防止)
+```
+
+- **オフラインとオンラインで学習コードを共有**するため、Qネット構築・状態エンコード・
+  損失計算は `rl_common.py` に集約している。これにより「バッチ学習した方策」と
+  「オンラインで継続学習する方策」の挙動が乖離しない。
+
+### 共通モジュール (`rl_common.py`)
+
+| 関数 | 役割 |
+|---|---|
+| `build_qnet(torch, nn, state_dim, n_actions, hidden)` | 3層 MLP の Qネットワーク (Linear→ReLU→Linear→ReLU→Linear)。オフライン/オンライン同一構造 |
+| `encode_state_dict(state, meta, np)` | 状態辞書 → 数値ベクトル。カテゴリ列は index 化 (未知値→0)、数値列は float 化し、`(vec - mean) / scale` で正規化 |
+| `compute_loss(algo, mode, ...)` | 1ミニバッチの損失。DQN/DDQN は Bellman 誤差 (smooth L1)、CQL は + 保守正則化項、BC は cross entropy |
+
+- **正規化の (mean, scale)** は 2 経路: オフラインは学習時の StandardScaler (`scalerMean/scalerScale`)、
+  オンラインは Welford のオンライン実行統計 (`runningMean/runningM2/runningCount`) から算出。
+  どちらも `_mean_scale_from_meta` が吸収する。
+- **mode**: `transition` (γで先読み、next_state 使用) と `bandit` (1ステップ報酬のみ) の2系統。
+
+### オフラインRL (`rl_runner.py`)
+
+1. server.js が `POST /ml/rl/train` を受け、`ml/rl_models/<name>/_run_config.json` に設定を書き出し
+   `rl_runner.py` を subprocess 起動。
+2. DuckDB テーブルから 状態/行動/報酬/次状態/done 列を読み、経験再生バッファを構築。
+3. N エピソード学習し、`RESULT_JSON:{...}` を stdout に出力 (Node 側がパース)。
+4. 成果物: `model.pt` / `config.json` / `metrics.json` (`lossHistory`、方策一致率 `policyAgreement`、
+   推定価値 `meanQ`、ログ平均報酬など)。
+5. UI の `📈 学習曲線` は `metrics.lossHistory` を、`🔍 方策を評価` は `POST /ml/rl/models/<name>/eval`
+   (ログ行動 vs 学習方策の一致率・行動分布) を表示。
+
+### オンラインRL (`rl_online_server.py`)
+
+llama-server / sd-server と同じく**遅延起動・常駐**するワーカー。`ml.onlinePort` (デフォルト 11600) で
+localhost HTTP を待ち受け、server.js が `rlWorkerRequest()` でプロキシする。
+
+- **メモリ常駐 Agent**: Qネット・ターゲットネット・optimizer・replay buffer (deque) ・
+  Welford 実行統計を保持。`AGENTS[name]` レジストリで管理。
+- **エンドポイント**: `/create` (spec から新規) / `/load_offline` (学習済みをウォームスタート) /
+  `/act` (推論, ε-greedy) / `/learn` (経験投入 + 勾配更新) / `/checkpoint` / `/status` / `/unload`。
+- **学習の流れ (`/learn`)**: 経験を buffer に追加し、`len(buffer) >= batch_size` になったら
+  1 呼び出しあたり最大 `MAX_GRAD_STEPS_PER_CALL` (=16) 回の勾配ステップ。
+  `total_steps % target_update == 0` でターゲットネットを同期。loss/reward は EMA で保持。
+- **自動チェックポイント**: `dirty` かつ「500 ステップ経過 or 60 秒経過」で `model.pt` /
+  `config.json` / `metrics.json` を保存。**ディスク上のモデルは常に“最新の重み”に上書きされる**点が重要。
+- **自動再水和**: `get_agent(name, auto_load=True)` は、メモリに無ければ `model.pt` + `config.json`
+  からエージェントを自動ロードする。よってサーバ再起動後の最初の `/act` でも復旧する。
+
+> **設計上の含意**: 「常駐メモリ + 最新重みの自動上書き」のため、DQN が方策崩壊
+> (catastrophic forgetting) を起こした状態まで学習を続けると、ディスク上の良いモデルも
+> 上書きされてしまう。**ピークの方策を残したい場合は、早期終了して学習を止める**運用が要る
+> (このトレードオフは意図的。履歴保存や best-model 保持は現状サーバ側に持たせていない)。
+
+### HTTP エンドポイントと認証
+
+`/ml/rl/*` はすべて `requireAuth` + `requirePermission('ml:read' | 'ml:write')`。
+Cookie セッション (全権限) か `Authorization: Bearer <token>` (トークンの権限配列でチェック)。
+
+| メソッド/パス | 用途 | 権限 |
+|---|---|---|
+| `GET /ml/rl/envs` | アルゴ/環境メタ | ml:read |
+| `POST /ml/rl/train` `…/status` `…/cancel` | オフライン学習 | ml:write / ml:read |
+| `GET /ml/rl/models` `…/:name/metrics` | 一覧・メトリクス | ml:read |
+| `POST /ml/rl/online/create` | 作成 / ウォームスタート | ml:write |
+| `POST /ml/rl/models/:name/act` | 推論 (state→action) | ml:read |
+| `POST /ml/rl/models/:name/learn` | 経験投入 + 更新 | ml:write |
+| `POST /ml/rl/models/:name/checkpoint` | 保存 | ml:write |
+| `GET /ml/rl/models/:name/online/status` | オンライン状況 | ml:read |
+
+### UI 設計 (`public/ml.html` 「🎮 強化学習」タブ)
+
+- **ボタン構成の統一**: オフライン (📊) / オンライン (⚡) のエージェントカードは共通で
+  `📈 学習曲線` `🔍 方策を評価` `⚡ オンライン操作/化` を持ち、クリックで右パネルが
+  切り替わる (`chartFor` / `evalFor` / `onlineFor` の排他表示) 同一の遷移にしている。
+- **オンラインの 📈 学習曲線**: サーバは損失履歴配列を持たないため、パネル表示中に
+  3秒間隔で `online/status` を取得し `rewardEMA` / `lossEMA` をブラウザ側に蓄積 (`onlineHist`)、
+  `OnlineSeriesChart` (canvas) で描画する**クライアント側セッション履歴**方式。
+- **オンラインの 🔍 方策を評価**: データセットが無いため、状態を入力して `act(ε=0)` を呼び、
+  各行動の Q値を `QValueBars` (横棒) で可視化し推奨行動 (★) を強調する。
+- **📝 操作ログ**: act/learn/評価/チェックポイント/削除などの結果を、各APIの返り値から
+  ログ行を組み立てて右パネル下部に時系列表示 (`opLog`)。サーバ側ログAPIは追加していない。
+
+### 主要な設計判断
+
+- **行動は離散のみ**: DQN 系は離散行動前提。連続制御 (例: MuJoCo の倒立振子の力) を扱うときは
+  **外部クライアント側で力を離散ビンに変換**して `actionLabels` に対応づける。
+- **オフライン/オンラインで `rl_common.py` を共有**: 前処理・損失の挙動差をなくし、
+  ウォームスタート (オフライン→オンライン継続学習) を成立させる。
+- **DuckDB はオンラインでは不使用**: オンラインは経験を API で受けるため、ML DB の
+  release/reacquire 調停 (オフライン学習で必要) は不要。
+
+---
+
 ## 🔧 外部API: ツール対応モード (agent_proxy.js)
 
 通常の外部APIは llama-server を別ポートで直接公開する「素のLLM」モードだが、ツール対応モードでは **server.js 内に専用の Express サーバーを別ポートで立てて**、Webチャットと同じツール群を外部から使えるようにする。実装は `agent_proxy.js` に集約。

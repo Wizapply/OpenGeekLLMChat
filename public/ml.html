@@ -167,10 +167,11 @@ function App() {
         </header>
         <div className="tab-bar">
           <button className={`tab ${activeTab === 'tables' ? 'active' : ''}`} onClick={() => setActiveTab('tables')}>🗂️ データテーブル</button>
-          <button className={`tab ${activeTab === 'query' ? 'active' : ''}`} onClick={() => setActiveTab('query')}>🔍 SQL クエリ</button>
-          <button className={`tab ${activeTab === 'models' ? 'active' : ''}`} onClick={() => setActiveTab('models')}>🧠 モデル (学習)</button>
-          <button className={`tab ${activeTab === 'imagetrain' ? 'active' : ''}`} onClick={() => setActiveTab('imagetrain')}>🖼️ 画像 (検出・学習)</button>
-          <button className={`tab ${activeTab === 'api' ? 'active' : ''}`} onClick={() => setActiveTab('api')}>📡 API (外部連携)</button>
+          <button className={`tab ${activeTab === 'models' ? 'active' : ''}`} onClick={() => setActiveTab('models')}>🧠 モデル学習</button>
+          <button className={`tab ${activeTab === 'imagetrain' ? 'active' : ''}`} onClick={() => setActiveTab('imagetrain')}>🖼️ 画像学習</button>
+          <button className={`tab ${activeTab === 'rl' ? 'active' : ''}`} onClick={() => setActiveTab('rl')}>🎮 強化学習</button>
+          <button className={`tab ${activeTab === 'api' ? 'active' : ''}`} onClick={() => setActiveTab('api')}>📡 API(外部連携)</button>
+          <button className={`tab ${activeTab === 'query' ? 'active' : ''}`} onClick={() => setActiveTab('query')}>🔍 SQLクエリ</button>
         </div>
         <div className="main-body">
           {!duckdbAvailable && (
@@ -244,6 +245,9 @@ function App() {
           )}
           {activeTab === 'imagetrain' && (
             <ImageTrainView showToast={showToast} />
+          )}
+          {activeTab === 'rl' && (
+            <RLView showToast={showToast} />
           )}
           {activeTab === 'api' && (
             <ApiUsageView showToast={showToast} />
@@ -2175,6 +2179,882 @@ function ModelEditDialog({ tables, initial, onClose, onDone, showToast }) {
   );
 }
 
+// ─── 🎮 強化学習 (RL) ビュー ───
+// データテーブルのログ済み経験データからオフラインRL (DQN / Double DQN / CQL / BC) で
+// エージェントを学習し、損失曲線・オフライン方策評価・推論(推奨行動)までを行う。
+const RL_ALGO_SHORT = { dqn: 'DQN', ddqn: 'Double DQN', cql: 'CQL', bc: 'BC' };
+
+// オフラインRL の学習損失曲線を canvas に描画
+function LossChart({ metrics, height = 200 }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    const cv = ref.current;
+    const loss = (metrics && metrics.lossHistory) || [];
+    if (!cv || loss.length === 0) return;
+    const dpr = window.devicePixelRatio || 1;
+    const W = cv.clientWidth, H = height;
+    cv.width = W * dpr; cv.height = H * dpr;
+    const ctx = cv.getContext('2d'); ctx.scale(dpr, dpr); ctx.clearRect(0, 0, W, H);
+    const pad = { l: 56, r: 10, t: 12, b: 24 };
+    const plotW = W - pad.l - pad.r, plotH = H - pad.t - pad.b;
+    let yMin = Math.min(...loss), yMax = Math.max(...loss);
+    if (yMin === yMax) { yMin = 0; yMax = yMax || 1; } else { yMin = Math.min(yMin, 0); }
+    const n = loss.length;
+    const x = i => pad.l + (n <= 1 ? 0 : (i / (n - 1)) * plotW);
+    const y = v => pad.t + plotH - ((v - yMin) / (yMax - yMin || 1)) * plotH;
+    const css = getComputedStyle(document.documentElement);
+    const cBorder = (css.getPropertyValue('--border') || '#2a2a3e').trim();
+    const cAccent = (css.getPropertyValue('--accent') || '#7c4dff').trim();
+    const cMuted = (css.getPropertyValue('--text-muted') || '#888').trim();
+    ctx.strokeStyle = cBorder; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pad.l, pad.t); ctx.lineTo(pad.l, pad.t + plotH); ctx.lineTo(pad.l + plotW, pad.t + plotH); ctx.stroke();
+    ctx.fillStyle = cMuted; ctx.font = '10px monospace'; ctx.textAlign = 'right';
+    for (let k = 0; k <= 4; k++) {
+      const v = yMin + (yMax - yMin) * k / 4, yy = y(v);
+      ctx.fillText(v.toFixed(3), pad.l - 5, yy + 3);
+      ctx.strokeStyle = 'rgba(128,128,128,0.12)';
+      ctx.beginPath(); ctx.moveTo(pad.l, yy); ctx.lineTo(pad.l + plotW, yy); ctx.stroke();
+    }
+    ctx.textAlign = 'center'; ctx.fillStyle = cMuted;
+    ctx.fillText('エポック', pad.l + plotW / 2, pad.t + plotH + 14);
+    ctx.strokeStyle = cAccent; ctx.lineWidth = 2; ctx.beginPath();
+    loss.forEach((v, i) => { i === 0 ? ctx.moveTo(x(i), y(v)) : ctx.lineTo(x(i), y(v)); });
+    ctx.stroke();
+  }, [metrics, height]);
+  return <canvas ref={ref} style={{ width: '100%', height, display: 'block' }} />;
+}
+
+// ─── オンラインRL 用: 単系列のライブ折れ線グラフ (reward EMA / loss EMA の推移) ───
+function OnlineSeriesChart({ data, color = '#7c4dff', height = 110 }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    const cv = ref.current;
+    const arr = (data || []).filter(v => v != null && isFinite(v));
+    if (!cv || arr.length === 0) return;
+    const dpr = window.devicePixelRatio || 1;
+    const W = cv.clientWidth, H = height;
+    cv.width = W * dpr; cv.height = H * dpr;
+    const ctx = cv.getContext('2d'); ctx.scale(dpr, dpr); ctx.clearRect(0, 0, W, H);
+    const pad = { l: 56, r: 10, t: 10, b: 18 };
+    const plotW = W - pad.l - pad.r, plotH = H - pad.t - pad.b;
+    let yMin = Math.min(...arr), yMax = Math.max(...arr);
+    if (yMin === yMax) { yMax = yMax + 1; yMin = yMin - 1; }
+    const n = arr.length;
+    const x = i => pad.l + (n <= 1 ? 0 : (i / (n - 1)) * plotW);
+    const y = v => pad.t + plotH - ((v - yMin) / (yMax - yMin || 1)) * plotH;
+    const css = getComputedStyle(document.documentElement);
+    const cBorder = (css.getPropertyValue('--border') || '#2a2a3e').trim();
+    const cMuted = (css.getPropertyValue('--text-muted') || '#888').trim();
+    ctx.strokeStyle = cBorder; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pad.l, pad.t); ctx.lineTo(pad.l, pad.t + plotH); ctx.lineTo(pad.l + plotW, pad.t + plotH); ctx.stroke();
+    ctx.fillStyle = cMuted; ctx.font = '10px monospace'; ctx.textAlign = 'right';
+    for (let k = 0; k <= 3; k++) {
+      const v = yMin + (yMax - yMin) * k / 3, yy = y(v);
+      ctx.fillText(v.toFixed(2), pad.l - 5, yy + 3);
+      ctx.strokeStyle = 'rgba(128,128,128,0.12)';
+      ctx.beginPath(); ctx.moveTo(pad.l, yy); ctx.lineTo(pad.l + plotW, yy); ctx.stroke();
+    }
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+    arr.forEach((v, i) => { i === 0 ? ctx.moveTo(x(i), y(v)) : ctx.lineTo(x(i), y(v)); });
+    ctx.stroke();
+  }, [data, color, height]);
+  return <canvas ref={ref} style={{ width: '100%', height, display: 'block' }} />;
+}
+
+// ─── オンラインRL 用: act の Q値を行動ごとの横棒で可視化 (方策の評価) ───
+function QValueBars({ qValues, chosen }) {
+  const entries = Object.entries(qValues || {});
+  if (entries.length === 0) return null;
+  const vals = entries.map(([, v]) => v);
+  const min = Math.min(...vals), max = Math.max(...vals);
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div className="rl-panel-title" style={{ fontSize: 12 }}>Q値（各行動の推定価値・★が推奨）</div>
+      {entries.map(([k, v]) => {
+        const w = max === min ? 100 : ((v - min) / (max - min)) * 100;
+        const isChosen = String(k) === String(chosen);
+        return (
+          <div key={k} style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '3px 0', fontFamily: 'var(--font-mono)', fontSize: 11 }}>
+            <span style={{ width: 72, textAlign: 'right', color: isChosen ? 'var(--accent)' : 'var(--text-secondary)', fontWeight: isChosen ? 700 : 400 }}>{k}{isChosen ? ' ★' : ''}</span>
+            <div style={{ flex: 1, background: 'var(--border)', borderRadius: 6, height: 14 }}>
+              <div style={{ width: `${Math.max(2, w)}%`, height: '100%', borderRadius: 6, background: isChosen ? 'var(--accent)' : 'rgba(124,77,255,0.4)' }} />
+            </div>
+            <span style={{ width: 64, color: 'var(--text-muted)' }}>{v}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// オフラインRL のオフライン評価結果 (方策一致率・行動分布・推薦サンプル) を表示
+function DatasetEvalResult({ result }) {
+  const labels = result.actionLabels || [];
+  const maxCount = Math.max(1, ...labels.map(l => Math.max(result.loggedActionDist?.[l] || 0, result.policyActionDist?.[l] || 0)));
+  return (
+    <div>
+      <div className="rl-eval-stats">
+        <div className="rl-stat"><div className="rl-stat-v">{Math.round((result.policyAgreement || 0) * 100)}%</div><div className="rl-stat-l">方策一致率<br />(ログ行動と)</div></div>
+        <div className="rl-stat"><div className="rl-stat-v">{result.meanQ}</div><div className="rl-stat-l">推定価値<br />(平均maxQ)</div></div>
+        <div className="rl-stat"><div className="rl-stat-v">{result.loggedMeanReward}</div><div className="rl-stat-l">ログ<br />平均報酬</div></div>
+        <div className="rl-stat"><div className="rl-stat-v" style={{ color: 'var(--accent)' }}>{result.rewardWhenFollowed ?? '—'}</div><div className="rl-stat-l">推奨一致時<br />平均報酬</div></div>
+      </div>
+      <div className="rl-agent-meta" style={{ margin: '4px 0 10px' }}>
+        {result.datasetMode === 'transition' ? '遷移ベース' : 'バンディット'} · {result.nRows}行で評価。
+        「推奨一致時平均報酬」が「ログ平均報酬」より高ければ、学習した方策の方が良い選択をしています。
+      </div>
+      <div className="rl-panel-title" style={{ fontSize: 12 }}>行動の分布 (ログ vs 学習方策)</div>
+      <div className="rl-dist">
+        {labels.map(l => (
+          <div key={l} className="rl-dist-row">
+            <div className="rl-dist-label">{l}</div>
+            <div className="rl-dist-bars">
+              <div className="rl-dist-bar"><div className="rl-bar logged" style={{ width: `${(result.loggedActionDist?.[l] || 0) / maxCount * 100}%` }}></div><span>{result.loggedActionDist?.[l] || 0}</span></div>
+              <div className="rl-dist-bar"><div className="rl-bar policy" style={{ width: `${(result.policyActionDist?.[l] || 0) / maxCount * 100}%` }}></div><span>{result.policyActionDist?.[l] || 0}</span></div>
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="rl-chart-legend" style={{ marginTop: 4 }}>
+        <span><span className="lg-line" style={{ background: 'rgba(124,77,255,0.4)' }}></span>ログ(実績)</span>
+        <span><span className="lg-line" style={{ background: 'var(--accent)' }}></span>学習方策(推奨)</span>
+      </div>
+      <div className="rl-panel-title" style={{ fontSize: 12, marginTop: 12 }}>推薦サンプル (先頭{(result.samples || []).length}件)</div>
+      <div className="rl-sample-wrap">
+        <table className="rl-sample-table">
+          <thead><tr><th>状態</th><th>実績</th><th>推奨</th><th>報酬</th></tr></thead>
+          <tbody>
+            {(result.samples || []).map((s, i) => {
+              const changed = s.loggedAction !== s.recommendedAction;
+              return (
+                <tr key={i}>
+                  <td>{Object.entries(s.state).map(([k, v]) => `${k}=${v}`).join(', ')}</td>
+                  <td>{s.loggedAction}</td>
+                  <td style={{ color: changed ? 'var(--accent)' : 'inherit', fontWeight: changed ? 600 : 400 }}>
+                    {s.recommendedAction}{changed ? ' ↗' : ''}
+                  </td>
+                  <td style={{ fontFamily: 'var(--font-mono)' }}>{s.reward}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function RLView({ showToast }) {
+  const [algos, setAlgos] = useState([]);
+  const [models, setModels] = useState([]);
+  const [running, setRunning] = useState(null);   // { jobId, name }
+  const [liveLog, setLiveLog] = useState('');
+  const [recentJobs, setRecentJobs] = useState([]);
+  const [showTrain, setShowTrain] = useState(false);  // 学習ダイアログ表示
+  // テーブル一覧 (学習ダイアログへ渡す)
+  const [tables, setTables] = useState([]);
+  // 学習曲線 / 評価
+  const [chartFor, setChartFor] = useState(null);   // { name, metrics }
+  const [evalResult, setEvalResult] = useState(null); // eval API 結果
+  const [evalFor, setEvalFor] = useState(null);     // 評価対象エージェント名
+  const [evaluating, setEvaluating] = useState(false);
+  // ⚡ オンライン学習
+  const [onlineFor, setOnlineFor] = useState(null);     // オンラインパネル対象
+  const [onlineStatus, setOnlineStatus] = useState(null);
+  const [onlineHist, setOnlineHist] = useState([]);     // [{step, loss, reward}] パネル表示中のEMA推移
+  const [evalOnline, setEvalOnline] = useState(false);  // 評価パネルがオンライン用か
+  const [onlineEvalResult, setOnlineEvalResult] = useState(null); // オンライン評価(act, ε=0)の結果
+  const [actInput, setActInput] = useState('{}');       // act/learn 用 state(JSON)
+  const [actResult, setActResult] = useState(null);
+  const [learnInput, setLearnInput] = useState({ action: '', reward: '' });
+  const [onlineBusy, setOnlineBusy] = useState(false);
+  const logRef = useRef(null);
+  // ─── 操作ログ (act/learn/評価/削除/オンライン化 などの結果を時系列で表示) ───
+  const [opLog, setOpLog] = useState([]);
+  const opLogRef = useRef(null);
+  const appendLog = (msg) => {
+    const t = new Date().toLocaleTimeString();
+    setOpLog(prev => [...prev.slice(-300), `[${t}] ${msg}`]);
+  };
+
+  useEffect(() => {
+    loadAlgos();
+    loadModels();
+    loadStatus();
+    loadTables();
+    const t = setInterval(() => { loadModels(); loadStatus(); }, 3000);
+    return () => clearInterval(t);
+  }, []);
+
+  async function loadTables() {
+    try {
+      const r = await fetch('/ml/datasets');
+      const d = await r.json();
+      setTables(d.datasets || d.tables || []);
+    } catch {}
+  }
+
+  useEffect(() => {
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [liveLog]);
+
+  useEffect(() => {
+    if (opLogRef.current) opLogRef.current.scrollTop = opLogRef.current.scrollHeight;
+  }, [opLog]);
+
+  // オンライン操作 or オンライン学習曲線パネル表示中は状態を定期取得して EMA 推移をサンプリング
+  useEffect(() => {
+    const liveName = onlineFor || (chartFor && chartFor.online ? chartFor.name : null);
+    if (!liveName) return;
+    const t = setInterval(() => refreshOnlineStatus(liveName), 3000);
+    return () => clearInterval(t);
+  }, [onlineFor, chartFor]);
+
+  async function loadAlgos() {
+    try {
+      const r = await fetch('/ml/rl/envs');
+      const d = await r.json();
+      setAlgos(d.algos || []);
+    } catch {}
+  }
+  async function loadModels() {
+    try {
+      const r = await fetch('/ml/rl/models');
+      const d = await r.json();
+      setModels(d.models || []);
+      setRunning(d.runningJob || null);
+    } catch {}
+  }
+  async function loadStatus() {
+    try {
+      const r = await fetch('/ml/rl/train/status');
+      const d = await r.json();
+      if (d.running) { setRunning({ jobId: d.jobId, name: d.name, env: d.env }); setLiveLog(d.log || ''); }
+      else { setRecentJobs(d.recentJobs || []); }
+    } catch {}
+  }
+
+  async function cancelTrain() {
+    if (!confirm('学習中のRLジョブをキャンセルしますか?')) return;
+    try {
+      const r = await fetch('/ml/rl/train/cancel', { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      showToast('キャンセルしました', 'success');
+      appendLog('⏹ 学習をキャンセルしました');
+    } catch (e) { showToast(`失敗: ${e.message}`, 'error'); appendLog(`❌ キャンセル失敗: ${e.message}`); }
+  }
+
+  async function showChart(name, online) {
+    setEvalResult(null); setEvalFor(null); setOnlineFor(null); setOnlineEvalResult(null);
+    if (online) {
+      // オンライン: サーバに損失履歴が無いため、このセッションで取得した EMA 推移を表示
+      setOnlineHist([]);
+      setChartFor({ name, online: true });
+      appendLog(`📈 学習推移を表示(オンライン): ${name}`);
+      refreshOnlineStatus(name);
+      return;
+    }
+    try {
+      const r = await fetch(`/ml/rl/models/${encodeURIComponent(name)}/metrics`);
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      setChartFor({ name, metrics: d, online: false });
+      appendLog(`📈 学習曲線を表示: ${name} (最終損失 ${d.finalLoss ?? '-'})`);
+    } catch (e) { showToast(`取得失敗: ${e.message}`, 'error'); appendLog(`❌ 学習曲線取得失敗: ${name} (${e.message})`); }
+  }
+
+  async function runEval(name, online) {
+    setChartFor(null); setEvalResult(null); setOnlineFor(null); setOnlineEvalResult(null);
+    if (online) {
+      // オンライン: データセットが無いので、状態を与えて act(ε=0) のQ値で方策を確認する
+      setEvalOnline(true); setEvalFor(name);
+      appendLog(`🔍 方策を評価(オンライン)を開く: ${name}`);
+      return;
+    }
+    if (running) { showToast('学習中は評価できません', 'error'); return; }
+    setEvalOnline(false); setEvalFor(name); setEvaluating(true);
+    appendLog(`🔍 評価開始: ${name} (5エピソード)`);
+    try {
+      const r = await fetch(`/ml/rl/models/${encodeURIComponent(name)}/eval`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ episodes: 5 }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      setEvalResult(d);
+      appendLog(`🔍 評価完了: ${name} · 方策一致率 ${Math.round((d.policyAgreement || 0) * 100)}% · ログ平均報酬 ${d.loggedMeanReward ?? '-'}`);
+    } catch (e) { showToast(`評価失敗: ${e.message}`, 'error'); appendLog(`❌ 評価失敗: ${name} (${e.message})`); setEvalFor(null); }
+    finally { setEvaluating(false); }
+  }
+
+  // オンライン方策評価: 状態を1件与えて act(ε=0) のQ値・推奨行動を取得
+  async function doEvalAct() {
+    const state = parseActState(); if (state === null) return;
+    setOnlineBusy(true);
+    try {
+      const r = await fetch(`/ml/rl/models/${encodeURIComponent(evalFor)}/act`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ state, epsilon: 0 }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      setOnlineEvalResult(d);
+      appendLog(`🔍 act評価 ${evalFor}: action=${d.action} · Q={${Object.entries(d.qValues || {}).map(([k, v]) => `${k}:${v}`).join(', ')}}`);
+    } catch (e) { showToast(`評価失敗: ${e.message}`, 'error'); appendLog(`❌ act評価失敗: ${evalFor} (${e.message})`); }
+    finally { setOnlineBusy(false); }
+  }
+
+  async function deleteAgent(name) {
+    if (!confirm(`エージェント「${name}」を削除しますか?`)) return;
+    try {
+      const r = await fetch(`/ml/rl/models/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      showToast('削除しました', 'success');
+      appendLog(`🗑 エージェント削除: ${name}`);
+      if (chartFor && chartFor.name === name) setChartFor(null);
+      if (evalFor === name) { setEvalResult(null); setEvalFor(null); }
+      if (onlineFor === name) setOnlineFor(null);
+      loadModels();
+    } catch (e) { showToast(`削除失敗: ${e.message}`, 'error'); }
+  }
+
+  // ⚡ オンライン学習: 既存エージェントをウォームスタートでメモリへロード
+  async function enableOnline(name) {
+    if (!confirm(`「${name}」をオンライン学習用にロードします (ウォームスタート)。\nよろしいですか?`)) return;
+    setOnlineBusy(true);
+    try {
+      const r = await fetch('/ml/rl/online/create', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fromAgent: name }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      showToast('オンライン化しました', 'success');
+      appendLog(`⚡ オンライン化(ウォームスタート読み込み): ${name}`);
+      openOnline(name);
+    } catch (e) { showToast(`オンライン化失敗: ${e.message}`, 'error'); appendLog(`❌ オンライン化失敗: ${name} (${e.message})`); }
+    finally { setOnlineBusy(false); }
+  }
+  function openOnline(name) {
+    setChartFor(null); setEvalFor(null); setActResult(null);
+    setOnlineHist([]);
+    setOnlineFor(name);
+    appendLog(`⚡ オンライン操作パネルを開く: ${name}`);
+    refreshOnlineStatus(name);
+  }
+  async function refreshOnlineStatus(name) {
+    try {
+      const r = await fetch(`/ml/rl/models/${encodeURIComponent(name)}/online/status`);
+      const d = await r.json();
+      setOnlineStatus(d);
+      // EMA 推移をサンプリング (totalSteps が進んだときだけ追加)
+      if (d && !d.error && d.totalSteps != null) {
+        setOnlineHist(prev => {
+          const last = prev[prev.length - 1];
+          if (last && last.step === d.totalSteps) return prev;
+          return [...prev.slice(-300), { step: d.totalSteps, loss: d.lossEMA, reward: d.rewardEMA }];
+        });
+      }
+    } catch (e) { setOnlineStatus({ error: e.message }); }
+  }
+  function parseActState() {
+    try { return JSON.parse(actInput); }
+    catch { showToast('state は有効なJSON ({"列":値}) で入力してください', 'error'); return null; }
+  }
+  async function doAct() {
+    const state = parseActState(); if (state === null) return;
+    setOnlineBusy(true);
+    try {
+      const r = await fetch(`/ml/rl/models/${encodeURIComponent(onlineFor)}/act`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ state, epsilon: 0 }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      setActResult(d);
+      setLearnInput(li => ({ ...li, action: d.action }));
+      appendLog(`🎯 act ${onlineFor}: action=${d.action}${d.explored ? ' (探索)' : ''} · Q={${Object.entries(d.qValues || {}).map(([k, v]) => `${k}:${v}`).join(', ')}}`);
+    } catch (e) { showToast(`act失敗: ${e.message}`, 'error'); appendLog(`❌ act失敗: ${onlineFor} (${e.message})`); }
+    finally { setOnlineBusy(false); }
+  }
+  async function doLearn() {
+    const state = parseActState(); if (state === null) return;
+    const reward = parseFloat(learnInput.reward);
+    if (!learnInput.action) { showToast('action を入力してください', 'error'); return; }
+    if (!isFinite(reward)) { showToast('reward は数値で入力してください', 'error'); return; }
+    setOnlineBusy(true);
+    try {
+      const r = await fetch(`/ml/rl/models/${encodeURIComponent(onlineFor)}/learn`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ state, action: learnInput.action, reward }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      showToast(`学習しました (totalSteps=${d.totalSteps})`, 'success');
+      appendLog(`📥 learn ${onlineFor}: action=${learnInput.action}, reward=${reward} → loss=${d.loss ?? '-'}, totalSteps=${d.totalSteps ?? '-'}, buffer=${d.bufferSize ?? '-'}`);
+      refreshOnlineStatus(onlineFor);
+    } catch (e) { showToast(`learn失敗: ${e.message}`, 'error'); appendLog(`❌ learn失敗: ${onlineFor} (${e.message})`); }
+    finally { setOnlineBusy(false); }
+  }
+  async function checkpointOnline() {
+    setOnlineBusy(true);
+    try {
+      const r = await fetch(`/ml/rl/models/${encodeURIComponent(onlineFor)}/checkpoint`, { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      showToast('チェックポイントを保存しました', 'success');
+      appendLog(`💾 チェックポイント保存: ${onlineFor} (totalSteps=${d.totalSteps ?? '-'})`);
+    } catch (e) { showToast(`保存失敗: ${e.message}`, 'error'); appendLog(`❌ チェックポイント保存失敗: ${onlineFor} (${e.message})`); }
+    finally { setOnlineBusy(false); }
+  }
+
+  return (
+    <div className="ml-models-view">
+      <div className="toolbar">
+        <button className="btn primary" onClick={() => setShowTrain(true)} disabled={!!running}>
+          ➕ エージェントを新規作成 (学習)
+        </button>
+        {running && (
+          <span style={{
+            background: 'var(--orange-dim)', color: 'var(--orange)',
+            padding: '4px 10px', borderRadius: 10, fontSize: 12,
+            fontFamily: 'var(--font-mono)',
+          }}>⚙️ 学習中: {running.name}</span>
+        )}
+      </div>
+
+      <div className="ml-layout">
+        {/* 左: エージェント一覧 (モデルカード調) */}
+        <div className="ml-table-list">
+
+          {models.length === 0 ? (
+            <div className="empty-state">
+              エージェントがありません。<br />「➕ エージェントを新規作成 (学習)」から開始してください。
+            </div>
+          ) : models.map(m => (
+            <div key={m.name} className="ml-table-item" style={{ position: 'relative' }}>
+              <button
+                className="ml-model-delete-btn"
+                onClick={(e) => { e.stopPropagation(); deleteAgent(m.name); }}
+                title={`エージェント「${m.name}」を削除`}
+                aria-label="削除"
+                disabled={!!running}
+              >×</button>
+              <div className="ml-table-name" style={{ paddingRight: 24 }}>
+                {m.online ? '⚡' : '📊'} {m.name}
+                <span style={{
+                  marginLeft: 6, fontSize: 10,
+                  background: m.online ? 'var(--orange-dim)' : 'var(--accent-dim)',
+                  color: m.online ? 'var(--orange)' : 'var(--accent)',
+                  padding: '1px 6px', borderRadius: 8,
+                }}>{m.online ? '⚡ オンライン' : '✓ 学習済'}</span>
+              </div>
+              <div className="ml-table-meta">
+                <b>{RL_ALGO_SHORT[m.algo] || m.algo || 'DQN'}</b> | {m.datasetMode === 'transition' ? '遷移ベース' : 'バンディット'} | {(m.actionLabels || []).length}行動
+                {!m.online && m.tableName ? ` | ${m.tableName}` : ''}
+              </div>
+              {m.metrics && (
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4, fontFamily: 'var(--font-mono)' }}>
+                  {m.online
+                    ? `steps: ${m.metrics.totalSteps ?? '-'}${m.metrics.rewardEMA != null ? ` · rewardEMA: ${m.metrics.rewardEMA}` : ''}${m.metrics.bufferSize != null ? ` · buffer: ${m.metrics.bufferSize}` : ''}`
+                    : `一致率: ${Math.round((m.metrics.policyAgreement || 0) * 100)}% · 推定価値: ${m.metrics.meanQ}`}
+                </div>
+              )}
+              <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
+                <button className="btn small" onClick={() => showChart(m.name, m.online)}>📈 学習曲線</button>
+                <button className="btn small primary" onClick={() => runEval(m.name, m.online)} disabled={!m.online && (!!running || evaluating)}>🔍 方策を評価</button>
+                {m.online
+                  ? <button className="btn small primary" onClick={() => openOnline(m.name)}>⚡ オンライン操作</button>
+                  : <button className="btn small" onClick={() => enableOnline(m.name)} disabled={onlineBusy}>⚡ オンライン化</button>}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* 右: 詳細 (学習ログ / 学習曲線 / 評価 / オンライン / 履歴) */}
+        <div className="ml-table-detail">
+          {running && (
+            <div className="rl-panel">
+              <div className="rl-panel-title">📜 学習ログ（ライブ）: {running.name}
+                <button className="btn small danger" style={{ float: 'right' }} onClick={cancelTrain}>⏹ キャンセル</button>
+              </div>
+              <pre ref={logRef} className="train-log rl-log">{liveLog || '(出力待ち...)'}</pre>
+            </div>
+          )}
+
+          {!running && chartFor && (
+            <div className="rl-panel">
+              <div className="rl-panel-title">
+                📈 {chartFor.online ? '学習推移（オンライン）' : '学習曲線'}: {chartFor.name}
+                <button className="btn small" style={{ float: 'right' }} onClick={() => setChartFor(null)}>✕ 閉じる</button>
+              </div>
+              {chartFor.online ? (
+                onlineHist.length < 2 ? (
+                  <div className="empty-state" style={{ padding: 20, fontSize: 13 }}>
+                    学習が進むと reward / loss の推移が表示されます。<br />
+                    外部API（act/learn ループ）で学習中、または「⚡ オンライン操作」で learn を実行すると、totalSteps の増加に合わせて伸びていきます。
+                  </div>
+                ) : (
+                  <div>
+                    <div style={{ fontSize: 11, color: 'var(--text-secondary)', margin: '2px 0' }}>報酬EMA (reward EMA)</div>
+                    <OnlineSeriesChart data={onlineHist.map(h => h.reward)} color="#7c4dff" />
+                    <div style={{ fontSize: 11, color: 'var(--text-secondary)', margin: '6px 0 2px' }}>損失EMA (loss EMA)</div>
+                    <OnlineSeriesChart data={onlineHist.map(h => h.loss)} color="#ff9800" />
+                    <div className="rl-agent-meta" style={{ marginTop: 8 }}>
+                      totalSteps <b>{onlineStatus?.totalSteps ?? '-'}</b> · buffer <b>{onlineStatus?.bufferSize ?? '-'}</b> ·
+                      reward(EMA) <b>{onlineStatus?.rewardEMA ?? '-'}</b> · loss(EMA) <b>{onlineStatus?.lossEMA ?? '-'}</b>
+                    </div>
+                    <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>
+                      ※ サーバは履歴を保存しないため、パネル表示中に取得した値の推移です（{onlineHist.length}点・3秒間隔）。
+                    </div>
+                  </div>
+                )
+              ) : (
+                <div>
+                  <LossChart metrics={chartFor.metrics} />
+                  <div className="rl-chart-legend">
+                    <span><span className="lg-line" style={{ background: 'var(--accent)' }}></span>{chartFor.metrics.lossName || '学習損失'} (エポック毎)</span>
+                  </div>
+                  <div className="rl-agent-meta" style={{ marginTop: 8 }}>
+                    {RL_ALGO_SHORT[chartFor.metrics.algo] || chartFor.metrics.algo || 'DQN'} ·
+                    方式 <b>{chartFor.metrics.datasetMode === 'transition' ? '遷移' : 'バンディット'}</b> ·
+                    最終損失 <b>{chartFor.metrics.finalLoss}</b> ·
+                    方策一致率 <b>{Math.round((chartFor.metrics.policyAgreement || 0) * 100)}%</b> ·
+                    推定価値(平均maxQ) <b>{chartFor.metrics.meanQ}</b> ·
+                    ログ平均報酬 {chartFor.metrics.loggedMeanReward} ·
+                    {chartFor.metrics.nTransitions}件 · {chartFor.metrics.elapsedSec}秒
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {!running && evalFor && (
+            <div className="rl-panel">
+              <div className="rl-panel-title">
+                🔍 方策評価: {evalFor}{evalOnline ? '（オンライン）' : ''}
+                <button className="btn small" style={{ float: 'right' }} onClick={() => { setEvalResult(null); setOnlineEvalResult(null); setEvalFor(null); }}>✕ 閉じる</button>
+              </div>
+              {evalOnline ? (
+                <div>
+                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 4 }}>状態 (JSON, 例: {`{"hour":22,"segment":"C"}`})</div>
+                  <textarea className="textarea" value={actInput} onChange={e => setActInput(e.target.value)} rows={2}
+                    spellCheck="false" style={{ width: '100%', minHeight: 52 }} />
+                  <div className="toolbar" style={{ marginTop: 6 }}>
+                    <button className="btn small primary" onClick={doEvalAct} disabled={onlineBusy}>🔍 この状態を評価 (act ε=0)</button>
+                  </div>
+                  {onlineEvalResult ? (
+                    <div className="rl-agent-meta" style={{ marginTop: 8 }}>
+                      推奨行動: <b>{onlineEvalResult.action}</b>{onlineEvalResult.explored ? ' (探索)' : ''}
+                      <QValueBars qValues={onlineEvalResult.qValues} chosen={onlineEvalResult.action} />
+                    </div>
+                  ) : (
+                    <div className="empty-state" style={{ padding: 16, fontSize: 12 }}>
+                      状態を入力して「この状態を評価」を押すと、各行動のQ値（推定価値）と推奨行動が表示されます。
+                    </div>
+                  )}
+                </div>
+              ) : evaluating ? (
+                <div className="empty-state" style={{ padding: 24 }}>⏳ 評価を実行中...</div>
+              ) : evalResult ? (
+                <DatasetEvalResult result={evalResult} />
+              ) : null}
+            </div>
+          )}
+
+          {!running && onlineFor && (
+            <div className="rl-panel">
+              <div className="rl-panel-title">
+                ⚡ オンライン学習: {onlineFor}
+                <button className="btn small" style={{ float: 'right' }} onClick={() => setOnlineFor(null)}>✕ 閉じる</button>
+              </div>
+              {onlineStatus && onlineStatus.error ? (
+                <div className="empty-state" style={{ padding: 16, color: 'var(--orange)' }}>⚠️ {onlineStatus.error}</div>
+              ) : onlineStatus ? (
+                <div className="rl-agent-meta" style={{ marginBottom: 10 }}>
+                  状態 <b>{onlineStatus.loaded ? 'ロード済' : '未ロード'}</b> ·
+                  方式 <b>{onlineStatus.mode === 'transition' ? '遷移' : 'バンディット'}</b> ·
+                  行動 <b>{(onlineStatus.actionLabels || []).join(', ')}</b><br />
+                  totalSteps <b>{onlineStatus.totalSteps ?? '-'}</b> ·
+                  buffer <b>{onlineStatus.bufferSize ?? '-'}</b> ·
+                  loss(EMA) <b>{onlineStatus.lossEMA ?? '-'}</b> ·
+                  reward(EMA) <b>{onlineStatus.rewardEMA ?? '-'}</b>
+                  <button className="btn small" style={{ marginLeft: 8 }} onClick={() => refreshOnlineStatus(onlineFor)}>🔄 更新</button>
+                </div>
+              ) : <div className="empty-state" style={{ padding: 16 }}>⏳ 取得中...</div>}
+
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', margin: '0 0 8px' }}>
+                📈 学習推移グラフ・🔍 Q値の評価は、上の「📈 学習曲線」「🔍 方策を評価」ボタンから開けます。
+              </div>
+
+              <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 4 }}>状態 (JSON, 例: {`{"hour":22,"segment":"C"}`})</div>
+              <textarea className="textarea" value={actInput} onChange={e => setActInput(e.target.value)} rows={2}
+                spellCheck="false" style={{ width: '100%', minHeight: 52 }} />
+              <div className="toolbar" style={{ marginTop: 6 }}>
+                <button className="btn small primary" onClick={doAct} disabled={onlineBusy}>🎯 act (推奨行動)</button>
+                <button className="btn small" onClick={checkpointOnline} disabled={onlineBusy}>💾 チェックポイント</button>
+              </div>
+              {actResult && (
+                <div className="rl-agent-meta" style={{ marginTop: 6 }}>
+                  推奨行動: <b>{actResult.action}</b>{actResult.explored ? ' (探索)' : ''}
+                  <QValueBars qValues={actResult.qValues} chosen={actResult.action} />
+                </div>
+              )}
+              <div style={{ borderTop: '1px solid var(--border)', margin: '10px 0 8px' }}></div>
+              <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 4 }}>経験を投入して即時学習 (上の状態に対して)</div>
+              <div className="toolbar">
+                <input className="input" type="text" placeholder="action" value={learnInput.action}
+                  onChange={e => setLearnInput(li => ({ ...li, action: e.target.value }))}
+                  style={{ width: 130 }} />
+                <input className="input" type="number" step="any" placeholder="reward" value={learnInput.reward}
+                  onChange={e => setLearnInput(li => ({ ...li, reward: e.target.value }))}
+                  style={{ width: 110 }} />
+                <button className="btn small primary" onClick={doLearn} disabled={onlineBusy}>📥 learn</button>
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 8, lineHeight: 1.6 }}>
+                💡 外部から回す場合は <code>POST /ml/rl/models/{onlineFor}/act</code> と <code>/learn</code> をループしてください (APIタブ参照)。
+              </div>
+            </div>
+          )}
+
+          {!running && !chartFor && !evalFor && !onlineFor && (
+            <div>
+              <h3 style={{ marginTop: 0 }}>学習ジョブ履歴</h3>
+              {recentJobs.length === 0 ? (
+                <div className="empty-state">ジョブがまだありません</div>
+              ) : (
+                <div style={{ maxHeight: 250, overflowY: 'auto', marginBottom: 16 }}>
+                  {recentJobs.slice(0, 10).map((j, i) => (
+                    <div key={i} className="ml-table-item" style={{ marginBottom: 6 }}>
+                      <span className="ml-table-name">
+                        {j.status === 'completed' ? '✅' : j.status === 'cancelled' ? '⏹' : '❌'} {j.name}
+                      </span>
+                      <div className="ml-table-meta">
+                        {j.policyAgreement != null ? `一致率 ${Math.round(j.policyAgreement * 100)}%` : '—'}
+                        {j.error && <span style={{ color: 'var(--red)' }}> · {j.error}</span>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="rl-panel rl-help">
+                <div className="rl-panel-title">💡 使い方</div>
+                <ol style={{ margin: '4px 0 0', paddingLeft: 20, lineHeight: 1.9 }}>
+                  <li><b>「➕ エージェントを新規作成 (学習)」</b>でテーブルと列(状態/行動/報酬)を選んで学習を開始</li>
+                  <li>各エージェントの <b>「📈 学習曲線」「🔍 方策を評価」</b> で結果を確認</li>
+                  <li><b>「⚡ オンライン化」</b>でリアルタイム学習 (act/learn) を有効化できます</li>
+                </ol>
+              </div>
+            </div>
+          )}
+
+          {/* ─── 📝 操作ログ (常時表示・操作の結果を時系列で記録) ─── */}
+          <div className="rl-panel" style={{ marginTop: 12 }}>
+            <div className="rl-panel-title">📝 操作ログ
+              <button className="btn small" style={{ float: 'right' }} onClick={() => setOpLog([])}>クリア</button>
+            </div>
+            <pre ref={opLogRef} className="train-log rl-log" style={{ maxHeight: 200 }}>
+              {opLog.length ? opLog.join('\n') : '(ここに act / learn / 評価 / 学習曲線 / オンライン化 / 削除 などの操作結果が時系列で表示されます)'}
+            </pre>
+          </div>
+        </div>
+      </div>
+
+      {showTrain && (
+        <RLTrainDialog
+          tables={tables}
+          algos={algos}
+          onClose={() => setShowTrain(false)}
+          onStarted={() => { setShowTrain(false); setLiveLog(''); setChartFor(null); setEvalResult(null); setEvalFor(null); setOnlineFor(null); loadStatus(); loadModels(); }}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── 🎮 RL 学習ダイアログ (データテーブルからのオフラインRL) ───
+function RLTrainDialog({ tables, algos, onClose, onStarted, showToast }) {
+  const [form, setForm] = useState({
+    name: 'offer_agent', algo: 'dqn',
+    episodes: 300, hiddenSize: 128, learningRate: 0.001, gamma: 0.99, batchSize: 64, cqlAlpha: 0.5,
+  });
+  const [tableCols, setTableCols] = useState([]);
+  const [dsForm, setDsForm] = useState({
+    table: '', stateColumns: [], actionColumn: '', rewardColumn: '', nextStateColumns: [], doneColumn: '',
+  });
+  const [busy, setBusy] = useState(false);
+
+  function upd(k, v) { setForm(f => ({ ...f, [k]: v })); }
+  function dsUpd(k, v) { setDsForm(f => ({ ...f, [k]: v })); }
+  function toggleCol(key, col) {
+    setDsForm(f => {
+      const arr = f[key].includes(col) ? f[key].filter(c => c !== col) : [...f[key], col];
+      return { ...f, [key]: arr };
+    });
+  }
+  async function loadTableCols(name) {
+    setTableCols([]);
+    if (!name) return;
+    try {
+      const r = await fetch(`/ml/datasets/${encodeURIComponent(name)}/schema`);
+      const d = await r.json();
+      const cols = (d.columns || d.schema || []).map(c => c.name || c.column_name || c).filter(Boolean);
+      setTableCols(cols);
+    } catch {}
+  }
+
+  async function startTrain() {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(form.name)) {
+      showToast('エージェント名は英数字・ハイフン・アンダースコア (1〜64文字)', 'error'); return;
+    }
+    if (!dsForm.table) { showToast('テーブルを選択してください', 'error'); return; }
+    if (dsForm.stateColumns.length === 0) { showToast('状態(特徴量)カラムを1つ以上選んでください', 'error'); return; }
+    if (!dsForm.actionColumn) { showToast('行動カラムを選んでください', 'error'); return; }
+    if (!dsForm.rewardColumn) { showToast('報酬カラムを選んでください', 'error'); return; }
+    if (dsForm.nextStateColumns.length > 0 && dsForm.nextStateColumns.length !== dsForm.stateColumns.length) {
+      showToast('次状態カラムは状態カラムと同数で選んでください (遷移ベース)', 'error'); return;
+    }
+    const payload = {
+      name: form.name, algo: form.algo,
+      episodes: form.episodes, hiddenSize: form.hiddenSize, learningRate: form.learningRate,
+      gamma: form.gamma, batchSize: form.batchSize, cqlAlpha: form.cqlAlpha,
+      table: dsForm.table, stateColumns: dsForm.stateColumns,
+      actionColumn: dsForm.actionColumn, rewardColumn: dsForm.rewardColumn,
+      nextStateColumns: dsForm.nextStateColumns, doneColumn: dsForm.doneColumn || undefined,
+    };
+    setBusy(true);
+    try {
+      const r = await fetch('/ml/rl/train', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      showToast(`学習開始: ${form.name}`, 'success');
+      onStarted();
+    } catch (e) { showToast(`開始失敗: ${e.message}`, 'error'); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 720 }}>
+        <div className="modal-header">
+          <div className="modal-title">➕ エージェントを新規作成 (データテーブルから学習)</div>
+          <button className="modal-close" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div className="field">
+              <label className="field-label">エージェント名</label>
+              <input className="input" value={form.name} onChange={e => upd('name', e.target.value)} placeholder="例: offer_agent" />
+              <span className="field-hint">英数字・ハイフン・アンダースコア、最大64文字。</span>
+            </div>
+            <div className="field">
+              <label className="field-label">データテーブル</label>
+              <select className="select" value={dsForm.table}
+                onChange={e => { loadTableCols(e.target.value);
+                  setDsForm({ table: e.target.value, stateColumns: [], actionColumn: '', rewardColumn: '', nextStateColumns: [], doneColumn: '' }); }}>
+                <option value="">— 選択 —</option>
+                {tables.map(t => <option key={t.name} value={t.name}>{t.name} ({(t.rowCount || 0).toLocaleString()}行)</option>)}
+              </select>
+            </div>
+          </div>
+
+          {dsForm.table && tableCols.length > 0 && (
+            <>
+              <div className="field">
+                <label className="field-label">状態カラム (特徴量・複数可)</label>
+                <div className="rl-colpick">
+                  {tableCols.map(c => (
+                    <label key={c} className={`rl-col-chip ${dsForm.stateColumns.includes(c) ? 'on' : ''}`}>
+                      <input type="checkbox" checked={dsForm.stateColumns.includes(c)}
+                        onChange={() => toggleCol('stateColumns', c)} />{c}
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                <div className="field"><label className="field-label">行動カラム</label>
+                  <select className="select" value={dsForm.actionColumn} onChange={e => dsUpd('actionColumn', e.target.value)}>
+                    <option value="">— 選択 —</option>
+                    {tableCols.map(c => <option key={c} value={c}>{c}</option>)}
+                  </select></div>
+                <div className="field"><label className="field-label">報酬カラム</label>
+                  <select className="select" value={dsForm.rewardColumn} onChange={e => dsUpd('rewardColumn', e.target.value)}>
+                    <option value="">— 選択 —</option>
+                    {tableCols.map(c => <option key={c} value={c}>{c}</option>)}
+                  </select></div>
+              </div>
+              <div className="field">
+                <label className="field-label">次状態カラム (任意・遷移ベースにする場合。状態と同数同順)</label>
+                <div className="rl-colpick">
+                  {tableCols.map(c => (
+                    <label key={c} className={`rl-col-chip ${dsForm.nextStateColumns.includes(c) ? 'on' : ''}`}>
+                      <input type="checkbox" checked={dsForm.nextStateColumns.includes(c)}
+                        onChange={() => toggleCol('nextStateColumns', c)} />{c}
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div className="field">
+                <label className="field-label">終了フラグカラム (任意)</label>
+                <select className="select" value={dsForm.doneColumn} onChange={e => dsUpd('doneColumn', e.target.value)}>
+                  <option value="">— なし —</option>
+                  {tableCols.map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+              <div className="field-hint" style={{ marginBottom: 8 }}>
+                方式: <b>{dsForm.nextStateColumns.length > 0 ? '遷移ベース オフラインDQN' : '文脈付きバンディット'}</b>
+              </div>
+            </>
+          )}
+
+          <div className="field">
+            <label className="field-label">アルゴリズム</label>
+            <select className="select" value={form.algo} onChange={e => upd('algo', e.target.value)}>
+              {algos.map(a => <option key={a.name} value={a.name}>{a.label}</option>)}
+            </select>
+            {(() => { const a = algos.find(x => x.name === form.algo); return a && a.desc
+              ? <span className="field-hint">{a.desc}</span> : null; })()}
+          </div>
+          {form.algo === 'cql' && (
+            <div className="field">
+              <label className="field-label">CQL の保守度 α (大きいほどログ外行動を強く抑制)</label>
+              <input className="input" type="number" step="0.1" min="0" max="10" value={form.cqlAlpha}
+                onChange={e => upd('cqlAlpha', parseFloat(e.target.value) || 0)} />
+            </div>
+          )}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
+            <div className="field"><label className="field-label">エポック数</label>
+              <input className="input" type="number" min="10" max="5000" value={form.episodes}
+                onChange={e => upd('episodes', parseInt(e.target.value) || 0)} /></div>
+            <div className="field"><label className="field-label">隠れ層サイズ</label>
+              <input className="input" type="number" min="16" max="1024" value={form.hiddenSize}
+                onChange={e => upd('hiddenSize', parseInt(e.target.value) || 0)} /></div>
+            <div className="field"><label className="field-label">学習率</label>
+              <input className="input" type="number" step="0.0001" min="0.00001" max="0.1" value={form.learningRate}
+                onChange={e => upd('learningRate', parseFloat(e.target.value) || 0)} /></div>
+            <div className="field"><label className="field-label">割引率 γ (遷移ベース用)</label>
+              <input className="input" type="number" step="0.01" min="0.5" max="0.999" value={form.gamma}
+                onChange={e => upd('gamma', parseFloat(e.target.value) || 0)} /></div>
+            <div className="field"><label className="field-label">バッチサイズ</label>
+              <input className="input" type="number" min="8" max="512" value={form.batchSize}
+                onChange={e => upd('batchSize', parseInt(e.target.value) || 0)} /></div>
+          </div>
+        </div>
+        <div className="modal-footer">
+          <button className="btn" onClick={onClose} disabled={busy}>キャンセル</button>
+          <button className="btn primary" onClick={startTrain} disabled={busy}>▶ 学習を開始</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── API 使い方ビュー (外部連携) ───
 function ApiUsageView({ showToast }) {
   const [tokens, setTokens] = useState([]);
@@ -2304,6 +3184,68 @@ curl -H "Authorization: Bearer ${sampleToken}" \\
   -H "Content-Type: application/json" \\
   -d '{"tableName":"sensor_data","rows":[{"ts":"2026-05-26T14:00","temp":23.5}],"createIfMissing":true}' \\
   "${exampleHost}/ml/datasets/append"`;
+
+  const rlPyExample = `import requests, time
+
+BASE = "${exampleHost}"
+H = {"Authorization": "Bearer ${sampleToken}", "Content-Type": "application/json"}
+
+# 1) データテーブルからオフラインRLを学習
+#    next_state列を付ければ遷移ベースDQN、無ければ文脈付きバンディット
+r = requests.post(f"{BASE}/ml/rl/train", headers=H, json={
+    "name": "offer_agent",
+    "table": "logs",                       # 経験データのテーブル
+    "stateColumns": ["hour", "segment"],   # 状態(文脈)
+    "actionColumn": "offer",               # 取った行動
+    "rewardColumn": "reward",              # 得られた報酬
+    # "nextStateColumns": ["hour2","segment2"],  # 任意: 遷移ベースにする場合
+    # "doneColumn": "done",                       # 任意: 終了フラグ
+    "episodes": 200,
+})
+print(r.json())   # {"ok": true, "jobId": "..."}
+
+# 2) 学習完了を待つ
+while True:
+    s = requests.get(f"{BASE}/ml/rl/train/status", headers=H).json()
+    if not s.get("running"):
+        break
+    time.sleep(2)
+
+# 3) 任意の状態に対する推奨行動を取得 (推論)
+r = requests.post(f"{BASE}/ml/rl/models/offer_agent/policy", headers=H,
+                  json={"state": {"hour": 22, "segment": "C"}})
+print(r.json())   # {"recommendedAction": "Z", "qValues": {"X":..,"Y":..,"Z":..}}
+
+# 4) オフライン方策評価 (ログ行動との一致率・推定価値)
+r = requests.post(f"{BASE}/ml/rl/models/offer_agent/eval", headers=H, json={})
+ev = r.json()
+print("policyAgreement:", ev["policyAgreement"], "meanQ:", ev["meanQ"])
+
+# ─────────────────────────────────────────────
+# ⚡ リアルタイム/オンライン学習 (act → 報酬観測 → learn)
+# ─────────────────────────────────────────────
+
+# A) スキーマ指定でゼロから新規オンラインエージェント
+requests.post(f"{BASE}/ml/rl/online/create", headers=H, json={
+    "name": "promo", "spec": {
+        "stateColumns": [{"name": "hour", "type": "numeric"},
+                         {"name": "segment", "type": "categorical", "values": ["A","B","C"]}],
+        "actionLabels": ["email", "sms", "push", "none"],
+        "algo": "dqn", "mode": "bandit"}})
+#   (既存エージェントをオンライン継続学習する場合は {"fromAgent": "offer_agent"})
+
+# B) act(推論) → 報酬を観測 → learn(即時学習) を繰り返す
+for state, reward_fn in your_stream:               # あなたのデータストリーム
+    r = requests.post(f"{BASE}/ml/rl/models/promo/act", headers=H,
+                      json={"state": state, "epsilon": 0.1}).json()  # ε=0で貪欲
+    action = r["action"]
+    reward = reward_fn(action)                      # 実際の結果(クリック/CV 等)
+    requests.post(f"{BASE}/ml/rl/models/promo/learn", headers=H,
+                  json={"state": state, "action": action, "reward": reward})
+
+# C) 状況確認 & 明示保存 (一定間隔で自動保存もされる)
+print(requests.get(f"{BASE}/ml/rl/models/promo/online/status", headers=H).json())
+requests.post(f"{BASE}/ml/rl/models/promo/checkpoint", headers=H)`;
 
   return (
     <div className="api-usage-view">
@@ -2475,6 +3417,22 @@ curl -H "Authorization: Bearer ${sampleToken}" \\
             <tr><td className="mono">GET</td><td className="mono">/ml/image/models</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>COCO事前学習モデル一覧</td></tr>
             <tr><td className="mono">GET</td><td className="mono">/ml/image/custom-models</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>カスタム学習済みモデル一覧</td></tr>
             <tr><td className="mono">POST</td><td className="mono">/ml/image/detect</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>物体検出 (COCO/カスタム)</td></tr>
+            <tr><td colSpan={4} style={{textAlign: 'center', background: 'var(--bg-tertiary)', padding: '4px', fontSize: 11}}>— 🎮 強化学習 (RL) —</td></tr>
+            <tr><td className="mono">GET</td><td className="mono">/ml/rl/envs</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>環境・アルゴリズム一覧</td></tr>
+            <tr><td className="mono">GET</td><td className="mono">/ml/rl/models</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>学習済みエージェント一覧</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/rl/train</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>学習開始 (データテーブル)</td></tr>
+            <tr><td className="mono">GET</td><td className="mono">/ml/rl/train/status</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>学習状態+ログ</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/rl/train/cancel</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>学習キャンセル</td></tr>
+            <tr><td className="mono">GET</td><td className="mono">/ml/rl/models/:name/metrics</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>学習曲線取得</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/rl/models/:name/eval</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>オフライン方策評価</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/rl/models/:name/policy</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>推奨行動の取得 (推論)</td></tr>
+            <tr><td className="mono">DELETE</td><td className="mono">/ml/rl/models/:name</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>エージェント削除</td></tr>
+            <tr><td colSpan={4} style={{textAlign: 'center', background: 'var(--bg-tertiary)', padding: '4px', fontSize: 11}}>— ⚡ リアルタイム/オンライン学習 —</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/rl/online/create</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>オンライン化 (fromAgent でウォームスタート / spec でゼロ作成)</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/rl/models/:name/act</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>推奨行動 (epsilon で探索)</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/rl/models/:name/learn</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>経験投入で即時1ステップ学習</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/rl/models/:name/checkpoint</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>明示チェックポイント</td></tr>
+            <tr><td className="mono">GET</td><td className="mono">/ml/rl/models/:name/online/status</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>オンライン学習状況</td></tr>
           </tbody>
         </table>
       </div>
@@ -2495,6 +3453,20 @@ curl -H "Authorization: Bearer ${sampleToken}" \\
           </tbody>
         </table>
         <CustomModelApiHelp host={exampleHost} token={sampleToken} />
+      </div>
+
+      <div className="ml-section">
+        <h3>🎮 強化学習 (RL) API の詳細</h3>
+        <p style={{color: 'var(--text-secondary)', fontSize: 13, lineHeight: 1.6}}>
+          データテーブルのログ済み経験データから<strong>オフラインRL</strong>でエージェントを学習し、
+          任意の状態に対する<strong>推奨行動</strong>を取得できます。学習は非同期で、<code>/ml/rl/train/status</code> で進捗を確認します。
+          <code>next_state</code> 列を指定すれば遷移ベースのオフラインDQN、指定しなければ文脈付きバンディットになります。<br /><br />
+          さらに <strong>⚡ リアルタイム/オンライン学習</strong> では、常駐ワーカーがモデルをメモリ保持し、
+          <code>act</code>(推論) と <code>learn</code>(経験投入で即時更新) を分離して提供します。
+          学習済みエージェントの<strong>ウォームスタート</strong>、または<strong>スキーマ指定でゼロから作成</strong>でき、
+          <code>epsilon</code> で ε-greedy 探索を制御します (下のサンプル後半)。
+        </p>
+        <pre className="api-help-code">{rlPyExample}</pre>
       </div>
     </div>
   );
@@ -2563,7 +3535,7 @@ function ImportDialog({ onClose, onDone, showToast }) {
           </div>
           <div className="field">
             <label className="field-label">CSVファイル</label>
-            <input className="input" type="file" accept=".csv,.tsv,.txt" onChange={handleFile} />
+            <input className="file-input" type="file" accept=".csv,.tsv,.txt" onChange={handleFile} />
           </div>
           <div className="field">
             <label className="field-label">または直接貼り付け</label>

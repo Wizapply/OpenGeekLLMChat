@@ -575,3 +575,169 @@
 .annotate-thumb-delete:hover {
   background: #ff3b30; transform: scale(1.1);
 }
+
+/* ─── 🎮 強化学習 (RL) ビュー ─── */
+.rl-view { display: flex; flex-direction: column; gap: 12px; }
+.rl-intro {
+  background: var(--accent-dim, rgba(124,77,255,0.12));
+  border: 1px solid var(--border, #2a2a3e);
+  border-radius: 8px; padding: 10px 14px; font-size: 13px; line-height: 1.6;
+  color: var(--text-primary, #eee);
+}
+.rl-layout { align-items: flex-start; gap: 14px; }
+.rl-left { flex: 0 0 380px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.rl-right { flex: 1 1 auto; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.rl-panel {
+  background: var(--bg-secondary, #1a1a2e);
+  border: 1px solid var(--border, #2a2a3e);
+  border-radius: 10px; padding: 14px;
+}
+.rl-panel-title { font-size: 14px; font-weight: 600; margin-bottom: 12px; color: var(--text-primary, #eee); }
+.rl-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
+.rl-grid2 .field { margin-bottom: 0; }
+.rl-view .field label { display: block; font-size: 11px; color: var(--text-muted, #999); margin-bottom: 4px; }
+.rl-running-badge {
+  margin-top: 10px; font-size: 12px; font-family: var(--font-mono, monospace);
+  background: var(--orange-dim, rgba(255,159,10,0.15)); color: var(--orange, #ff9f0a);
+  padding: 6px 10px; border-radius: 8px; display: inline-block;
+}
+.rl-agent-item {
+  border: 1px solid var(--border, #2a2a3e); border-radius: 8px;
+  padding: 10px 12px; margin-bottom: 8px; background: var(--bg-tertiary, #15151f);
+}
+.rl-agent-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.rl-agent-name { font-weight: 600; font-size: 13px; color: var(--text-primary, #eee); }
+.rl-solved {
+  font-size: 10px; background: rgba(52,199,89,0.18); color: #34c759;
+  padding: 1px 7px; border-radius: 8px; white-space: nowrap;
+}
+.rl-agent-meta { font-size: 11.5px; color: var(--text-muted, #999); margin-top: 4px; line-height: 1.5; }
+.rl-agent-meta b { color: var(--accent, #7c4dff); font-family: var(--font-mono, monospace); }
+.rl-agent-actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.rl-log { max-height: 360px; overflow-y: auto; margin: 0; }
+.rl-chart-legend {
+  display: flex; gap: 16px; flex-wrap: wrap; margin-top: 8px;
+  font-size: 11px; color: var(--text-muted, #999);
+}
+.rl-chart-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.rl-chart-legend .lg-line { width: 16px; height: 3px; border-radius: 2px; display: inline-block; }
+.rl-help ol { font-size: 12.5px; color: var(--text-secondary, #bbb); }
+@media (max-width: 900px) {
+  .rl-layout { flex-direction: column; }
+  .rl-left { flex: 1 1 auto; width: 100%; }
+}
+
+/* ─── RL: データテーブル学習 (オフラインRL) UI ─── */
+.rl-colpick { display: flex; flex-wrap: wrap; gap: 6px; max-height: 140px; overflow-y: auto;
+  padding: 6px; border: 1px solid var(--border, #2a2a3e); border-radius: 6px; background: var(--bg-tertiary, #15151f); }
+.rl-col-chip { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px;
+  padding: 3px 8px; border-radius: 12px; border: 1px solid var(--border, #2a2a3e);
+  cursor: pointer; user-select: none; color: var(--text-secondary, #bbb); }
+.rl-col-chip.on { background: var(--accent-dim, rgba(124,77,255,0.15)); color: var(--accent, #7c4dff);
+  border-color: var(--accent, #7c4dff); }
+.rl-col-chip input { margin: 0; }
+.rl-eval-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 8px; }
+.rl-stat { background: var(--bg-tertiary, #15151f); border: 1px solid var(--border, #2a2a3e);
+  border-radius: 8px; padding: 10px 6px; text-align: center; }
+.rl-stat-v { font-size: 20px; font-weight: 700; font-family: var(--font-mono, monospace); color: var(--text-primary, #eee); }
+.rl-stat-l { font-size: 10px; color: var(--text-muted, #999); margin-top: 4px; line-height: 1.3; }
+.rl-dist { display: flex; flex-direction: column; gap: 5px; margin: 6px 0; }
+.rl-dist-row { display: flex; align-items: center; gap: 8px; }
+.rl-dist-label { width: 80px; font-size: 11.5px; font-family: var(--font-mono, monospace);
+  color: var(--text-secondary, #bbb); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 0 80px; }
+.rl-dist-bars { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.rl-dist-bar { display: flex; align-items: center; gap: 6px; height: 12px; }
+.rl-dist-bar span { font-size: 10px; color: var(--text-muted, #999); font-family: var(--font-mono, monospace); }
+.rl-bar { height: 10px; border-radius: 3px; min-width: 2px; transition: width 0.3s; }
+.rl-bar.logged { background: rgba(124,77,255,0.4); }
+.rl-bar.policy { background: var(--accent, #7c4dff); }
+.rl-sample-wrap { max-height: 260px; overflow: auto; border: 1px solid var(--border, #2a2a3e); border-radius: 6px; margin-top: 4px; }
+.rl-sample-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+.rl-sample-table th { position: sticky; top: 0; background: var(--bg-tertiary, #15151f);
+  text-align: left; padding: 5px 8px; color: var(--text-muted, #999); font-weight: 600; border-bottom: 1px solid var(--border, #2a2a3e); }
+.rl-sample-table td { padding: 4px 8px; border-bottom: 1px solid var(--border, #2a2a3e); color: var(--text-secondary, #bbb); }
+.rl-sample-table tr:last-child td { border-bottom: none; }
+
+/* RL: アルゴリズム説明 */
+.rl-algo-desc {
+  margin-top: 6px; font-size: 11.5px; line-height: 1.5;
+  color: var(--text-muted, #999); background: var(--bg-tertiary, #15151f);
+  border-radius: 6px; padding: 6px 9px;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   フォーム入力の統一感 (input / textarea / select / ファイル選択)
+   ───────────────────────────────────────────────────────────── */
+
+/* 数値・テキスト入力にホバー/フォーカス時のアクセントを付与 (.input/.textarea/.select は tuning-styles.css 定義) */
+.input:hover, .textarea:hover, .select:hover { border-color: var(--border-active, #3a3a52); }
+.input::placeholder, .textarea::placeholder { color: var(--text-muted, #8a8a9a); }
+.input:disabled, .textarea:disabled, .select:disabled { opacity: 0.55; cursor: not-allowed; }
+.select { cursor: pointer; }
+
+/* ネイティブの数値スピナーを控えめに */
+.input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
+
+/* ファイル選択 input を全体テーマに合わせる
+   (CSVインポート / 画像アップロードなどの可視ファイル入力すべてに適用) */
+input[type="file"] {
+  font-size: 13px;
+  color: var(--text-secondary, #aaa);
+  max-width: 100%;
+}
+input[type="file"]::file-selector-button,
+input[type="file"]::-webkit-file-upload-button {
+  margin-right: 10px;
+  padding: 7px 13px;
+  border: 1px solid var(--border, #2a2a3e);
+  border-radius: 6px;
+  background: var(--surface, #1a1a2e);
+  color: var(--text, #eee);
+  font-size: 12px;
+  font-family: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+input[type="file"]::file-selector-button:hover,
+input[type="file"]::-webkit-file-upload-button:hover {
+  border-color: var(--accent, #7c4dff);
+  background: var(--bg-tertiary, #20203a);
+  color: var(--accent, #7c4dff);
+}
+
+/* ファイル選択を「枠付きフィールド」として見せる共通クラス */
+.file-input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 12px;
+  background: var(--surface, #1a1a2e);
+  border: 1px solid var(--border, #2a2a3e);
+  border-radius: var(--radius-sm, 6px);
+  color: var(--text-secondary, #aaa);
+  font-size: 13px;
+  transition: border-color 0.15s;
+}
+.file-input:hover { border-color: var(--border-active, #3a3a52); }
+.file-input:focus-within { border-color: var(--accent, #7c4dff); outline: none; }
+
+/* 画像検出のファイル入力も枠付きフィールドに揃える */
+.image-detect-file {
+  padding: 9px 12px;
+  background: var(--surface, #1a1a2e);
+  border: 1px solid var(--border, #2a2a3e);
+  border-radius: 6px;
+}
+
+/* 画像ビュー等の入力 (.ml-input / .image-detect-select) も .input と同じ挙動に揃える */
+.ml-input:hover, .image-detect-select:hover { border-color: var(--border-active, #3a3a52); }
+.ml-input:focus, .image-detect-select:focus { border-color: var(--accent, #7c4dff); outline: none; }
+.ml-input::placeholder { color: var(--text-muted, #8a8a9a); }
+.ml-input:disabled, .image-detect-select:disabled { opacity: 0.55; cursor: not-allowed; }
+
+/* レンジスライダーのつまみをテーマ色に */
+input[type="range"], .image-detect-slider { accent-color: var(--accent, #7c4dff); }
+
+/* チェックボックスもテーマ色に (列選択チップ等) */
+input[type="checkbox"], input[type="radio"] { accent-color: var(--accent, #7c4dff); }

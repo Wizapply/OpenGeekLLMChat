@@ -12,3 +12,8 @@ cert.pem
 key.pem
 # Python venv
 .venv-transcribe/
+# Python キャッシュ
+__pycache__/
+*.pyc
+# ML/RL の実行時データ (データセット・学習済みモデル等)
+ml/

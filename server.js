@@ -76,6 +76,9 @@ const DEFAULT_CONFIG = {
     enabled: false,          // 機械学習機能の有効化。要 `npm install duckdb`
     apiTokens: [],           // 外部API用トークン: [{name, token, permissions}]
                              //   permissions: "ml:read" / "ml:write" / "*" (全部)
+    onlinePort: 11600,       // リアルタイム/オンラインRLワーカーのポート (Node が遅延起動)
+    onlineIdleMs: 0,         // ワーカーのアイドル停止(ms)。0=常駐(学習途中のバッファ保護のため既定無効)
+    onlineReadyTimeoutMs: 60000, // ワーカー起動待ちタイムアウト(ms)
   },
   ragTopK: 10,
   ragMode: 'agentic',
@@ -99,6 +102,19 @@ const DEFAULT_CONFIG = {
   topK: 40,
   topP: 0.9,
   temperature: 0.7,
+  // ─── 繰り返し/思考ループ対策のサンプラー (llama.cpp) ───
+  // Qwen3 等の thinking が同じ文を繰り返してループするのを防ぐ。1.0/0で各々無効。
+  repeatPenalty: 1.1,        // 繰り返しペナルティ (1.05〜1.15が無難、1.0で無効)
+  repeatLastN: 320,          // ペナルティを適用する直近トークン数
+  presencePenalty: 0,        // OpenAI互換 presence_penalty
+  frequencyPenalty: 0,       // OpenAI互換 frequency_penalty
+  // DRY サンプラー: 反復ループに非常に有効 (dryMultiplier=0 で無効)
+  dryMultiplier: 0.8,
+  dryBase: 1.75,
+  dryAllowedLength: 2,
+  dryPenaltyLastN: -1,       // -1 = コンテキスト全体を対象
+  // 1応答あたりの最大生成トークン (暴走ループの安全網。agentContext.largePredict が優先)
+  chatMaxTokens: 8192,
   // ログレベル: 'verbose' (全ログ), 'normal' (デフォルト), 'quiet' (最小限)
   // 'quiet' にすると /v1/* プロキシの毎リクエストログとllama-serverのstdoutを抑制
   logLevel: 'normal',
@@ -305,6 +321,21 @@ function buildAgentDeps() {
     isSafeReadOnlySql,
     ML_MODELS_DIR,
     runMlPredict,
+    // 強化学習 (RL)
+    RL_MODELS_DIR,
+    loadRlAgents,
+    runRlPolicy,
+    runRlEval,
+    startRlTraining,
+    // オンラインRL (常駐ワーカー経由)
+    rlOnlineAct: async (name, state, epsilon) => {
+      await ensureRlOnlineWorker();
+      return rlWorkerRequest('/act', { name, state, epsilon });
+    },
+    rlOnlineLearn: async (name, exp) => {
+      await ensureRlOnlineWorker();
+      return rlWorkerRequest('/learn', { name, ...exp });
+    },
     // ファイル操作
     UPLOADS_DIR,
     listUploadFiles: async () => {
@@ -867,6 +898,8 @@ function stopEmbeddingModel() {
 function cleanup() {
   if (chatProc) try { chatProc.kill('SIGTERM'); } catch {}
   if (embedProc) try { embedProc.kill('SIGTERM'); } catch {}
+  // オンラインRLワーカー (SIGTERM で dirty なエージェントを自動 checkpoint)
+  if (rlOnlineWorker && rlOnlineWorker.proc) try { rlOnlineWorker.proc.kill('SIGTERM'); } catch {}
   // 外部APIサーバーも全停止
   for (const [, s] of externalServers) {
     if (s.proc && !s.proc.killed) {
@@ -1835,8 +1868,12 @@ const TORCH_CACHE_DIR = path.join(ML_DIR, 'torch_cache');
 const IMAGE_DATASETS_DIR = path.join(ML_DIR, 'image_datasets'); // データセット (画像+アノテーション)
 const IMAGE_MODELS_DIR = path.join(ML_DIR, 'image_models');     // 学習済みカスタムモデル
 
+// 強化学習 (RL / DQN) — 組み込み環境でエージェントを学習
+const RL_MODELS_DIR = path.join(ML_DIR, 'rl_models');  // 学習済みエージェント (名前毎にディレクトリ)
+const RL_JOBS_FILE = path.join(ML_DIR, 'rl_jobs.json'); // RL 学習ジョブ履歴
+
 // ディレクトリ作成
-for (const d of [TUNING_DIR, TUNING_DATA_DIR, TUNING_RUNS_DIR, ML_DIR, ML_MODELS_DIR, RAG_DIR, TORCH_CACHE_DIR, IMAGE_DATASETS_DIR, IMAGE_MODELS_DIR]) {
+for (const d of [TUNING_DIR, TUNING_DATA_DIR, TUNING_RUNS_DIR, ML_DIR, ML_MODELS_DIR, RAG_DIR, TORCH_CACHE_DIR, IMAGE_DATASETS_DIR, IMAGE_MODELS_DIR, RL_MODELS_DIR]) {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 }
 
@@ -3553,6 +3590,7 @@ let _duckdb = null;        // duckdb モジュール (lazy load)
 let _mlDb = null;           // データベース接続
 let _mlDbConn = null;       // 接続オブジェクト
 let _mlDbInitFailed = false; // duckdb モジュール初期化失敗フラグ
+let _mlDbExternalHold = false; // 外部プロセス(オフラインRL等)が read_only でDBを掴んでいる間 true
 let currentMlJob = null;    // 実行中の学習ジョブ { jobId, modelName, proc, log: [] }
                             // DuckDB は排他ロックなので学習中は Node 側で DB を開かない
 
@@ -3572,7 +3610,7 @@ function getDuckDB() {
 function getMlDb() {
   // 学習中(currentMlJob 実行中)は ML DB を絶対に開かない
   // Python(ml_runner)が排他ロックを取得しているため、Node側で開こうとすると失敗する
-  if (currentMlJob) {
+  if (currentMlJob || _mlDbExternalHold) {
     throw new Error('現在 ML 学習ジョブ実行中のため DuckDB は一時的にアクセスできません (ジョブ終了後に再試行してください)');
   }
   if (_mlDbConn) return _mlDbConn;
@@ -3603,6 +3641,30 @@ function mlExec(sql) {
       resolve();
     });
   });
+}
+
+// 外部プロセス (オフラインRL の学習/評価) が DuckDB を read_only で開く前に、
+// Node 側の接続を CHECKPOINT してから完全クローズし、排他ロック競合を避ける。
+// 解放後は _mlDbExternalHold=true の間 Node 側からはアクセス不可。reacquireMlDb() で再開。
+async function releaseMlDbForExternal(ip) {
+  try {
+    if (_mlDbConn) {
+      await mlExec('CHECKPOINT');
+      await new Promise((resolve) => _mlDbConn.close(resolve));
+      _mlDbConn = null;
+    }
+    if (_mlDb) {
+      await new Promise((resolve) => _mlDb.close(resolve));
+      _mlDb = null;
+    }
+  } catch (e) {
+    log(ip || '-', `[ML] DB一時クローズ警告: ${e.message} (続行します)`);
+  }
+  _mlDbExternalHold = true;
+}
+// 外部プロセス終了後に呼ぶ。次回 getMlDb() で遅延再接続される。
+function reacquireMlDb() {
+  _mlDbExternalHold = false;
 }
 
 // ─── メタ情報管理（テーブル説明文等） ───
@@ -5131,6 +5193,7 @@ app.post('/ml/image/datasets/:name/import', requireAuth, requirePermission('ml:w
 
 // ─── 画像学習ジョブ (表データ学習とは別系統) ───
 let currentImageJob = null;  // { jobId, datasetName, modelName, proc, log: [] }
+let currentRlJob = null;     // 強化学習(RL)ジョブ { jobId, name, env, proc, log: [] }
 
 const IMAGE_JOBS_FILE = path.join(ML_DIR, 'image_jobs.json');
 function loadImageJobs() {
@@ -5445,6 +5508,647 @@ ${'='.repeat(50)}
   } catch (e) {
     log(getIP(req), `[画像学習] モデルDL失敗: ${name} - ${e.message}`);
     if (!res.headersSent) res.status(500).json({ error: `zip生成に失敗: ${e.message}` });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// 強化学習 (RL / DQN) — rl_runner.py でデータテーブルからオフラインRLを学習・評価
+// 表データ学習・画像学習とは独立した別系統 (currentRlJob で1ジョブのみ実行)
+// ════════════════════════════════════════════════════════════════════════
+
+// 利用可能なアルゴリズム (UIのセレクタ用)
+const RL_ALGOS = [
+  { name: 'dqn', label: 'DQN', desc: '価値ベース off-policy の基本。ターゲットネットワーク + バッチ学習' },
+  { name: 'ddqn', label: 'Double DQN', desc: '行動選択と評価を分離し、Q値の過大評価を抑える定番改良' },
+  { name: 'cql', label: 'CQL (Conservative Q-Learning)', desc: 'オフラインRLの代表手法。ログ外行動のQ値を保守的に抑制' },
+  { name: 'bc', label: 'Behavior Cloning (模倣)', desc: 'ログ済み行動を教師あり学習で模倣するベースライン (報酬不使用)' },
+];
+
+function loadRlJobs() {
+  if (!fs.existsSync(RL_JOBS_FILE)) return [];
+  try { return JSON.parse(fs.readFileSync(RL_JOBS_FILE, 'utf-8')); }
+  catch { return []; }
+}
+function saveRlJobs(jobs) {
+  fs.writeFileSync(RL_JOBS_FILE, JSON.stringify(jobs.slice(0, 50), null, 2), 'utf-8');
+}
+// エージェント名検証 (英数字・ハイフン・アンダースコア)
+const isValidAgentName = isValidDatasetName;
+
+// ─── アルゴリズム / 学習方式の情報 ───
+app.get('/ml/rl/envs', requireAuth, requirePermission('ml:read'), (req, res) => {
+  res.json({
+    algos: RL_ALGOS,
+    dataset: {
+      supported: true,
+      label: '📊 データテーブルから学習 (オフラインRL)',
+      desc: 'DuckDB の表をログ済み経験データとみなして学習。next_state列を指定すれば遷移ベースのオフラインDQN、なければ文脈付きバンディット。',
+    },
+    online: {
+      supported: true,
+      label: '⚡ リアルタイム/オンライン学習 (外部API)',
+      desc: '常駐ワーカーがモデルをメモリ保持し、act(推論)/learn(経験投入で即更新)をHTTPで提供。学習済みエージェントのウォームスタート、またはスキーマ指定でゼロから作成。',
+    },
+  });
+});
+
+// ─── 学習済みエージェント一覧 ───
+app.get('/ml/rl/models', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const models = [];
+  try {
+    for (const name of fs.readdirSync(RL_MODELS_DIR)) {
+      const cfgPath = path.join(RL_MODELS_DIR, name, 'config.json');
+      const modelPath = path.join(RL_MODELS_DIR, name, 'model.pt');
+      if (!fs.existsSync(cfgPath) || !fs.existsSync(modelPath)) continue;
+      try {
+        const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+        let metrics = null;
+        const mp = path.join(RL_MODELS_DIR, name, 'metrics.json');
+        if (fs.existsSync(mp)) {
+          try {
+            const m = JSON.parse(fs.readFileSync(mp, 'utf-8'));
+            metrics = {
+              datasetMode: m.datasetMode,
+              finalLoss: m.finalLoss,
+              policyAgreement: m.policyAgreement,
+              meanQ: m.meanQ,
+              loggedMeanReward: m.loggedMeanReward,
+              nTransitions: m.nTransitions,
+              epochs: m.epochs,
+              elapsedSec: m.elapsedSec,
+              // オンライン学習の指標
+              totalSteps: m.totalSteps,
+              bufferSize: m.bufferSize,
+              lossEMA: m.lossEMA,
+              rewardEMA: m.rewardEMA,
+            };
+          } catch {}
+        }
+        models.push({
+          name,
+          env: cfg.env,
+          online: cfg.online === true || cfg.env === 'online',
+          algo: cfg.algo,
+          episodes: cfg.episodes,
+          datasetMode: cfg.datasetMode,
+          tableName: cfg.tableName,
+          stateColumns: cfg.meta?.stateColumns,
+          actionColumn: cfg.meta?.actionColumn,
+          actionLabels: cfg.actionLabels,
+          trainedAt: cfg.trainedAt,
+          metrics,
+        });
+      } catch {}
+    }
+  } catch {}
+  models.sort((a, b) => (b.trainedAt || 0) - (a.trainedAt || 0));
+  res.json({
+    models,
+    runningJob: currentRlJob ? { jobId: currentRlJob.jobId, name: currentRlJob.name, env: currentRlJob.env } : null,
+  });
+});
+
+// ─── 学習開始 (データテーブルからのオフラインRL) ───
+// body: { name, table, stateColumns[], actionColumn, rewardColumn,
+//         nextStateColumns?[], doneColumn?, algo?, episodes?, gamma?, learningRate?, hiddenSize?, batchSize? }
+// 列名の簡易検証 (SQLは python 側で二重引用符で囲むため、引用符・バックスラッシュ・; を禁止)
+function isValidRlColumn(c) {
+  return typeof c === 'string' && c.length > 0 && c.length <= 128 && !/["\\;]/.test(c);
+}
+
+// RL 学習の中核処理 (HTTPルートと agent_proxy ツールから共用)。
+// 成功時 { jobId } を返し、失敗時は Error を throw する。
+async function startRlTraining(b, ip) {
+  if (currentRlJob) {
+    const e = new Error(`既にRL学習中: ${currentRlJob.name}`); e.status = 409; throw e;
+  }
+  if (!isValidAgentName(b.name)) {
+    const e = new Error('エージェント名は英数字・ハイフン・アンダースコア (1〜64文字)'); e.status = 400; throw e;
+  }
+  const algo = RL_ALGOS.some(a => a.name === b.algo) ? b.algo : 'dqn';
+  const scriptPath = path.join(__dirname, 'rl_runner.py');
+  if (!fs.existsSync(scriptPath)) {
+    const e = new Error(`rl_runner.py が見つかりません: ${scriptPath}`); e.status = 500; throw e;
+  }
+
+  // データテーブル由来 (オフラインRL) の列マッピングを検証
+  if (!isValidTableName(b.table)) { const e = new Error('無効なテーブル名'); e.status = 400; throw e; }
+  const stateCols = Array.isArray(b.stateColumns) ? b.stateColumns : [];
+  if (stateCols.length === 0 || !stateCols.every(isValidRlColumn)) {
+    const e = new Error('stateColumns は1個以上の有効な列名が必要です'); e.status = 400; throw e;
+  }
+  if (!isValidRlColumn(b.actionColumn)) { const e = new Error('actionColumn が無効です'); e.status = 400; throw e; }
+  if (!isValidRlColumn(b.rewardColumn)) { const e = new Error('rewardColumn が無効です'); e.status = 400; throw e; }
+  const nextCols = Array.isArray(b.nextStateColumns) ? b.nextStateColumns.filter(c => c) : [];
+  if (nextCols.length > 0 && (nextCols.length !== stateCols.length || !nextCols.every(isValidRlColumn))) {
+    const e = new Error('nextStateColumns は stateColumns と同数・同順で指定してください'); e.status = 400; throw e;
+  }
+  const doneCol = (b.doneColumn && isValidRlColumn(b.doneColumn)) ? b.doneColumn : null;
+
+  const clampInt = (v, def, lo, hi) => Math.min(Math.max(parseInt(v) || def, lo), hi);
+  const clampNum = (v, def, lo, hi) => Math.min(Math.max(typeof v === 'number' ? v : (parseFloat(v) || def), lo), hi);
+  const outputDir = path.join(RL_MODELS_DIR, b.name);
+  const runConfig = {
+    mode: 'train', name: b.name, env: 'dataset', algo,
+    episodes: clampInt(b.episodes, 300, 10, 5000),
+    gamma: clampNum(b.gamma, 0.99, 0.5, 0.999),
+    learningRate: clampNum(b.learningRate, 0.001, 1e-5, 0.1),
+    hiddenSize: clampInt(b.hiddenSize, 128, 16, 1024),
+    batchSize: clampInt(b.batchSize, 64, 8, 512),
+    cqlAlpha: clampNum(b.cqlAlpha, 0.5, 0.0, 10.0),
+    tableName: b.table, stateColumns: stateCols, actionColumn: b.actionColumn,
+    rewardColumn: b.rewardColumn, nextStateColumns: nextCols, doneColumn: doneCol,
+    dbPath: ML_DB_FILE, outputDir,
+  };
+
+  // Python が DuckDB を read_only で開くため、Node 側接続を一旦解放
+  log(ip, `[RL学習] DuckDB を学習用に一時クローズ (table=${b.table})`);
+  await releaseMlDbForExternal(ip);
+
+  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+  const tmpCfg = path.join(outputDir, '_run_config.json');
+  fs.writeFileSync(tmpCfg, JSON.stringify(runConfig, null, 2));
+
+  const jobId = `rljob_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const pythonCmd = appConfig.pythonPath || 'python3';
+  const { spawn } = require('child_process');
+  const proc = spawn(pythonCmd, [scriptPath, tmpCfg], {
+    cwd: __dirname, env: { ...process.env, PYTHONUNBUFFERED: '1' }, detached: true,
+  });
+
+  currentRlJob = { jobId, name: b.name, env: 'dataset', algo, isDataset: true, proc, log: [], startedAt: Date.now() };
+  log(ip, `[RL学習] 開始: ${b.name} (table=${b.table}, algo=${algo}, epochs=${runConfig.episodes})`);
+
+  const handleData = (d) => {
+    if (!currentRlJob) return;
+    currentRlJob.log.push(d.toString());
+    if (currentRlJob.log.length > 1000) currentRlJob.log = currentRlJob.log.slice(-800);
+  };
+  proc.stdout.on('data', handleData);
+  proc.stderr.on('data', handleData);
+
+  const finalize = () => { reacquireMlDb(); };
+  proc.on('close', (code) => {
+    try { fs.unlinkSync(tmpCfg); } catch {}
+    const fullLog = currentRlJob ? currentRlJob.log.join('') : '';
+    const wasCancelled = currentRlJob && currentRlJob.cancelled;
+    let result = null;
+    const m = fullLog.match(/RESULT_JSON:(.+)/);
+    if (m) { try { result = JSON.parse(m[1]); } catch {} }
+    const jobs = loadRlJobs();
+    jobs.unshift({
+      jobId, name: b.name, env: 'dataset', algo,
+      status: wasCancelled ? 'cancelled' : ((code === 0 && result?.status === 'completed') ? 'completed' : 'failed'),
+      datasetMode: result?.datasetMode ?? null,
+      finalLoss: result?.finalLoss ?? null,
+      policyAgreement: result?.policyAgreement ?? null,
+      meanQ: result?.meanQ ?? null,
+      loggedMeanReward: result?.loggedMeanReward ?? null,
+      device: result?.device ?? null,
+      error: wasCancelled ? null : (result?.error ?? (code !== 0 ? `exit ${code}` : null)),
+      startedAt: currentRlJob ? currentRlJob.startedAt : Date.now(),
+      finishedAt: Date.now(),
+      log: fullLog.slice(-5000),
+    });
+    saveRlJobs(jobs);
+    log('-', `[RL学習] 終了: ${b.name} (exit ${code}, ${wasCancelled ? 'cancelled' : (result?.status || 'failed')})`);
+    currentRlJob = null;
+    finalize();
+  });
+  proc.on('error', (err) => {
+    try { fs.unlinkSync(tmpCfg); } catch {}
+    log('-', `[RL学習] プロセスエラー: ${err.message}`);
+    currentRlJob = null;
+    finalize();
+  });
+
+  return { jobId };
+}
+
+app.post('/ml/rl/train', requireAuth, requirePermission('ml:write'), jsonParser, async (req, res) => {
+  try {
+    const out = await startRlTraining(req.body || {}, getIP(req));
+    res.json({ ok: true, jobId: out.jobId });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// ─── 学習ジョブの状態 + ログ ───
+app.get('/ml/rl/train/status', requireAuth, requirePermission('ml:read'), (req, res) => {
+  if (currentRlJob) {
+    return res.json({
+      running: true,
+      jobId: currentRlJob.jobId,
+      name: currentRlJob.name,
+      env: currentRlJob.env,
+      log: currentRlJob.log.join(''),
+    });
+  }
+  const jobs = loadRlJobs();
+  res.json({ running: false, recentJobs: jobs.slice(0, 10) });
+});
+
+// ─── 学習中ジョブのキャンセル ───
+app.post('/ml/rl/train/cancel', requireAuth, requirePermission('ml:write'), (req, res) => {
+  if (!currentRlJob) return res.status(400).json({ error: '学習中のRLジョブがありません' });
+  currentRlJob.cancelled = true;
+  const pid = currentRlJob.proc && currentRlJob.proc.pid;
+  if (pid) {
+    try { process.kill(-pid, 'SIGKILL'); }
+    catch { try { currentRlJob.proc.kill('SIGKILL'); } catch {} }
+  }
+  res.json({ ok: true });
+});
+
+// ─── 学習曲線 (報酬履歴) 取得 ───
+app.get('/ml/rl/models/:name/metrics', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const name = req.params.name;
+  if (!isValidAgentName(name)) return res.status(400).json({ error: '無効なエージェント名' });
+  const mp = path.join(RL_MODELS_DIR, name, 'metrics.json');
+  if (!fs.existsSync(mp)) return res.status(404).json({ error: 'メトリクスが見つかりません (未学習?)' });
+  try { res.json(JSON.parse(fs.readFileSync(mp, 'utf-8'))); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── エージェント削除 ───
+app.delete('/ml/rl/models/:name', requireAuth, requirePermission('ml:write'), (req, res) => {
+  const ip = getIP(req);
+  const name = req.params.name;
+  if (!isValidAgentName(name)) return res.status(400).json({ error: '無効なエージェント名' });
+  if (currentRlJob && currentRlJob.name === name) {
+    return res.status(409).json({ error: '学習中のエージェントは削除できません' });
+  }
+  const dir = path.join(RL_MODELS_DIR, name);
+  if (!fs.existsSync(dir)) return res.status(404).json({ error: 'エージェントが見つかりません' });
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  log(ip, `[RL学習] エージェント削除: ${name}`);
+  res.json({ ok: true });
+});
+
+// 学習済みエージェントの env (組み込み/dataset) を config.json から判定
+function getRlAgentEnv(name) {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(RL_MODELS_DIR, name, 'config.json'), 'utf-8'));
+    return cfg.env || null;
+  } catch { return null; }
+}
+
+// ─── リアルタイム/オンラインRL ワーカー管理 ───
+// rl_online_server.py をメモリ常駐させ、act/learn を localhost HTTP でプロキシする。
+// sd-server/llama-server と同じく遅延起動・identity-guard でハンドルを null 化。
+// 注意: オンライン学習は DuckDB を一切使わない (経験はAPI経由、ウォームスタートは
+//       model.pt/config.json の読み込みのみ) ため、ML DB の release/reacquire 調停は不要。
+let rlOnlineWorker = { proc: null, port: null, starting: false, lastUsed: 0 };
+
+async function ensureRlOnlineWorker() {
+  const ml = appConfig.ml || {};
+  const port = ml.onlinePort || 11600;
+  if (rlOnlineWorker.proc && !rlOnlineWorker.proc.killed) {
+    rlOnlineWorker.lastUsed = Date.now();
+    return port;
+  }
+  // 既に起動処理中なら ready を待つ
+  if (rlOnlineWorker.starting) {
+    const ok = await waitForReady('127.0.0.1', port, ml.onlineReadyTimeoutMs || 60000, false);
+    if (!ok) throw new Error('オンラインRLワーカーの起動待ちがタイムアウトしました');
+    rlOnlineWorker.lastUsed = Date.now();
+    return port;
+  }
+  rlOnlineWorker.starting = true;
+  try {
+    const scriptPath = path.join(__dirname, 'rl_online_server.py');
+    if (!fs.existsSync(scriptPath)) throw new Error('rl_online_server.py が見つかりません');
+    const pythonCmd = appConfig.pythonPath || 'python3';
+    const { spawn } = require('child_process');
+    const proc = spawn(pythonCmd, [scriptPath, String(port)], {
+      cwd: __dirname,
+      env: { ...process.env, PYTHONUNBUFFERED: '1', RL_MODELS_DIR },
+    });
+    const quiet = appConfig.logLevel === 'quiet';
+    proc.stdout.on('data', d => { if (!quiet) process.stdout.write(`[rl-online] ${d}`); });
+    proc.stderr.on('data', d => { if (!quiet) process.stderr.write(`[rl-online] ${d}`); });
+    proc.on('exit', (code) => {
+      if (rlOnlineWorker.proc === proc) rlOnlineWorker.proc = null;
+      log('-', `[rl-online] ワーカー終了 (code=${code})`);
+    });
+    proc.on('error', (err) => {
+      if (rlOnlineWorker.proc === proc) rlOnlineWorker.proc = null;
+      log('-', `[rl-online] 起動エラー: ${err.message}`);
+    });
+    rlOnlineWorker.proc = proc;
+    rlOnlineWorker.port = port;
+    // readiness 待ちと、spawn 失敗(error/即時exit)を競合させて即座に失敗を検出する
+    const failPromise = new Promise((resolve) => {
+      proc.once('error', () => resolve('error'));
+      proc.once('exit', () => resolve('exit'));
+    });
+    const ok = await Promise.race([
+      waitForReady('127.0.0.1', port, ml.onlineReadyTimeoutMs || 60000, false),
+      failPromise,
+    ]);
+    if (ok !== true) {
+      try { proc.kill('SIGKILL'); } catch {}
+      rlOnlineWorker.proc = null;
+      throw new Error('オンラインRLワーカーが起動しませんでした (torch 未インストール、または pythonPath を確認してください)');
+    }
+    rlOnlineWorker.lastUsed = Date.now();
+    log('-', `[rl-online] ワーカー起動 (:${port})`);
+    return port;
+  } finally {
+    rlOnlineWorker.starting = false;
+  }
+}
+
+// ワーカーへ JSON POST して JSON 応答を得る
+function rlWorkerRequest(reqPath, body) {
+  return new Promise((resolve, reject) => {
+    const data = Buffer.from(JSON.stringify(body || {}), 'utf-8');
+    const req = http.request({
+      hostname: '127.0.0.1', port: rlOnlineWorker.port, path: reqPath, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': data.length },
+      timeout: 30000,
+    }, (resp) => {
+      let b = '';
+      resp.on('data', d => b += d);
+      resp.on('end', () => {
+        let j;
+        try { j = JSON.parse(b); } catch { return reject(new Error('ワーカー応答の解析に失敗しました')); }
+        if (resp.statusCode >= 400) {
+          const e = new Error(j.error || `ワーカーエラー ${resp.statusCode}`);
+          e.status = resp.statusCode;
+          return reject(e);
+        }
+        resolve(j);
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('ワーカーへのリクエストがタイムアウトしました')); });
+    req.write(data); req.end();
+  });
+}
+
+// アイドル停止チェック (既定 onlineIdleMs=0 で無効)
+function checkRlOnlineIdle() {
+  const idleMs = appConfig.ml?.onlineIdleMs;
+  if (!idleMs || idleMs <= 0) return;
+  if (!rlOnlineWorker.proc || rlOnlineWorker.starting) return;
+  if (Date.now() - rlOnlineWorker.lastUsed >= idleMs) {
+    log('-', '[rl-online] アイドルのためワーカーを停止 (dirty は自動保存)');
+    try { rlOnlineWorker.proc.kill('SIGTERM'); } catch {}
+  }
+}
+setInterval(checkRlOnlineIdle, 30000);
+
+// 学習済みエージェント一覧 (HTTPルートと agent_proxy ツールから共用)
+function loadRlAgents() {
+  const models = [];
+  try {
+    for (const name of fs.readdirSync(RL_MODELS_DIR)) {
+      const cfgPath = path.join(RL_MODELS_DIR, name, 'config.json');
+      const modelPath = path.join(RL_MODELS_DIR, name, 'model.pt');
+      if (!fs.existsSync(cfgPath) || !fs.existsSync(modelPath)) continue;
+      try {
+        const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+        const info = {
+          name, env: cfg.env, algo: cfg.algo, datasetMode: cfg.datasetMode,
+          actionLabels: cfg.actionLabels, trainedAt: cfg.trainedAt,
+          online: cfg.online === true || cfg.env === 'online',
+        };
+        if (cfg.env === 'dataset' || cfg.env === 'online') {
+          info.tableName = cfg.tableName;
+          info.stateColumns = cfg.meta?.stateColumns || [];
+          info.actionColumn = cfg.meta?.actionColumn;
+        }
+        const mp = path.join(RL_MODELS_DIR, name, 'metrics.json');
+        if (fs.existsSync(mp)) { try { info.metrics = JSON.parse(fs.readFileSync(mp, 'utf-8')); } catch {} }
+        models.push(info);
+      } catch {}
+    }
+  } catch {}
+  models.sort((a, b) => (b.trainedAt || 0) - (a.trainedAt || 0));
+  return models;
+}
+
+// RL エージェントの評価 (組み込み=ロールアウト軌跡 / dataset=オフライン方策評価)。
+// dataset の場合は Python が DuckDB を read_only で開くため Node 側接続を一時解放する。
+function runRlEval(name, episodes) {
+  return new Promise((resolve, reject) => {
+    if (!isValidAgentName(name)) return reject(new Error('無効なエージェント名'));
+    if (currentRlJob) return reject(new Error(`学習中のため評価できません: ${currentRlJob.name}`));
+    const modelDir = path.join(RL_MODELS_DIR, name);
+    if (!fs.existsSync(path.join(modelDir, 'model.pt'))) return reject(new Error('エージェントが学習されていません'));
+    const scriptPath = path.join(__dirname, 'rl_runner.py');
+    if (!fs.existsSync(scriptPath)) return reject(new Error('rl_runner.py が見つかりません'));
+
+    const isDataset = getRlAgentEnv(name) === 'dataset';
+    const ep = Math.min(Math.max(parseInt(episodes) || 5, 1), 20);
+    const evalCfg = path.join(modelDir, '_eval_config.json');
+    const evalConfig = { mode: 'eval', modelDir, episodes: ep, outputDir: modelDir };
+    if (isDataset) evalConfig.dbPath = ML_DB_FILE;
+
+    const run = () => {
+      fs.writeFileSync(evalCfg, JSON.stringify(evalConfig, null, 2));
+      const pythonCmd = appConfig.pythonPath || 'python3';
+      const { spawn } = require('child_process');
+      const proc = spawn(pythonCmd, [scriptPath, evalCfg], { cwd: __dirname, env: { ...process.env, PYTHONUNBUFFERED: '1' } });
+      let stdout = '', stderr = '';
+      proc.stdout.on('data', d => { stdout += d.toString(); });
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      const timeout = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 120000);
+      proc.on('close', (code) => {
+        clearTimeout(timeout);
+        try { fs.unlinkSync(evalCfg); } catch {}
+        if (isDataset) reacquireMlDb();
+        const m = (stdout + stderr).match(/RESULT_JSON:(.+)/);
+        if (m) {
+          try {
+            const result = JSON.parse(m[1]);
+            if (result.status === 'completed') return resolve(result);
+            return reject(new Error(result.error || '評価に失敗しました'));
+          } catch (e) { return reject(new Error(`結果のパース失敗: ${e.message}`)); }
+        }
+        reject(new Error(`評価失敗 (exit ${code}): ${stderr.slice(0, 300) || stdout.slice(0, 300)}`));
+      });
+      proc.on('error', (err) => { clearTimeout(timeout); if (isDataset) reacquireMlDb(); reject(new Error(`評価プロセス起動失敗: ${err.message}`)); });
+    };
+
+    if (isDataset) releaseMlDbForExternal('-').then(run).catch(run);
+    else run();
+  });
+}
+
+// RL エージェントの推論: 状態を1件与えて推奨行動とQ値を返す (DuckDB 不使用)。
+function runRlPolicy(name, state) {
+  return new Promise((resolve, reject) => {
+    if (!isValidAgentName(name)) return reject(new Error('無効なエージェント名'));
+    const modelDir = path.join(RL_MODELS_DIR, name);
+    if (!fs.existsSync(path.join(modelDir, 'model.pt'))) return reject(new Error('エージェントが学習されていません'));
+    const scriptPath = path.join(__dirname, 'rl_runner.py');
+    if (!fs.existsSync(scriptPath)) return reject(new Error('rl_runner.py が見つかりません'));
+    const polCfg = path.join(modelDir, `_policy_${Date.now()}.json`);
+    fs.writeFileSync(polCfg, JSON.stringify({ mode: 'policy', modelDir, state: state || {} }, null, 2));
+    const pythonCmd = appConfig.pythonPath || 'python3';
+    const { spawn } = require('child_process');
+    const proc = spawn(pythonCmd, [scriptPath, polCfg], { cwd: __dirname, env: { ...process.env, PYTHONUNBUFFERED: '1' } });
+    let stdout = '', stderr = '';
+    proc.stdout.on('data', d => { stdout += d.toString(); });
+    proc.stderr.on('data', d => { stderr += d.toString(); });
+    const timeout = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 30000);
+    proc.on('close', (code) => {
+      clearTimeout(timeout);
+      try { fs.unlinkSync(polCfg); } catch {}
+      const m = (stdout + stderr).match(/RESULT_JSON:(.+)/);
+      if (m) {
+        try {
+          const result = JSON.parse(m[1]);
+          if (result.status === 'completed') return resolve(result);
+          return reject(new Error(result.error || '推論に失敗しました'));
+        } catch (e) { return reject(new Error(`結果のパース失敗: ${e.message}`)); }
+      }
+      reject(new Error(`推論失敗 (exit ${code}): ${stderr.slice(0, 300) || stdout.slice(0, 300)}`));
+    });
+    proc.on('error', (err) => { clearTimeout(timeout); reject(new Error(`推論プロセス起動失敗: ${err.message}`)); });
+  });
+}
+
+// ─── 評価 (組み込み=軌跡 / dataset=オフライン方策評価) ───
+// body: { episodes? }
+app.post('/ml/rl/models/:name/eval', requireAuth, requirePermission('ml:read'), jsonParser, async (req, res) => {
+  try {
+    const result = await runRlEval(req.params.name, (req.body || {}).episodes);
+    res.json(result);
+  } catch (e) {
+    res.status(/学習中/.test(e.message) ? 409 : 500).json({ error: e.message });
+  }
+});
+
+// ─── 推論 (推奨行動取得) ───
+// body: { state: { 列名: 値, ... } }  (dataset) または { state: [v0, v1, ...] } (組み込み環境)
+app.post('/ml/rl/models/:name/policy', requireAuth, requirePermission('ml:read'), jsonParser, async (req, res) => {
+  try {
+    const result = await runRlPolicy(req.params.name, (req.body || {}).state);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── リアルタイム/オンラインRL 外部API (常駐ワーカー経由) ───
+
+// オンラインエージェントの作成: fromAgent でウォームスタート、または spec でゼロから新規
+app.post('/ml/rl/online/create', requireAuth, requirePermission('ml:write'), jsonParser, async (req, res) => {
+  try {
+    const body = req.body || {};
+    await ensureRlOnlineWorker();
+    if (body.fromAgent) {
+      if (!isValidAgentName(body.fromAgent)) return res.status(400).json({ error: '無効なエージェント名' });
+      const dir = path.join(RL_MODELS_DIR, body.fromAgent);
+      if (!fs.existsSync(path.join(dir, 'model.pt')) || !fs.existsSync(path.join(dir, 'config.json'))) {
+        return res.status(404).json({ error: `学習済みエージェントが見つかりません: ${body.fromAgent}` });
+      }
+      // ウォームスタートは同一エージェント名でそのままオンライン継続学習する
+      const result = await rlWorkerRequest('/load_offline', { name: body.fromAgent });
+      return res.json(result);
+    }
+    if (body.spec && typeof body.spec === 'object') {
+      const name = body.name;
+      if (!isValidAgentName(name)) return res.status(400).json({ error: '無効なエージェント名 (英数_-、64文字以内)' });
+      if (fs.existsSync(path.join(RL_MODELS_DIR, name, 'config.json'))) {
+        return res.status(409).json({ error: `エージェント名が既に存在します: ${name}` });
+      }
+      const spec = body.spec;
+      if (!Array.isArray(spec.stateColumns) || spec.stateColumns.length === 0) {
+        return res.status(400).json({ error: 'spec.stateColumns を1つ以上指定してください' });
+      }
+      if (!Array.isArray(spec.actionLabels) || spec.actionLabels.length < 2) {
+        return res.status(400).json({ error: 'spec.actionLabels は2つ以上指定してください' });
+      }
+      const result = await rlWorkerRequest('/create', { name, spec });
+      return res.json(result);
+    }
+    res.status(400).json({ error: 'fromAgent か spec のいずれかを指定してください' });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// 推論: 状態を与えて推奨行動を取得 (epsilon>0 で ε-greedy 探索)
+app.post('/ml/rl/models/:name/act', requireAuth, requirePermission('ml:read'), jsonParser, async (req, res) => {
+  try {
+    const name = req.params.name;
+    if (!isValidAgentName(name)) return res.status(400).json({ error: '無効なエージェント名' });
+    const body = req.body || {};
+    if (typeof body.state !== 'object' || body.state === null || Array.isArray(body.state)) {
+      return res.status(400).json({ error: 'state は {列名: 値} のオブジェクトで指定してください' });
+    }
+    let epsilon = body.epsilon;
+    if (epsilon != null && (typeof epsilon !== 'number' || epsilon < 0 || epsilon > 1)) {
+      return res.status(400).json({ error: 'epsilon は 0〜1 の数値で指定してください' });
+    }
+    await ensureRlOnlineWorker();
+    const result = await rlWorkerRequest('/act', { name, state: body.state, epsilon });
+    res.json(result);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// 学習: 経験 (state, action, reward[, next_state, done]) を投入して即時更新
+app.post('/ml/rl/models/:name/learn', requireAuth, requirePermission('ml:write'), jsonParser, async (req, res) => {
+  try {
+    const name = req.params.name;
+    if (!isValidAgentName(name)) return res.status(400).json({ error: '無効なエージェント名' });
+    const body = req.body || {};
+    const payload = { name };
+    if (Array.isArray(body.experiences)) {
+      if (body.experiences.length === 0) return res.status(400).json({ error: 'experiences が空です' });
+      if (body.experiences.length > 1000) return res.status(400).json({ error: 'experiences は1000件以下にしてください' });
+      payload.experiences = body.experiences;
+    } else {
+      if (typeof body.state !== 'object' || body.state === null || Array.isArray(body.state)) {
+        return res.status(400).json({ error: 'state は {列名: 値} のオブジェクトで指定してください' });
+      }
+      if (typeof body.reward !== 'number' || !isFinite(body.reward)) {
+        return res.status(400).json({ error: 'reward は数値で指定してください' });
+      }
+      if (body.action == null) return res.status(400).json({ error: 'action を指定してください' });
+      Object.assign(payload, {
+        state: body.state, action: body.action, reward: body.reward,
+        next_state: body.next_state, done: body.done,
+      });
+    }
+    await ensureRlOnlineWorker();
+    const result = await rlWorkerRequest('/learn', payload);
+    res.json(result);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// 明示的チェックポイント (model.pt / config.json / metrics.json を保存)
+app.post('/ml/rl/models/:name/checkpoint', requireAuth, requirePermission('ml:write'), jsonParser, async (req, res) => {
+  try {
+    const name = req.params.name;
+    if (!isValidAgentName(name)) return res.status(400).json({ error: '無効なエージェント名' });
+    await ensureRlOnlineWorker();
+    const result = await rlWorkerRequest('/checkpoint', { name });
+    res.json(result);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// オンライン学習状況
+app.get('/ml/rl/models/:name/online/status', requireAuth, requirePermission('ml:read'), async (req, res) => {
+  try {
+    const name = req.params.name;
+    if (!isValidAgentName(name)) return res.status(400).json({ error: '無効なエージェント名' });
+    await ensureRlOnlineWorker();
+    const result = await rlWorkerRequest('/status', { name });
+    res.json(result);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
   }
 });
 

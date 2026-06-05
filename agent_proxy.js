@@ -323,6 +323,101 @@ function buildToolDefs(enabledTools, appConfig) {
         },
       },
     });
+    // ─── 強化学習 (RL) ───
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'rl_list_agents',
+        description: '学習済み強化学習(RL)エージェントの一覧と性能指標を取得する。各エージェントはデータテーブルからオフライン学習されたもの (状態→推奨行動の方策)。',
+        parameters: { type: 'object', properties: {} },
+      },
+    });
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'rl_get_policy',
+        description: 'RLエージェントに状態を与えて推奨行動とQ値を取得する。state は {列名: 値} の辞書で渡す (例: {"hour":22,"segment":"C"})。「この状況ではどの選択肢(行動)が最適?」に答えるツール。',
+        parameters: {
+          type: 'object',
+          properties: {
+            agentName: { type: 'string' },
+            state: { description: '状態。{列名: 値} の辞書' },
+          },
+          required: ['agentName', 'state'],
+        },
+      },
+    });
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'rl_eval_agent',
+        description: 'RLエージェントをオフライン方策評価する。ログ済み行動との一致率・推定価値(平均maxQ)・行動分布などを返す。',
+        parameters: {
+          type: 'object',
+          properties: {
+            agentName: { type: 'string' },
+          },
+          required: ['agentName'],
+        },
+      },
+    });
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'rl_train_agent',
+        description: 'データテーブルからオフラインRLでエージェントの学習を開始する(非同期、jobIdを返す)。table・stateColumns・actionColumn・rewardColumn を指定。nextStateColumns を付ければ遷移ベースのオフラインRL、無ければ文脈付きバンディット。',
+        parameters: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'エージェント名 (英数字・ハイフン・アンダースコア)' },
+            table: { type: 'string', description: '経験データのテーブル名' },
+            stateColumns: { type: 'array', items: { type: 'string' }, description: '状態(特徴量)の列名配列' },
+            actionColumn: { type: 'string', description: '行動の列名' },
+            rewardColumn: { type: 'string', description: '報酬の列名' },
+            nextStateColumns: { type: 'array', items: { type: 'string' }, description: '任意: 遷移先状態の列名配列 (stateColumnsと同数同順)' },
+            doneColumn: { type: 'string', description: '任意: 終了フラグの列名' },
+            algo: { type: 'string', description: 'アルゴリズム: dqn(既定) / ddqn / cql(保守的・オフライン向け) / bc(ログ模倣)' },
+            episodes: { type: 'number', description: 'エポック数 (既定300)' },
+          },
+          required: ['name', 'table', 'stateColumns', 'actionColumn', 'rewardColumn'],
+        },
+      },
+    });
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'rl_act',
+        description: 'オンラインRLエージェントに状態を与えて推奨行動を取得する。epsilon>0 を渡すと ε-greedy 探索 (学習用)。rl_get_policy と違いリアルタイム学習中のエージェント向け。',
+        parameters: {
+          type: 'object',
+          properties: {
+            agentName: { type: 'string' },
+            state: { description: '状態。{列名: 値} の辞書' },
+            epsilon: { type: 'number', description: '任意: 探索率 0〜1 (既定0=貪欲)' },
+          },
+          required: ['agentName', 'state'],
+        },
+      },
+    });
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'rl_learn',
+        description: 'オンラインRLエージェントに経験(state, action, reward)を送り、その場で1ステップ学習させる。next_state/done は任意(遷移ベース時)。',
+        parameters: {
+          type: 'object',
+          properties: {
+            agentName: { type: 'string' },
+            state: { description: '状態。{列名: 値} の辞書' },
+            action: { type: 'string', description: '取った行動 (エージェントの行動集合内)' },
+            reward: { type: 'number', description: '得られた報酬' },
+            next_state: { description: '任意: 遷移先状態 {列名: 値}' },
+            done: { description: '任意: エピソード終了フラグ' },
+          },
+          required: ['agentName', 'state', 'action', 'reward'],
+        },
+      },
+    });
   }
 
   if (enabledTools.includes('rag')) {
@@ -436,6 +531,8 @@ async function executeTool(fnName, fnArgs, deps, ip) {
     ddgSearch, fetchPageText,
     getMlDb, loadMlModels, isValidTableName, isSafeReadOnlySql, ML_MODELS_DIR,
     runMlPredict,
+    loadRlAgents, runRlPolicy, runRlEval, startRlTraining,
+    rlOnlineAct, rlOnlineLearn,
     listUploadFiles, readUploadFile,
     searchDocumentsSimple,
   } = deps;
@@ -542,6 +639,70 @@ async function executeTool(fnName, fnArgs, deps, ip) {
       };
       const features = sanitize(fnArgs.features);
       return await runMlPredict(fnArgs.modelName, features);
+    }
+
+    case 'rl_list_agents': {
+      if (!loadRlAgents) return { error: 'RL機能は利用できません' };
+      const agents = loadRlAgents().map(a => ({
+        name: a.name, datasetMode: a.datasetMode,
+        tableName: a.tableName, stateColumns: a.stateColumns, actionColumn: a.actionColumn,
+        actionLabels: a.actionLabels,
+        metrics: a.metrics ? {
+          policyAgreement: a.metrics.policyAgreement,
+          meanQ: a.metrics.meanQ, loggedMeanReward: a.metrics.loggedMeanReward,
+        } : null,
+      }));
+      return { agents, count: agents.length };
+    }
+
+    case 'rl_get_policy': {
+      if (!runRlPolicy) return { error: 'RL機能は利用できません' };
+      return await runRlPolicy(fnArgs.agentName, fnArgs.state);
+    }
+
+    case 'rl_eval_agent': {
+      if (!runRlEval) return { error: 'RL機能は利用できません' };
+      const r = await runRlEval(fnArgs.agentName, fnArgs.episodes);
+      // サンプルはトークンが嵩むので要約のみ返す
+      return {
+        datasetMode: r.datasetMode, nRows: r.nRows,
+        policyAgreement: r.policyAgreement, meanQ: r.meanQ,
+        loggedMeanReward: r.loggedMeanReward, rewardWhenFollowed: r.rewardWhenFollowed,
+        policyActionDist: r.policyActionDist, loggedActionDist: r.loggedActionDist,
+      };
+    }
+
+    case 'rl_train_agent': {
+      if (!startRlTraining) return { error: 'RL機能は利用できません' };
+      try {
+        const out = await startRlTraining(fnArgs, ip);
+        return { ok: true, jobId: out.jobId, note: '学習を開始しました。完了後 rl_list_agents で確認できます。' };
+      } catch (e) {
+        return { error: e.message };
+      }
+    }
+
+    case 'rl_act': {
+      if (!rlOnlineAct) return { error: 'オンラインRL機能は利用できません' };
+      try {
+        const r = await rlOnlineAct(fnArgs.agentName, fnArgs.state, fnArgs.epsilon);
+        return { action: r.action, qValues: r.qValues, explored: r.explored, totalSteps: r.totalSteps };
+      } catch (e) {
+        return { error: e.message };
+      }
+    }
+
+    case 'rl_learn': {
+      if (!rlOnlineLearn) return { error: 'オンラインRL機能は利用できません' };
+      try {
+        const r = await rlOnlineLearn(fnArgs.agentName, {
+          state: fnArgs.state, action: fnArgs.action, reward: fnArgs.reward,
+          next_state: fnArgs.next_state, done: fnArgs.done,
+        });
+        return { ok: true, loss: r.loss, bufferSize: r.bufferSize, totalSteps: r.totalSteps, rewardEMA: r.rewardEMA, warnings: r.warnings };
+      } catch (e) {
+        return { error: e.message };
+      }
     }
 
     // 新名 + 後方互換 (search_documents) の両方を受ける
