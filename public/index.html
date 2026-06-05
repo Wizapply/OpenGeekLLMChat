@@ -4676,8 +4676,13 @@ ${conversationText}
           ) : (
             messages.map((msg, i) => (
               <div key={i} className={`message ${msg.role}`}>
-                <div className={`msg-avatar ${msg.role === 'assistant' ? 'assistant-av' : 'user-av'}`}>
-                  {msg.role === 'assistant' ? '' : 'U'}
+                <div
+                  className={`msg-avatar ${msg.role === 'assistant' ? 'assistant-av' : 'user-av'}`}
+                  style={msg.role !== 'assistant' && appConfig.userIcon
+                    ? { backgroundImage: `url("${appConfig.userIcon}")`, backgroundSize: 'cover', backgroundPosition: 'center' }
+                    : undefined}
+                >
+                  {msg.role === 'assistant' ? '' : (appConfig.userIcon ? '' : 'U')}
                 </div>
                 <div className="msg-content">
                   {msg.thinking && (

@@ -55,6 +55,10 @@ function App() {
   const [dlAdvanced, setDlAdvanced] = useState(false);
   const [dlJob, setDlJob] = useState(null); // サーバーの進捗ジョブ
   const dlPollRef = useRef(null);
+  // ─── ユーザーアイコン ───
+  const [userIcon, setUserIcon] = useState('');
+  const [iconUploading, setIconUploading] = useState(false);
+  const iconInputRef = useRef(null);
   const textareaRef = useRef(null);
 
   // 認証チェック
@@ -62,6 +66,7 @@ function App() {
     (async () => {
       try {
         const cfg = await (await fetch('/config')).json();
+        if (cfg.userIcon) setUserIcon(cfg.userIcon);
         if (cfg.hasPassword) {
           setAuthRequired(true);
           if (cfg.authenticated) setAuthenticated(true);
@@ -298,6 +303,49 @@ function App() {
   // アンマウント時にポーリング停止
   useEffect(() => () => { if (dlPollRef.current) clearInterval(dlPollRef.current); }, []);
 
+  // ─── ユーザーアイコンのアップロード / 解除 ───
+  async function uploadUserIcon(file) {
+    if (!file) return;
+    if (!file.type.startsWith('image/')) { setError('画像ファイルを選択してください'); return; }
+    setIconUploading(true); setError(''); setSuccess('');
+    try {
+      // 拡張子を MIME から決定（サーバー側でも検証される）
+      const extMap = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' };
+      const ext = extMap[file.type] || (file.name.split('.').pop() || 'png').toLowerCase();
+      const fd = new FormData();
+      fd.append('file', file);
+      const r = await fetch(`/config/user-icon?ext=${encodeURIComponent(ext)}`, { method: 'POST', body: fd });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || 'アップロードに失敗しました');
+      // キャッシュ回避のため ?t= を付けて即時反映
+      setUserIcon(`${data.userIcon}?t=${Date.now()}`);
+      setSuccess('ユーザーアイコンを設定しました。チャット画面に反映されます。');
+      setTimeout(() => setSuccess(''), 6000);
+      // config.json が更新されたのでエディタも最新化（誤って上書き消去するのを防ぐ）
+      await loadConfig();
+      await loadBackups();
+    } catch (e) {
+      setError(e.message);
+    } finally { setIconUploading(false); }
+  }
+
+  async function removeUserIcon() {
+    if (!confirm('ユーザーアイコンを解除しますか？')) return;
+    setError(''); setSuccess('');
+    try {
+      const r = await fetch('/config/user-icon', { method: 'DELETE' });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || '解除に失敗しました');
+      setUserIcon('');
+      setSuccess('ユーザーアイコンを解除しました（デフォルトに戻ります）。');
+      setTimeout(() => setSuccess(''), 6000);
+      await loadConfig();
+      await loadBackups();
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
   function formatJson() {
     if (parseError) { setError('構文エラーがあるためフォーマットできません'); return; }
     try {
@@ -367,10 +415,6 @@ function App() {
         <div className="sidebar-section">
           <div className="section-title">ファイル</div>
           <div className="stats-card">
-            <div className="stats-card-label">行数</div>
-            <div className="stats-card-value">{lineCount}</div>
-          </div>
-          <div className="stats-card">
             <div className="stats-card-label">サイズ</div>
             <div className="stats-card-value">{sizeKB} KB</div>
           </div>
@@ -381,27 +425,33 @@ function App() {
             </div>
           </div>
 
-          <div className="section-title" style={{ marginTop: 16 }}>
-            バックアップ
-            <button className="link-btn" onClick={() => setShowBackups(!showBackups)} style={{ marginLeft: 6, fontSize: 10 }}>
-              {showBackups ? '隠す' : `${backups.length}件`}
-            </button>
-          </div>
-          {showBackups && (
-            <div className="backup-list">
-              {backups.length === 0 ? (
-                <div className="empty-hint">バックアップなし</div>
-              ) : (
-                backups.map(b => (
-                  <div key={b.name} className="backup-item" onClick={() => restoreBackup(b.name)}>
-                    <div className="backup-name">{b.name.replace(/^config\.json\.bak\./, '')}</div>
-                    <div className="backup-meta">{(b.size / 1024).toFixed(1)} KB</div>
-                  </div>
-                ))
-              )}
-              <div className="empty-hint" style={{ marginTop: 8 }}>クリックで復元</div>
+          {/* ── ユーザーアイコン ── */}
+          <div className="section-title" style={{ marginTop: 16 }}>ユーザーアイコン</div>
+          <div className="user-icon-row">
+            <div className="user-icon-preview">
+              {userIcon ? <img src={userIcon} alt="user icon" /> : <span className="user-icon-fallback">U</span>}
             </div>
-          )}
+            <div className="user-icon-actions">
+              <input
+                ref={iconInputRef}
+                type="file"
+                accept="image/png,image/jpeg,image/webp,image/gif"
+                style={{ display: 'none' }}
+                onChange={e => { if (e.target.files[0]) uploadUserIcon(e.target.files[0]); e.target.value = ''; }}
+              />
+              <button className="btn" onClick={() => iconInputRef.current?.click()} disabled={iconUploading}>
+                {iconUploading ? 'アップロード中...' : '📷 画像を選択'}
+              </button>
+              {userIcon && (
+                <button className="link-btn" style={{ fontSize: 11 }} onClick={removeUserIcon} disabled={iconUploading}>
+                  解除
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="empty-hint" style={{ marginTop: 4, textAlign: 'left' }}>
+            PNG / JPEG / WebP / GIF。チャットのユーザー側アイコンに反映されます。
+          </div>
 
           {/* ── HuggingFace GGUF モデル追加 ── */}
           <div className="section-title" style={{ marginTop: 16 }}>モデル追加 (HuggingFace GGUF)</div>
@@ -466,6 +516,29 @@ function App() {
               GGUF の「resolve」または「blob」URL に対応。登録後は本体を再起動すると選択できます。
             </div>
           </div>
+
+          {/* ── バックアップ（一番下） ── */}
+          <div className="section-title" style={{ marginTop: 16 }}>
+            バックアップ
+            <button className="link-btn" onClick={() => setShowBackups(!showBackups)} style={{ marginLeft: 6, fontSize: 10 }}>
+              {showBackups ? '隠す' : `${backups.length}件`}
+            </button>
+          </div>
+          {showBackups && (
+            <div className="backup-list">
+              {backups.length === 0 ? (
+                <div className="empty-hint">バックアップなし</div>
+              ) : (
+                backups.map(b => (
+                  <div key={b.name} className="backup-item" onClick={() => restoreBackup(b.name)}>
+                    <div className="backup-name">{b.name.replace(/^config\.json\.bak\./, '')}</div>
+                    <div className="backup-meta">{(b.size / 1024).toFixed(1)} KB</div>
+                  </div>
+                ))
+              )}
+              <div className="empty-hint" style={{ marginTop: 8 }}>クリックで復元</div>
+            </div>
+          )}
         </div>
       </aside>
 

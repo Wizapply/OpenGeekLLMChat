@@ -3653,6 +3653,95 @@ app.delete('/files/*', requireAuth, (req, res) => {
   }
 });
 
+// ─── ユーザーアイコン (config.userIcon にパス保存、画像は public/uploads へ) ───
+const USER_ICON_EXT_ALLOW = ['png', 'jpg', 'jpeg', 'webp', 'gif'];
+
+// マジックバイトによる簡易画像判定（拡張子偽装・任意ファイル混入を防ぐ）
+function isImageBuffer(buf) {
+  if (!buf || buf.length < 12) return false;
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return true; // PNG
+  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return true;                     // JPEG
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return true;                     // GIF
+  if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+      buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return true; // WEBP
+  return false;
+}
+
+// config.json を1キーだけ安全に書き換える（バックアップ作成・最新10件保持）
+function patchConfigFile(patchFn) {
+  const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
+  patchFn(cfg);
+  try {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    fs.copyFileSync(CONFIG_FILE, `${CONFIG_FILE}.bak.${ts}`);
+    const dir = path.dirname(CONFIG_FILE);
+    const base = path.basename(CONFIG_FILE);
+    fs.readdirSync(dir)
+      .filter(f => f.startsWith(`${base}.bak.`))
+      .map(f => ({ f, t: fs.statSync(path.join(dir, f)).mtimeMs }))
+      .sort((a, b) => b.t - a.t)
+      .slice(10)
+      .forEach(b => { try { fs.unlinkSync(path.join(dir, b.f)); } catch {} });
+  } catch {}
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
+  return cfg;
+}
+
+// アイコンのアップロード（multipart/form-data）。public/uploads に保存し config.userIcon を更新
+app.post('/config/user-icon', requireAuth, async (req, res) => {
+  const ip = getIP(req);
+  const ct = req.headers['content-type'] || '';
+  if (!ct.startsWith('multipart/form-data')) {
+    return res.status(400).json({ error: 'multipart/form-data で画像を送信してください' });
+  }
+  let ext = String(req.query.ext || 'png').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (ext === 'jpeg') ext = 'jpg';
+  if (!USER_ICON_EXT_ALLOW.includes(ext)) ext = 'png';
+  try {
+    const buf = await parseMultipart(req);
+    if (!buf || buf.length === 0) return res.status(400).json({ error: 'ファイルが空です' });
+    if (buf.length > MAX_FILE_SIZE) return res.status(413).json({ error: `ファイルが大きすぎます (${buf.length} bytes)` });
+    if (!isImageBuffer(buf)) return res.status(400).json({ error: '画像ファイルではありません (PNG/JPEG/WebP/GIF のみ)' });
+
+    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+    const fileName = `user-icon-${Date.now().toString(36)}.${ext}`;
+    const abs = path.join(UPLOADS_DIR, fileName);
+    fs.writeFileSync(abs, buf);
+    const urlPath = `/uploads/${fileName}`;
+
+    const old = appConfig.userIcon;
+    patchConfigFile(cfg => { cfg.userIcon = urlPath; });
+    appConfig.userIcon = urlPath;  // 表示用パスなので再起動なしで即反映
+
+    // 旧アイコンが uploads 配下なら掃除
+    if (old && typeof old === 'string' && old.startsWith('/uploads/')) {
+      const oldAbs = path.join(UPLOADS_DIR, path.basename(old));
+      if (oldAbs !== abs) { try { fs.unlinkSync(oldAbs); } catch {} }
+    }
+    log(ip, `USER ICON SET: ${urlPath} (${buf.length} bytes)`);
+    res.json({ ok: true, userIcon: urlPath, size: buf.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// アイコンの解除（config.userIcon を削除し、uploads のファイルも掃除）
+app.delete('/config/user-icon', requireAuth, (req, res) => {
+  const ip = getIP(req);
+  try {
+    const old = appConfig.userIcon;
+    patchConfigFile(cfg => { delete cfg.userIcon; });
+    appConfig.userIcon = undefined;
+    if (old && typeof old === 'string' && old.startsWith('/uploads/')) {
+      try { fs.unlinkSync(path.join(UPLOADS_DIR, path.basename(old))); } catch {}
+    }
+    log(ip, 'USER ICON CLEARED');
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── グローバル設定 ───
 const SETTINGS_FILE = path.join(__dirname, 'settings.json');
 
