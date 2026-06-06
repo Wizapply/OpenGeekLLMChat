@@ -515,24 +515,29 @@ function renderLatex(text) {
 const MarkdownContent = React.memo(function MarkdownContent({ content }) {
   const ref = useRef(null);
 
-  // [[gen_image:URL|encodedPrompt]] マーカーをパースしてセグメントに分割
+  // [[gen_image:URL|encodedPrompt]] / [[gen_audio:URL|encodedText]] マーカーを
+  // パースしてセグメントに分割。
   // 高速パス: マーカーが含まれていなければ分割せず単純レンダリング
   const segments = React.useMemo(() => {
     if (!content) return [];
-    if (!content.includes('[[gen_image:')) {
+    if (!content.includes('[[gen_image:') && !content.includes('[[gen_audio:')) {
       return [{ type: 'text', value: content }];
     }
     const result = [];
-    const regex = /\[\[gen_image:([^|\]]+)(?:\|([^\]]*))?\]\]/g;
+    const regex = /\[\[gen_(image|audio):([^|\]]+)(?:\|([^\]]*))?\]\]/g;
     let lastIndex = 0;
     let match;
     while ((match = regex.exec(content)) !== null) {
       if (match.index > lastIndex) {
         result.push({ type: 'text', value: content.slice(lastIndex, match.index) });
       }
-      let promptText = '';
-      try { promptText = decodeURIComponent(match[2] || ''); } catch { promptText = match[2] || ''; }
-      result.push({ type: 'gen_image', url: match[1], prompt: promptText });
+      let metaText = '';
+      try { metaText = decodeURIComponent(match[3] || ''); } catch { metaText = match[3] || ''; }
+      if (match[1] === 'audio') {
+        result.push({ type: 'gen_audio', url: match[2], text: metaText });
+      } else {
+        result.push({ type: 'gen_image', url: match[2], prompt: metaText });
+      }
       lastIndex = regex.lastIndex;
     }
     if (lastIndex < content.length) {
@@ -541,7 +546,7 @@ const MarkdownContent = React.memo(function MarkdownContent({ content }) {
     return result;
   }, [content]);
 
-  const hasMarkers = segments.some(s => s.type === 'gen_image');
+  const hasMarkers = segments.some(s => s.type === 'gen_image' || s.type === 'gen_audio');
 
   // マーカー無し: dangerouslySetInnerHTML でシンプルにレンダリング
   // React.memo で contentが変わらない限りこの関数自体が呼ばれないので、
@@ -565,6 +570,9 @@ const MarkdownContent = React.memo(function MarkdownContent({ content }) {
         }
         if (seg.type === 'gen_image') {
           return <GeneratedImage key={i} url={seg.url} prompt={seg.prompt} />;
+        }
+        if (seg.type === 'gen_audio') {
+          return <GeneratedAudio key={i} url={seg.url} text={seg.text} />;
         }
         return null;
       })}
@@ -641,6 +649,71 @@ function GeneratedImage({ url, prompt }) {
         </div>
       )}
     </>
+  );
+}
+
+// ─── 生成音声コンポーネント ───
+// チャット欄に <audio controls> プレーヤーを表示し、再生とダウンロードを提供する。
+//
+// 重要: <audio src="/uploads/..."> に直接URLを渡すと、応答ストリーミング中の
+// 再レンダリングでネットワーク読み込みが繰り返し中断され、ロードが完了せず
+// 再生ボタンが押せない(HAVE_NOTHING, 0:00/0:00)状態になることがある。
+// そこで一度 fetch でファイル全体を取得して Blob URL 化し、それを src に使う。
+// Blobはメモリ上の完結リソースなので、再レンダリングの影響を受けず、長さも
+// 即座に確定してシーク・再生が安定する。
+function GeneratedAudio({ url, text }) {
+  const [blobUrl, setBlobUrl] = useState(null);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let objUrl = null;
+    setBlobUrl(null);
+    setErr(null);
+    fetch(url, { credentials: 'same-origin' })
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.blob();
+      })
+      .then(b => {
+        if (cancelled) return;
+        objUrl = URL.createObjectURL(b);
+        setBlobUrl(objUrl);
+      })
+      .catch(e => { if (!cancelled) setErr(e.message); });
+    return () => {
+      cancelled = true;
+      if (objUrl) URL.revokeObjectURL(objUrl);
+    };
+  }, [url]);
+
+  function downloadAudio() {
+    const a = document.createElement('a');
+    a.href = url;
+    const filename = url.split('/').pop() || `speech_${Date.now()}.wav`;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
+
+  return (
+    <div className="gen-audio-card">
+      <div className="gen-audio-header">
+        <span className="gen-audio-icon">🔊</span>
+        {text && <span className="gen-audio-text" title={text}>{text}</span>}
+      </div>
+      {blobUrl ? (
+        <audio key={blobUrl} className="gen-audio-player" src={blobUrl} controls preload="auto" />
+      ) : (
+        <div className="gen-audio-loading">{err ? `読み込み失敗: ${err}` : '音声を読み込み中…'}</div>
+      )}
+      <div className="gen-audio-actions">
+        <button className="gen-image-btn" onClick={downloadAudio} title="音声をダウンロード">
+          💾 保存
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -1226,7 +1299,11 @@ function App() {
       // Web検索が利用可能か: configで許可されており、かつチャット欄でONになっている
       const webSearchActive = appConfig.webSearch !== false && webSearchEnabled;
 
-      const useAgentic = appConfig.ragMode === 'agentic' && (documents.length > 0 || webSearchActive);
+      // ツール判断ループ(agentic)に入る条件。
+      // ドキュメント添付 or Web検索ON に加え、画像生成/音声合成が有効なら
+      // 「描いて」「音声にして」等を検出できるよう常にツール判断を通す。
+      const useAgentic = appConfig.ragMode === 'agentic'
+        && (documents.length > 0 || webSearchActive || appConfig.imageGen || appConfig.ttsGen);
 
       if (useAgentic) {
         // ─── Agentic RAG + Web検索: LLMがツールで検索を判断 ───
@@ -1394,6 +1471,37 @@ function App() {
                   count: { type: 'number', description: '生成枚数 (デフォルト 1、最大 4)' },
                 },
                 required: ['prompt']
+              }
+            }
+          });
+        }
+
+        // 音声合成ツール: ttsGen が有効ならツール提供
+        // 「音声にして」「しゃべって」「読み上げて」「〇〇の声で作って」等を検出して使用
+        if (appConfig.ttsGen) {
+          const voicePresets = Array.isArray(appConfig.ttsVoices) ? appConfig.ttsVoices : [];
+          const voiceHint = voicePresets.length > 0
+            ? ` 登録済みの声: ${voicePresets.map(v => `"${v.name}"${v.desc ? `(${v.desc})` : ''}`).join('、')}。`
+            : '';
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'generate_speech',
+              description: 'テキストを音声(WAV)に合成する。ユーザーが「音声にして」「しゃべって」「読み上げて」「声で作って」「ボイスを生成」等を依頼した場合に使用する。日本語のテキストをそのまま渡せる。' + voiceHint,
+              parameters: {
+                type: 'object',
+                properties: {
+                  text: {
+                    type: 'string',
+                    description: '読み上げる(音声化する)テキスト。例: "こんにちは"'
+                  },
+                  voice: {
+                    type: 'string',
+                    description: '声の指定。登録済みの声の名前か、または声の特徴をテキストで記述する。例: "30代男性、落ち着いた低めの声"、"明るい女性の声"。省略可。'
+                  },
+                  speed: { type: 'number', description: '話す速さ (0.25〜4.0、デフォルト 1.0)' },
+                },
+                required: ['text']
               }
             }
           });
@@ -1593,6 +1701,11 @@ function App() {
         let apiMessages = [{ role: 'system', content: agentSystem }, ...history];
         let allContexts = [];
         let searchQueries = [];
+        // ツールが実際に生成したメディアの本物URL。
+        // LLMが [[gen_audio:...]]/[[gen_image:...]] のファイル名を改変して出力する
+        // ことがあるため、最終応答でこの実URLでマーカーを確定させる。
+        const generatedAudios = [];   // { url, text }
+        const generatedImages = [];   // { url, prompt }
 
         // アシスタントメッセージを先に追加
         setMessages(prev => [...prev, { role: 'assistant', content: '', thinking: '', contexts: null, agentStatus: 'ツール判断中...', searchQueries: [] }]);
@@ -1631,6 +1744,9 @@ function App() {
         }
         if (hasImages && appConfig.ml?.enabled) {
           toolListLines.push('- detect_objects: 添付画像の物体検出（「何が写ってる」「物体を検出」「画像を分析」等で使う）');
+        }
+        if (appConfig.ttsGen) {
+          toolListLines.push('- generate_speech: テキストを音声(WAV)に合成（「音声にして」「しゃべって」「読み上げて」「〇〇の声で作って」等で使う。声の特徴はテキストで指定可）');
         }
         if (appConfig.fileAccess !== false && wantsServerFileOps) {
           if (wantsFileWrite) {
@@ -2282,6 +2398,9 @@ function App() {
 
                 searchQueries[searchQueries.length - 1].resultCount = data.images.length;
 
+                // 実URLを記録（最終応答でマーカーを確定させるため）
+                data.images.forEach((url) => generatedImages.push({ url, prompt }));
+
                 // 生成画像はカスタムマーカー [[gen_image:URL|prompt]] で返す
                 // LLMがそのまま応答に含めて出力 → MarkdownContent側でパースして <GeneratedImage> 描画
                 const imageMarkers = data.images.map((url) => {
@@ -2296,6 +2415,68 @@ function App() {
                 console.error(`[generate_image] エラー:`, e);
                 searchQueries[searchQueries.length - 1].resultCount = 0;
                 apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: `画像生成失敗: ${errMsg}\n\nユーザーに「画像生成サーバーがまだ起動中の可能性があります。1〜2分待ってからもう一度お試しください」と伝えてください。` });
+              } finally {
+                setMessages(prev => {
+                  const copy = [...prev];
+                  copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: null, searchQueries: [...searchQueries] };
+                  return copy;
+                });
+              }
+            } else if (fnName === 'generate_speech') {
+              const ttsText = (fnArgs.text || '').trim();
+              const ttsVoice = fnArgs.voice || fnArgs.instructions || '';
+              const ttsSpeed = Number(fnArgs.speed) || undefined;
+
+              if (!ttsText) {
+                apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: '音声化するテキストが指定されていません。' });
+                continue;
+              }
+
+              searchQueries.push({ query: `🔊 音声合成: ${ttsText.slice(0, 40)}`, resultCount: null, type: 'audio' });
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = {
+                  ...copy[copy.length - 1],
+                  agentStatus: `🔊 音声生成中: "${ttsText.slice(0, 30)}..."`,
+                  searchQueries: [...searchQueries],
+                };
+                return copy;
+              });
+
+              try {
+                // 音声合成は時間がかかるので長めのタイムアウト (5分)
+                const ctrl = new AbortController();
+                const timer = setTimeout(() => ctrl.abort(), 300000);
+                console.log(`[generate_speech] リクエスト送信: text="${ttsText}", voice="${ttsVoice}", speed=${ttsSpeed}`);
+                const res = await fetch('/tts', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ text: ttsText, voice: ttsVoice, speed: ttsSpeed }),
+                  signal: ctrl.signal,
+                });
+                clearTimeout(timer);
+                const data = await res.json();
+                console.log(`[generate_speech] レスポンス: status=${res.status}`, data);
+                if (!res.ok) throw new Error(data.error || `生成失敗 (HTTP ${res.status})`);
+                if (!data.url) throw new Error('音声が返されませんでした');
+
+                searchQueries[searchQueries.length - 1].resultCount = 1;
+
+                // 実URLを記録（最終応答でマーカーを確定させるため）
+                generatedAudios.push({ url: data.url, text: ttsText });
+
+                // 生成音声はカスタムマーカー [[gen_audio:URL|encodedText]] で返す
+                // LLMがそのまま応答に含めて出力 → MarkdownContent側でパースして <GeneratedAudio> 描画
+                const encoded = encodeURIComponent(ttsText);
+                const marker = `[[gen_audio:${data.url}|${encoded}]]`;
+                const summary = `音声を生成しました（${data.elapsed}秒、声: ${data.voice}${data.caption ? `, 指定: ${data.caption}` : ''}）。\n\n${marker}\n\n` +
+                                `重要: 上記の [[gen_audio:...]] マーカーを、必ずそのまま改変せずに最終応答にコピーして含めてください。これは音声プレーヤーを表示するための重要なタグです。「ご依頼の音声を生成しました。」のような1〜2文のコメントを添えるだけで結構です。マーカーを忘れずに含めてください。`;
+                apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: summary });
+              } catch (e) {
+                const errMsg = e.name === 'AbortError' ? 'タイムアウト（5分超過）' : e.message;
+                console.error(`[generate_speech] エラー:`, e);
+                searchQueries[searchQueries.length - 1].resultCount = 0;
+                apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: `音声生成失敗: ${errMsg}\n\nユーザーに「音声合成サーバーがまだ起動中の可能性があります。1〜2分待ってからもう一度お試しください」と伝えてください。` });
               } finally {
                 setMessages(prev => {
                   const copy = [...prev];
@@ -2487,7 +2668,7 @@ function App() {
         });
 
         if (!finalRes.ok) throw new Error(`API Error: ${finalRes.status}`);
-        await streamResponse(finalRes, contextInfo, searchQueries);
+        await streamResponse(finalRes, contextInfo, searchQueries, { audios: generatedAudios, images: generatedImages });
 
         // ─── 空応答の救済処理 ───
         // ツール呼び出し後の最終応答が空になることがある (Qwen3 系で稀に発生)
@@ -2539,7 +2720,7 @@ function App() {
                 };
                 return copy;
               });
-              await streamResponse(retryRes, contextInfo, searchQueries);
+              await streamResponse(retryRes, contextInfo, searchQueries, { audios: generatedAudios, images: generatedImages });
 
               // それでも空なら、固定メッセージにフォールバック
               const afterMsg = await new Promise(resolve => {
@@ -2671,7 +2852,7 @@ function App() {
           });
 
           if (!retryRes.ok) break;
-          await streamResponse(retryRes, contextInfo, searchQueries);
+          await streamResponse(retryRes, contextInfo, searchQueries, { audios: generatedAudios, images: generatedImages });
           // 次のループで再度<|tool_call|>が出ていないかチェック
         }
 
@@ -2749,7 +2930,39 @@ function App() {
   }
 
   // ─── ストリーミング応答の共通処理 ───
-  async function streamResponse(res, contextInfo, searchQueries) {
+  async function streamResponse(res, contextInfo, searchQueries, genMedia) {
+    // genMedia = { audios: [{url,text}], images: [{url,prompt}] } | undefined
+    // ツールが実際に生成したメディアの本物URL。LLMがマーカーのファイル名を
+    // 改変して出力しても、最終応答でこの実URLに上書き・補完して正しく描画する。
+    function fixGenMarkers(content) {
+      if (!genMedia) return content;
+      const audios = genMedia.audios || [];
+      const images = genMedia.images || [];
+      if (audios.length === 0 && images.length === 0) return content;
+      let out = content || '';
+      // 1) 既存マーカーのURLを実URLで順番に上書き（余分な捏造マーカーは削除）
+      let ai = 0;
+      out = out.replace(/\[\[gen_audio:[^\]]*\]\]/g, () => {
+        if (ai >= audios.length) return '';
+        const a = audios[ai++];
+        return `[[gen_audio:${a.url}|${encodeURIComponent(a.text || '')}]]`;
+      });
+      let ii = 0;
+      out = out.replace(/\[\[gen_image:[^\]]*\]\]/g, () => {
+        if (ii >= images.length) return '';
+        const im = images[ii++];
+        return `[[gen_image:${im.url}|${encodeURIComponent(im.prompt || '')}]]`;
+      });
+      // 2) LLMがマーカーを出さなかった分を末尾に補完
+      for (; ai < audios.length; ai++) {
+        out += `\n\n[[gen_audio:${audios[ai].url}|${encodeURIComponent(audios[ai].text || '')}]]`;
+      }
+      for (; ii < images.length; ii++) {
+        out += `\n\n[[gen_image:${images[ii].url}|${encodeURIComponent(images[ii].prompt || '')}]]`;
+      }
+      return out;
+    }
+
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let assistantContent = '';
@@ -2962,6 +3175,20 @@ function App() {
       }
       return copy;
     });
+
+    // ─── 生成メディアのマーカーを実URLで確定 ───
+    // LLMが [[gen_audio:...]]/[[gen_image:...]] のファイル名を改変・捏造して
+    // 出力することがあるため、ツールが実際に返したURLでマーカーを上書き・補完する。
+    if (genMedia && ((genMedia.audios && genMedia.audios.length) || (genMedia.images && genMedia.images.length))) {
+      setMessages(prev => {
+        const copy = [...prev];
+        const last = copy[copy.length - 1];
+        if (last && last.role === 'assistant') {
+          copy[copy.length - 1] = { ...last, content: fixGenMarkers(last.content || '') };
+        }
+        return copy;
+      });
+    }
   }
 
   // ─── ファイルハンドリング ───
@@ -4699,7 +4926,7 @@ ${conversationText}
                       </div>
                       {msg.searchQueries?.map((sq, si) => (
                         <div key={si} className="agent-search-item">
-                          <span className="agent-search-icon">{sq.type === 'web' ? '🌐' : sq.type === 'file' ? '📁' : sq.type === 'image' ? '🎨' : sq.type === 'data' ? '🗂️' : '🔍'}</span>
+                          <span className="agent-search-icon">{sq.type === 'web' ? '🌐' : sq.type === 'file' ? '📁' : sq.type === 'image' ? '🎨' : sq.type === 'audio' ? '🔊' : sq.type === 'data' ? '🗂️' : '🔍'}</span>
                           <span className="agent-search-query">{sq.query}</span>
                           {sq.resultCount != null && (
                             <span className="agent-search-result">{sq.resultCount}件</span>

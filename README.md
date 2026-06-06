@@ -213,6 +213,17 @@ config.json から HTTPサーバーや llama-server の細かな設定を調整�
 - **複数枚一括生成**: `count: 4` パラメータで最大4枚同時生成
 - **3分タイムアウト**: 大きいモデル・複雑なプロンプトでも対応
 
+### 🔊 音声合成（Irodori-TTS 連携）
+チャットで「『こんにちは』を30代男性の声で作って」と頼むと、LLMが自動的に `generate_speech` ツールを呼び出して音声(WAV)を生成する。日本語特化のローカル音声合成AI [Irodori-TTS](https://github.com/Aratako/Irodori-TTS) の OpenAI互換サーバー（`/v1/audio/speech`）を内部プロセスとして管理する（画像生成 sd-server と同じ方式）。
+
+- **自動ツールコール**: LLMが「音声にして」「しゃべって」「読み上げて」「〇〇の声で作って」等を検出して自動使用
+- **オンデマンドロード**: 初回 generate_speech 時に Irodori-TTS サーバーを自動起動（`irodoriTts.command` 設定時）
+- **アイドルアンロード**: 一定時間使われなければ自動アンロード（VRAM節約、`idleUnloadMs`）
+- **声のテキスト指定 (VoiceDesign)**: 「30代男性、落ち着いた低めの声」のように声の特徴をテキストで指定可能（`instructions` / `irodori.caption` で送信）
+- **声プリセット**: `config.json` の `ttsVoices[]` で「30代男性」「20代女性」等の声を名前付き登録（voice ID / 声の記述をマッピング）
+- **チャット内再生**: `<audio controls>` プレーヤーで即再生 + 💾保存ボタン
+- **サーバー保存**: 生成WAVは画像生成と同じく `public/uploads/` に保存される
+
 ### 🤖 機械学習 (ML) - データ・学習・推論パイプライン
 チャットUI から独立した管理画面（`/ml.html`）で、表データの取り込み・SQL分析・PyTorch学習・推論まで一気通貫に行える。LLMチャットからも自然言語で操作可能。
 
@@ -929,6 +940,19 @@ opengeek-llm-chat/
 | `imageModels[].path` | モデルファイル(.safetensors)の絶対パス |
 | `imageModels[].vae` | VAEモデルの絶対パス（任意、品質向上） |
 | `imageModels[].extraArgs` | sd-server に渡す追加引数（例: `["--type", "f16"]`） |
+| `ttsGen` | 音声合成（Irodori-TTS連携）ON/OFF。`irodoriTts` を設定した上で `true` にして有効化 |
+| `irodoriTts.host` / `port` | Irodori-TTS サーバーの内部通信ホスト/ポート（デフォルト 127.0.0.1:8088） |
+| `irodoriTts.endpoint` | OpenAI互換エンドポイント（デフォルト `/v1/audio/speech`） |
+| `irodoriTts.model` | リクエストの `model` フィールド（デフォルト `irodori-tts`） |
+| `irodoriTts.defaultVoice` | 声指定が無いときの voice ID（`voices/` のファイル名） |
+| `irodoriTts.defaultFormat` | 出力フォーマット（`wav`/`mp3`/`flac`/`opus`/`aac`/`pcm`） |
+| `irodoriTts.captionField` | 声のテキスト記述を `irodori` 内のどのキーで送るか（デフォルト `caption`、`null`で無効） |
+| `irodoriTts.command` / `args` / `cwd` / `env` | サーバー子プロセス自動起動の spawn 設定。`command` を `null` にすると外部起動済みとみなし転送のみ |
+| `irodoriTts.readyTimeoutMs` | 起動完了待ちタイムアウト、デフォルト 300000ms |
+| `irodoriTts.idleUnloadMs` | アイドル時自動アンロード時間（VRAM節約）、0で無効 |
+| `ttsVoices[].name` | 声プリセット名（LLMがこの名前で指定可能） |
+| `ttsVoices[].voiceId` | サーバーの voice ID（リファレンス音声ファイル名）にマッピング |
+| `ttsVoices[].instructions` | 声のテキスト記述（VoiceDesign のキャプション） |
 | `ml.enabled` | 機械学習機能 ON/OFF。`true` で `/ml.html` UI と LLMツール (ml_*) を有効化、要 `npm install duckdb` |
 | `ml.onlinePort` | 強化学習(RL)オンライン常駐ワーカー (`rl_online_server.py`) の localhost ポート、デフォルト 11600 |
 | `ml.onlineIdleMs` | オンラインワーカーのアイドル自動停止時間 (ms)、0 で常駐 (停止しない) |
@@ -1199,6 +1223,9 @@ LLMが自分で判断してツールを呼びます。プロンプトに「検�
 | `GET` | `/image-gen/info` | ✓ | 画像生成サーバー状態（モデル、起動中フラグ） |
 | `POST` | `/image-gen` | ✓ | 画像生成（LLMの generate_image ツール用） |
 | `POST` | `/image-gen/unload` | ✓ | sd-server を手動アンロード（VRAM解放） |
+| `GET` | `/tts/info` | ✓ | 音声合成サーバー状態（声一覧、起動中フラグ） |
+| `POST` | `/tts` | ✓ | 音声合成（LLMの generate_speech ツール用） |
+| `POST` | `/tts/unload` | ✓ | Irodori-TTS サーバーを手動アンロード（VRAM解放） |
 | `POST` | `/auth` | — | ログイン（Cookie発行・24h TTL） |
 | `GET` | `/sse/gpu` | ✓ | GPU監視 SSE |
 | `GET/POST` | `/settings` | ✓ | ユーザー設定 |
@@ -2034,6 +2061,198 @@ draw: a cute orange tabby cat sitting on a windowsill, soft sunlight, photoreali
 - **画像生成中の応答時間**: SDXL Base 1.0 で 1024x1024 / 20steps 程度なら 8〜30秒、サーバー側タイムアウトは 5分
 
 詳細な実装と sd-server オプションは [DESIGN.md](./DESIGN.md) の画像生成セクションを参照。
+
+---
+
+## 🔊 音声合成（Irodori-TTS 連携）
+
+LLMが `generate_speech` ツールを呼び出してテキストを音声(WAV)に合成する仕組み。日本語特化のローカル音声合成AI [Irodori-TTS](https://github.com/Aratako/Irodori-TTS) の OpenAI互換サーバー [Irodori-TTS-Server](https://github.com/Aratako/Irodori-TTS-Server)（`POST /v1/audio/speech`）を子プロセスとして管理し、内部HTTPで通信する（画像生成 sd-server と同じ方式）。
+
+### セットアップ
+
+#### 1. Irodori-TTS-Server の用意
+
+Irodori-TTS-Server は Python 3.10 が必要。**venv 方式（uv 不要・本リポジトリの流儀に一致／推奨）** と **uv 方式** のどちらでも動く。
+
+**A. venv + pip（推奨。`uv` を入れなくてよい）**
+```bash
+git clone https://github.com/Aratako/Irodori-TTS-Server.git
+cd Irodori-TTS-Server
+python3.10 -m venv venv
+source venv/bin/activate
+pip install -e .                      # pyproject.toml から依存をインストール
+# PyTorch を環境に合わせて入れる（AMD ROCm の例。CUDA/CPU は適宜変更）:
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/rocm6.2
+# 声のリファレンス音声は voices/ に配置（例: voices/sample.wav → voice "sample"）
+# 単体起動の確認:
+python -m irodori_openai_tts --host 127.0.0.1 --port 8088
+```
+→ config.json の `irodoriTts.command` は **venv の python の絶対パス**を指定する（下記）。systemd 等から spawn する場合 PATH に依存しない絶対パスが安全。
+
+**B. uv 方式（upstream の標準。`uv` のインストールが必要）**
+```bash
+# uv を入れる（snap でも可: sudo snap install astral-uv）:
+curl -LsSf https://astral.sh/uv/install.sh | sh      # ~/.local/bin/uv に入る
+cd Irodori-TTS-Server
+uv run python -m irodori_openai_tts --host 127.0.0.1 --port 8088
+```
+→ この場合 config.json は `"command": "/絶対パス/uv"`, `"args": ["run","python","-m","irodori_openai_tts", ...]` とする（`uv` 単体だと systemd の PATH に無く `ENOENT` になりやすいので絶対パス推奨）。
+
+VoiceDesign（テキストで声を記述）を使う場合は VoiceDesign 対応モデルを利用する。
+
+#### 2. config.json 設定
+
+```json
+"ttsGen": true,
+"irodoriTts": {
+  "host": "127.0.0.1",
+  "port": 8088,
+  "endpoint": "/v1/audio/speech",
+  "model": "irodori-tts",
+  "defaultVoice": "none",
+  "defaultFormat": "wav",
+  "defaultSpeed": 1.0,
+  "captionField": "caption",
+  "irodori": {},
+  "timeoutMs": 180000,
+  "command": "/home/wizapply-ai/Irodori-TTS-Server/venv/bin/python",
+  "args": ["-m", "irodori_openai_tts", "--host", "127.0.0.1", "--port", "8088"],
+  "cwd": "/home/wizapply-ai/Irodori-TTS-Server",
+  "env": {
+    "HSA_OVERRIDE_GFX_VERSION": "12.0.1",
+    "HIP_VISIBLE_DEVICES": "0"
+  },
+  "readyTimeoutMs": 300000,
+  "idleUnloadMs": 600000
+},
+"ttsVoices": [
+  { "name": "標準", "desc": "参照音声なし（VoiceDesign/既定話者）", "voiceId": "none" },
+  { "name": "30代男性", "desc": "落ち着いた30代男性の声", "instructions": "30代の男性、落ち着いた低めの声、明瞭で穏やかな話し方" },
+  { "name": "20代女性", "desc": "明るい20代女性の声", "instructions": "20代の女性、明るく親しみやすい声、やや高めで元気なトーン" }
+]
+```
+
+| キー | 説明 |
+|:--|:--|
+| `ttsGen` | `true` で音声合成機能を有効化（LLMにツール提供） |
+| `irodoriTts.host` / `port` | Irodori-TTS サーバーの内部通信ホスト/ポート |
+| `irodoriTts.endpoint` | OpenAI互換エンドポイント（既定 `/v1/audio/speech`） |
+| `irodoriTts.model` | リクエストの `model` フィールド（既定 `irodori-tts`） |
+| `irodoriTts.defaultVoice` | 声の指定が無いときに使う voice ID（`voices/` のファイル名） |
+| `irodoriTts.defaultFormat` | 出力フォーマット（`wav`/`mp3`/`flac`/`opus`/`aac`/`pcm`） |
+| `irodoriTts.captionField` | 声のテキスト記述を `irodori` 内のどのキーで送るか（既定 `caption`、`null`で無効） |
+| `irodoriTts.irodori` | irodori 拡張の基底オプション（`num_steps`/`cfg_scale_text` 等） |
+| `irodoriTts.command` / `args` / `cwd` / `env` | サーバーを子プロセス自動起動するための spawn 設定。`command` を `null` にすると「外部起動済み」とみなし転送のみ行う |
+| `irodoriTts.readyTimeoutMs` | 起動完了（TCP接続）待ちタイムアウト |
+| `irodoriTts.idleUnloadMs` | 何ms未使用で自動アンロードするか（`0`で無効） |
+| `ttsVoices[].name` | 声プリセット名（LLMがこの名前で指定できる） |
+| `ttsVoices[].voiceId` | サーバーの voice ID（リファレンス音声のファイル名）にマッピング |
+| `ttsVoices[].instructions` | 声のテキスト記述（VoiceDesign のキャプション） |
+
+> `command` を設定しない場合は、別途 Irodori-TTS サーバーを起動しておけば `/tts` が転送するだけで動作する（画像生成より手軽）。`command` を設定すると sd-server と同様にオンデマンド起動・アイドルアンロードされる。
+
+#### 3. 再起動
+
+```bash
+sudo systemctl restart opengeek-llm-chat
+# またはブラウザの「🔄 本体を再起動」
+```
+
+### 使い方
+
+ブラウザのチャットで:
+
+```
+「こんにちは」を30代男性の声で作って
+```
+
+→ LLMが `generate_speech` ツール呼び出し → チャット欄に `<audio>` プレーヤーが表示され、その場で再生できる。生成WAVは `public/uploads/tts_<timestamp>_<rand>.wav` に保存される。
+
+声はテキストで自由に指定できる:
+
+```
+落ち着いた女性アナウンサーの声で「本日のニュースをお伝えします」をしゃべって
+```
+
+### 声の指定方法
+
+> **重要 / 現状の制約**: 公式の **Irodori-TTS-Server（OpenAI互換）はテキストでの声の指定（VoiceDesign）に非対応**で、声の制御は **`voices/` に置いた参照音声によるボイスクローンのみ**です。`instructions` / `irodori.caption` は送信していますが、現行サーバー（base 500M-v3 等）は無視します（ログに `speaker conditioning is disabled` と出る）。**特定の声（例: 30代男性）を出すには参照音声が必須**です。
+
+- **`none`（参照音声なし）**: `voices/` が空でもエラーにならない既定話者。声は固定できない（女性寄りの既定声になりがち）。初期値は `defaultVoice: "none"`
+- **参照音声でのボイスクローン（声を指定する正攻法）**:
+  1. 数秒のクリアな音声（例: 30代男性の日本語）を `~/Irodori-TTS-Server/voices/otoko30.wav` に置く（ファイル名 `otoko30` が voice ID）
+  2. `config.json` の `ttsVoices` に `{ "name": "30代男性", "voiceId": "otoko30" }` を登録
+  3. 「30代男性の声で」と言うと `/tts` が `voice: "otoko30"` に解決し、その音声をクローンして合成する
+  - エイリアスは `~/Irodori-TTS-Server/voices/voices.json` でも管理可能（サーバー仕様）
+- **プリセット名**: `ttsVoices[]` の名前を指定すると、その `voiceId`（参照音声）が使われる。`voiceId` の無い（`instructions` のみの）プリセットは現行サーバーでは既定話者になる
+- **フリーなテキスト記述**: 未登録の文字列は VoiceDesign キャプションとして送るが、**現行サーバーでは無視される**（将来 VoiceDesign 対応バックエンドに差し替えた場合に有効）
+
+> `voices/` が空のとき `voice='sample'` 等は `Unknown voice` で 400 になるため、`defaultVoice` は `none` を推奨。特定の声は参照音声を `voices/` に追加して `voiceId` で指定する。
+
+### 留意点
+
+- **VRAM共有に注意**: チャット用 llama-server や sd-server と同じGPUを使う場合、合計VRAMに収まる必要がある。`HIP_VISIBLE_DEVICES` で別GPUに分けるか、`idleUnloadMs` でアイドル時アンロード推奨
+- **生成音声は `public/uploads/` に保存**: ファイル名は `tts_<timestamp>_<rand>.wav`（画像生成と同じ場所）。手動削除可能
+- **声の指定は参照音声のみ**: 現行 Irodori-TTS-Server はテキスト記述（VoiceDesign）非対応。`voices/` の参照音声 voice ID で指定する
+- **未知フィールドの扱い**: `instructions` / `irodori.caption` を併送する。strict なサーバーで問題が出る場合は `captionField` を `null` にして送信を抑制できる
+
+### VoiceDesign（テキストで声を指定）をチャットで使う
+
+参照音声を用意せず、**テキストの説明（キャプション）だけで声を作りたい**場合は、Irodori-TTS の **VoiceDesign モデル**（`Aratako/Irodori-TTS-600M-v3-VoiceDesign` 等）を使う。ただし公式 `irodori_openai_tts` は VoiceDesign 非対応なので、本リポジトリ同梱の簡易ラッパー [`irodori_voicedesign_server.py`](./irodori_voicedesign_server.py) を使う（VoiceDesign の `infer.py` をリクエスト毎に呼び、`instructions`/`irodori.caption` を声のキャプションとして渡す。モデルを毎回ロードするため1回あたり数秒〜十数秒かかる簡易方式）。
+
+**セットアップ**
+```bash
+# 1. Irodori-TTS 本体(core, infer.py を含む)を取得
+cd ~ && git clone https://github.com/Aratako/Irodori-TTS.git
+
+# 2. ラッパーを infer.py と同じ場所へ置く（このリポジトリの irodori_voicedesign_server.py）
+cp /path/OpenGeekLLMChat/irodori_voicedesign_server.py ~/Irodori-TTS/
+
+# 3. 依存入り venv で起動（Irodori-TTS-Server の venv を再利用可。fastapi/uvicorn/soundfile/torch/irodori-tts が必要）
+cd ~/Irodori-TTS
+VD_PYTHON=~/Irodori-TTS-Server/venv/bin/python \
+VD_HF_CHECKPOINT=Aratako/Irodori-TTS-600M-v3-VoiceDesign \
+~/Irodori-TTS-Server/venv/bin/python -m uvicorn irodori_voicedesign_server:app --host 127.0.0.1 --port 8089
+# 確認: curl -s http://127.0.0.1:8089/health
+```
+
+**config.json をラッパー(8089)へ向ける**
+```json
+"irodoriTts": {
+  "host": "127.0.0.1",
+  "port": 8089,
+  "endpoint": "/v1/audio/speech",
+  "model": "irodori-tts",
+  "defaultVoice": "none",
+  "defaultFormat": "wav",
+  "captionField": "caption",
+  "irodori": {},
+  "timeoutMs": 600000,
+  "command": "/home/wizapply-ai/Irodori-TTS-Server/venv/bin/python",
+  "args": ["-m", "uvicorn", "irodori_voicedesign_server:app", "--host", "127.0.0.1", "--port", "8089"],
+  "cwd": "/home/wizapply-ai/Irodori-TTS",
+  "env": {
+    "VD_PYTHON": "/home/wizapply-ai/Irodori-TTS-Server/venv/bin/python",
+    "VD_HF_CHECKPOINT": "Aratako/Irodori-TTS-600M-v3-VoiceDesign",
+    "HSA_OVERRIDE_GFX_VERSION": "12.0.1",
+    "HIP_VISIBLE_DEVICES": "0"
+  },
+  "readyTimeoutMs": 60000,
+  "idleUnloadMs": 600000
+}
+```
+本体を再起動すれば、`ttsVoices` のプリセット（例「30代男性」の `instructions`）や、チャットで言ったフリーな声の記述（例「ハスキーな低い男性の声で」）がキャプションとして VoiceDesign に渡り、声がテキスト指定どおりに変わる。
+
+> ラッパーは出力 wav を 16bit PCM に正規化して返すため、ブラウザの `<audio>` で確実に再生できる。低速が気になる場合は、`infer.py` ではなく Irodori の推論ランタイムを常駐ロードする方式（高速）に拡張できる。
+
+> **systemd で動かす場合の注意（`npm start` では動くのに service で生成されない時）**: `opengeek-llm-chat.service` は `ProtectHome=read-only` で `/home` 配下が読み取り専用になる。VoiceDesign ラッパーは (1) 一時 wav の書き込み、(2) HuggingFace モデルキャッシュへの書き込み が必要なので、次の対応を行う。
+> - 一時 wav: ラッパーの `VD_OUT_DIR` は既定で `/tmp` 配下なので追加対応不要（明示するなら `config.json` の `irodoriTts.env` に `"VD_OUT_DIR": "/tmp/irodori_vd_outputs"`）。
+> - モデルキャッシュ: service の `ReadWritePaths` に `~/.cache/huggingface` を追加する。
+>   ```ini
+>   ReadWritePaths=/home/wizapply-ai/opengeek-llm-chat /tmp /home/wizapply-ai/.cache/huggingface
+>   ```
+>   その後 `sudo systemctl daemon-reload && sudo systemctl restart opengeek-llm-chat`。
+> - GPU(ROCm) で動かすなら service に `Environment=HSA_OVERRIDE_GFX_VERSION=12.0.1` 等を追加（CPUのままでも動作はする）。
 
 ---
 

@@ -127,6 +127,33 @@
       "extraArgs": []
     }
   ],
+  "ttsGen": true,
+  "irodoriTts": {
+    "host": "127.0.0.1",
+    "port": 8088,
+    "endpoint": "/v1/audio/speech",
+    "model": "irodori-tts",
+    "defaultVoice": "none",
+    "defaultFormat": "wav",
+    "defaultSpeed": 1.0,
+    "captionField": "caption",
+    "irodori": {},
+    "timeoutMs": 180000,
+    "command": "/home/[user]/Irodori-TTS-Server/venv/bin/python",
+    "args": ["-m", "irodori_openai_tts", "--host", "127.0.0.1", "--port", "8088"],
+    "cwd": "/home/[user]/Irodori-TTS-Server",
+    "env": {
+      "HSA_OVERRIDE_GFX_VERSION": "12.0.1",
+      "HIP_VISIBLE_DEVICES": "0"
+    },
+    "readyTimeoutMs": 300000,
+    "idleUnloadMs": 600000
+  },
+  "ttsVoices": [
+    { "name": "標準", "desc": "参照音声なし（VoiceDesign/既定話者）", "voiceId": "none" },
+    { "name": "30代男性", "desc": "落ち着いた30代男性の声", "instructions": "落ち着いた低めの30代男性の声で、明瞭で穏やかに、自然に読み上げてください。" },
+    { "name": "20代女性", "desc": "明るい20代女性の声", "instructions": "やや高めで明るい20代女性の声で、親しみやすく元気に読み上げてください。" }
+  ],
   "ragTopK": 30,
   "ragMode": "agentic",
   "systemPrompts": {

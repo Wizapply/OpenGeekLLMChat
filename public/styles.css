@@ -2631,6 +2631,48 @@
     color: var(--accent);
   }
 
+  /* ── 生成音声プレーヤー ── */
+  .gen-audio-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 8px 0;
+    padding: 10px 12px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    max-width: 360px;
+  }
+  .gen-audio-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.4;
+  }
+  .gen-audio-icon { flex-shrink: 0; }
+  .gen-audio-text {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .gen-audio-player {
+    width: 100%;
+    height: 38px;
+  }
+  .gen-audio-loading {
+    font-size: 12px;
+    color: var(--text-muted);
+    padding: 8px 4px;
+  }
+  .gen-audio-actions {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+
   /* ライトボックス（フルサイズプレビュー） */
   .gen-image-lightbox {
     position: fixed;

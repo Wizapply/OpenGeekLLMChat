@@ -39,8 +39,11 @@ ProtectHome=read-only
 
 # 書き込み許可ディレクトリ
 # - /home/wizapply-ai/opengeek-llm-chat: chats/ public/uploads/ public/plots/ settings.json 等
-# - /tmp: Pythonスクリプト一時ファイル
-ReadWritePaths=/home/wizapply-ai/opengeek-llm-chat /tmp
+# - /tmp: Pythonスクリプト一時ファイル / TTS一時wav (VD_OUT_DIR 既定)
+# ⚠️ Irodori-TTS VoiceDesign を使う場合は、HuggingFaceモデルキャッシュ書き込みのため
+#    ~/.cache/huggingface も追加する（ProtectHome=read-only だと書けず合成に失敗する）。
+#    例: ReadWritePaths=... /tmp /home/wizapply-ai/.cache/huggingface
+ReadWritePaths=/home/wizapply-ai/opengeek-llm-chat /tmp /home/wizapply-ai/.cache/huggingface
 
 # llama-server を spawn するためバイナリ実行が必要
 # Pythonスクリプト実行も含む

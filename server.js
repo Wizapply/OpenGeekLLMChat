@@ -69,6 +69,35 @@ const DEFAULT_CONFIG = {
   webSearch: true,
   fileAccess: true,
   imageGen: false,           // 画像生成（stable-diffusion.cpp連携）。imageModels[]を定義して有効化
+  ttsGen: false,             // 音声合成（Irodori-TTS連携）。irodoriTts を設定して有効化
+  // ─── 音声合成 (Irodori-TTS) 設定 ───
+  // 画像生成(stable-diffusion.cpp)と同じ方式: Irodori-TTS の OpenAI互換サーバーを
+  // 子プロセスで spawn し、オンデマンド起動・アイドルアンロードする。
+  // 起動コマンド例: uv run python -m irodori_openai_tts --host 127.0.0.1 --port 8088
+  irodoriTts: {
+    host: '127.0.0.1',
+    port: 8088,
+    endpoint: '/v1/audio/speech',  // OpenAI互換エンドポイント
+    model: 'irodori-tts',          // リクエストの model フィールド
+    defaultVoice: 'none',          // voices/ 配下のリファレンス音声ID。'none' は参照音声なし(VoiceDesign/既定話者)
+    defaultFormat: 'wav',          // wav / mp3 / flac / opus / aac / pcm
+    defaultSpeed: 1.0,             // 0.25〜4.0
+    // 声のテキスト記述(VoiceDesign)の送り先。'instructions'(OpenAI標準) と
+    // irodori.caption の両方に入れる。strictなサーバー向けに captionField=null で無効化可。
+    captionField: 'caption',       // irodori オブジェクト内に入れるキー名 (null で無効)
+    irodori: {},                   // irodori 拡張の基底オプション (num_steps, cfg_scale_text 等)
+    timeoutMs: 180000,             // 1リクエストのタイムアウト
+    // ── 子プロセス管理 (sd-server と同じ方式) ──
+    // command/args を設定すると server.js が Irodori-TTS サーバーを spawn し
+    // オンデマンド起動する。未設定なら「外部で起動済み」とみなし転送のみ行う。
+    command: null,                 // 例: 'uv'
+    args: null,                    // 例: ['run','python','-m','irodori_openai_tts','--host','127.0.0.1','--port','8088']
+    cwd: null,                     // Irodori-TTS-Server のディレクトリ
+    env: {},                       // 追加環境変数 (HIP_VISIBLE_DEVICES 等)
+    readyTimeoutMs: 300000,        // 起動完了(TCP接続)待ちタイムアウト
+    idleUnloadMs: 600000,          // アイドルアンロード(ms)。0/未設定で無効
+  },
+  ttsVoices: [],                   // 声プリセット: [{ name, desc, voiceId, instructions }]
   // ─── 機械学習 (ML) 設定 ───
   // データテーブル(DuckDB)、Web API インポート、PyTorch学習、外部APIトークン
   // 旧フォーマット (`mlEnabled` / `apiTokens` トップレベル) も後方互換読み込み対応
@@ -124,7 +153,7 @@ function loadConfig() {
     if (fs.existsSync(CONFIG_FILE)) {
       const userConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
       const merged = { ...DEFAULT_CONFIG, ...userConfig };
-      ['systemPrompts', 'agentContext', 'transcribe', 'llamaServer', 'embeddingModel', 'ml'].forEach(key => {
+      ['systemPrompts', 'agentContext', 'transcribe', 'llamaServer', 'embeddingModel', 'ml', 'irodoriTts'].forEach(key => {
         if (DEFAULT_CONFIG[key] && typeof DEFAULT_CONFIG[key] === 'object') {
           merged[key] = { ...DEFAULT_CONFIG[key], ...(userConfig[key] || {}) };
         }
@@ -712,6 +741,98 @@ function checkSdIdle() {
   }
 }
 setInterval(checkSdIdle, 30000);
+
+// ════════════════════════════════════════════════
+// 音声合成 (Irodori-TTS の OpenAI互換サーバーを管理)
+// ════════════════════════════════════════════════
+// アーキテクチャ (画像生成 sd-server と同じ方式):
+//   - Irodori-TTS-Server (OpenAI互換 /v1/audio/speech) を子プロセスで起動
+//   - LLMが generate_speech ツールを呼ぶ → /tts エンドポイント → TTSサーバーに転送
+//   - 生成音声は public/uploads/ に WAV で保存し、チャット欄で再生
+//   - アイドルアンロード機能あり（チャットモデル・sd-serverと同じパターン）
+//   - command/args 未設定なら「外部起動済み」とみなし転送のみ行う
+
+let ttsProc = null;            // 現在のTTSサーバープロセス
+let ttsProcStarting = false;
+let ttsLastActivity = Date.now();
+
+// Irodori-TTSサーバーを spawn して起動（オンデマンド）
+async function startTtsServer() {
+  if (ttsProcStarting) throw new Error('既にTTSサーバー起動処理中です');
+  const cfg = appConfig.irodoriTts || {};
+  // command 未設定なら自動起動しない（外部起動済みとみなす）
+  if (!cfg.command) {
+    throw new Error('irodoriTts.command が未設定です。外部でTTSサーバーを起動するか、command/args を設定してください。');
+  }
+
+  ttsProcStarting = true;
+  // 起動開始時に ttsLastActivity をリセット（sd-serverと同じく即アイドル判定を防ぐ）
+  ttsLastActivity = Date.now();
+  try {
+    await stopTtsServer();
+    const host = cfg.host || '127.0.0.1';
+    const port = cfg.port || 8088;
+    const args = Array.isArray(cfg.args) ? cfg.args : [];
+
+    log('-', `[irodori-tts] 起動: ${cfg.command} ${args.join(' ')}`);
+    const proc = spawn(cfg.command, args, {
+      cwd: cfg.cwd || __dirname,
+      env: { ...process.env, ...(cfg.env || {}) },
+    });
+    ttsProc = proc;
+
+    proc.stdout.on('data', (d) => process.stdout.write(`[irodori-tts] ${d}`));
+    proc.stderr.on('data', (d) => process.stderr.write(`[irodori-tts] ${d}`));
+    // 新プロセスに切り替わった後で古いプロセスの exit が来ても誤って null にしない
+    proc.on('exit', (code) => {
+      log('-', `[irodori-tts] 終了 (code=${code}, pid=${proc.pid})`);
+      if (ttsProc === proc) ttsProc = null;
+    });
+    proc.on('error', (err) => {
+      log('-', `[irodori-tts] プロセスエラー: ${err.message}`);
+      if (ttsProc === proc) ttsProc = null;
+    });
+
+    // 起動完了を待つ（TCP接続で判定）
+    const ready = await waitForTcpReady(host, port, cfg.readyTimeoutMs || 300000);
+    if (!ready) throw new Error(`irodori-tts が ${cfg.readyTimeoutMs || 300000}ms 以内に起動しませんでした`);
+
+    ttsLastActivity = Date.now();
+    log('-', `[irodori-tts] Ready (host=${host}, port=${port}, pid=${proc.pid})`);
+  } finally {
+    ttsProcStarting = false;
+  }
+}
+
+async function stopTtsServer() {
+  if (!ttsProc || ttsProc.killed) {
+    ttsProc = null;
+    return;
+  }
+  try { ttsProc.kill('SIGTERM'); } catch {}
+  await new Promise(resolve => {
+    const timer = setTimeout(() => {
+      if (ttsProc && !ttsProc.killed) {
+        try { ttsProc.kill('SIGKILL'); } catch {}
+      }
+      resolve();
+    }, 5000);
+    ttsProc.once('exit', () => { clearTimeout(timer); resolve(); });
+  });
+  ttsProc = null;
+}
+
+// アイドルアンロード（sd-serverと同じパターン）
+function checkTtsIdle() {
+  const idleMs = appConfig.irodoriTts?.idleUnloadMs;
+  if (!idleMs || !ttsProc || ttsProcStarting) return;
+  const elapsed = Date.now() - ttsLastActivity;
+  if (elapsed >= idleMs) {
+    log('-', `[irodori-tts] アイドル ${Math.round(elapsed / 1000)}s → アンロード`);
+    stopTtsServer();
+  }
+}
+setInterval(checkTtsIdle, 30000);
 
 async function startChatModel(modelName) {
   if (chatProcStarting) throw new Error('既にモデル起動処理中です');
@@ -1833,6 +1954,152 @@ app.post('/image-gen/unload', requireAuth, async (req, res) => {
   const ip = getIP(req);
   log(ip, '[IMAGE-GEN] 手動アンロード');
   await stopImageModel();
+  res.json({ ok: true });
+});
+
+// ════════════════════════════════════════════════
+// 音声合成 API (/tts)
+// ════════════════════════════════════════════════
+// LLMの generate_speech ツールから呼ばれる。
+// - Irodori-TTSサーバーが未起動かつ command 設定済みなら自動起動（オンデマンドロード）
+// - 生成音声は public/uploads/ に WAV 保存し、URLを返す
+// - チャットUIは [[gen_audio:URL|text]] マーカーで <audio> 再生
+
+app.get('/tts/info', requireAuth, (req, res) => {
+  const cfg = appConfig.irodoriTts || {};
+  res.json({
+    available: !!appConfig.ttsGen,
+    starting: ttsProcStarting,
+    running: !!(ttsProc && !ttsProc.killed),
+    managed: !!cfg.command,          // server.js が子プロセス管理するか
+    defaultVoice: cfg.defaultVoice || 'sample',
+    defaultFormat: cfg.defaultFormat || 'wav',
+    voices: (appConfig.ttsVoices || []).map(v => ({ name: v.name, desc: v.desc })),
+  });
+});
+
+app.post('/tts', requireAuth, jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  const cfg = appConfig.irodoriTts || {};
+  let {
+    text,                            // 読み上げるテキスト (必須)
+    voice = null,                    // 声の指定: 登録名 / voice ID / フリーなテキスト記述
+    instructions = '',               // 声のテキスト記述(VoiceDesign)。voiceが記述ならそちら優先
+    format = null,                   // wav / mp3 / flac / opus / aac / pcm
+    speed = null,                    // 0.25〜4.0
+  } = req.body || {};
+
+  if (!text || typeof text !== 'string' || !text.trim()) {
+    return res.status(400).json({ error: 'text が必要です' });
+  }
+  if (!appConfig.ttsGen) {
+    return res.status(400).json({ error: '音声合成が無効です。config.json の ttsGen を true にしてください。' });
+  }
+
+  // ── 声の解決 ──
+  // 1. ttsVoices に name 一致するプリセットがあれば voiceId / instructions を採用
+  // 2. 一致しなければ voice 文字列を「フリーなテキスト記述」とみなし caption に回す
+  const presets = Array.isArray(appConfig.ttsVoices) ? appConfig.ttsVoices : [];
+  let voiceId = cfg.defaultVoice || 'sample';
+  let caption = (instructions || '').trim();
+
+  if (voice && typeof voice === 'string') {
+    const preset = presets.find(v => v.name === voice || v.voiceId === voice);
+    if (preset) {
+      if (preset.voiceId) voiceId = preset.voiceId;
+      if (preset.instructions && !caption) caption = preset.instructions;
+    } else {
+      // 登録外 → テキスト記述（例: "30代男性、落ち着いた声"）として扱う
+      caption = caption || voice;
+    }
+  }
+
+  const responseFormat = (format || cfg.defaultFormat || 'wav').toLowerCase();
+  const reqSpeed = Number(speed) || Number(cfg.defaultSpeed) || 1.0;
+
+  // ── サーバーのオンデマンド起動（command 設定時のみ） ──
+  if (cfg.command && (!ttsProc || ttsProc.killed)) {
+    try {
+      log(ip, `[TTS] irodori-tts を起動`);
+      await startTtsServer();
+    } catch (e) {
+      return res.status(500).json({ error: `TTSサーバー起動失敗: ${e.message}` });
+    }
+  }
+
+  ttsLastActivity = Date.now();
+  const host = cfg.host || '127.0.0.1';
+  const port = cfg.port || 8088;
+  const endpoint = cfg.endpoint || '/v1/audio/speech';
+
+  // ── OpenAI互換リクエストの組み立て ──
+  const body = {
+    model: cfg.model || 'irodori-tts',
+    input: text,
+    voice: voiceId,
+    response_format: responseFormat,
+    speed: Math.min(Math.max(reqSpeed, 0.25), 4.0),
+  };
+  // 声のテキスト記述(VoiceDesign): OpenAI標準の instructions と irodori.caption の両方へ
+  if (caption) body.instructions = caption;
+  const irodoriOpts = { ...(cfg.irodori || {}) };
+  if (caption && cfg.captionField) irodoriOpts[cfg.captionField] = caption;
+  if (Object.keys(irodoriOpts).length > 0) body.irodori = irodoriOpts;
+
+  const startTime = Date.now();
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), cfg.timeoutMs || 180000);
+    const ttsResp = await fetch(`http://${host}:${port}${endpoint}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    }).finally(() => clearTimeout(timer));
+
+    if (!ttsResp.ok) {
+      const errText = await ttsResp.text().catch(() => '');
+      throw new Error(`TTSサーバー エラー ${ttsResp.status}: ${errText.slice(0, 200)}`);
+    }
+
+    // 音声バイト列を取得して保存（画像生成と同じく public/uploads/ へ）
+    const arrayBuf = await ttsResp.arrayBuffer();
+    const buf = Buffer.from(arrayBuf);
+    if (buf.length === 0) throw new Error('TTSサーバーから空の音声が返されました');
+
+    const extMap = { wav: 'wav', mp3: 'mp3', flac: 'flac', opus: 'opus', aac: 'aac', pcm: 'pcm' };
+    const ext = extMap[responseFormat] || 'wav';
+    const ts = Date.now();
+    const rand = Math.random().toString(36).slice(2, 8);
+    const fileName = `tts_${ts}_${rand}.${ext}`;
+    const uploadsDir = path.join(__dirname, 'public', 'uploads');
+    if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+    fs.writeFileSync(path.join(uploadsDir, fileName), buf);
+
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    log(ip, `[TTS] 完了: ${fileName} (${(buf.length / 1024).toFixed(0)}KB, ${elapsed}秒, voice="${voiceId}", caption="${caption.slice(0, 40)}")`);
+
+    res.json({
+      ok: true,
+      url: `/uploads/${fileName}`,
+      format: ext,
+      voice: voiceId,
+      caption,
+      text,
+      elapsed: Number(elapsed),
+    });
+  } catch (e) {
+    const msg = e.name === 'AbortError' ? 'タイムアウト' : e.message;
+    log(ip, `[TTS] error: ${msg}`);
+    res.status(500).json({ error: msg });
+  }
+});
+
+// 手動でTTSサーバー停止
+app.post('/tts/unload', requireAuth, async (req, res) => {
+  const ip = getIP(req);
+  log(ip, '[TTS] 手動アンロード');
+  await stopTtsServer();
   res.json({ ok: true });
 });
 
@@ -3020,7 +3287,7 @@ function requirePermission(perm) {
 
 app.get('/config', (req, res) => {
   // 公開しない: password, llamaServer内のbinPath, embeddingModelの実体パス, ml.apiTokens(機密)
-  const { password, llamaServer, embeddingModel, ml, ...rest } = appConfig;
+  const { password, llamaServer, embeddingModel, ml, irodoriTts, ...rest } = appConfig;
   const safeConfig = {
     ...rest,
     // llamaServer情報は最小限のみ
@@ -3028,6 +3295,13 @@ app.get('/config', (req, res) => {
     // ml は enabled のみ公開、apiTokens(機密)は出さない
     ml: { enabled: !!(ml?.enabled) },
   };
+  // irodoriTts は機密(command/args/cwd/env/host/port)を伏せ、UI表示用の最小限のみ公開
+  if (irodoriTts) {
+    safeConfig.irodoriTts = {
+      defaultVoice: irodoriTts.defaultVoice || 'sample',
+      defaultFormat: irodoriTts.defaultFormat || 'wav',
+    };
+  }
   safeConfig.hasPassword = !!password;
 
   // 既存セッションCookieが有効かどうかを判定
