@@ -2112,6 +2112,10 @@ const TUNING_DATA_DIR = path.join(TUNING_DIR, 'datasets');
 const TUNING_RUNS_DIR = path.join(TUNING_DIR, 'runs');
 const TUNING_SAMPLES_FILE = path.join(TUNING_DIR, 'samples.jsonl');
 const TUNING_JOBS_FILE = path.join(TUNING_DIR, 'jobs.json');
+// HuggingFace モデルキャッシュ先 (ベースモデルのダウンロード保存先)。
+// 本番では ~/.cache が systemd の ProtectHome 等で読み取り専用のことがあるため、
+// アプリ内に明示する。tune_runner.py 起動時に HF_HOME 環境変数で渡す。
+const TUNING_HF_CACHE_DIR = path.join(TUNING_DIR, 'hf_cache');
 
 // ─── 機械学習(ML)機能の定数 ─────────────────────────────────────────
 // 表データ用の DuckDB を1ファイルに集約。テーブル単位で管理。
@@ -2144,7 +2148,7 @@ const RL_MODELS_DIR = path.join(ML_DIR, 'rl_models');  // 学習済みエージ�
 const RL_JOBS_FILE = path.join(ML_DIR, 'rl_jobs.json'); // RL 学習ジョブ履歴
 
 // ディレクトリ作成
-for (const d of [TUNING_DIR, TUNING_DATA_DIR, TUNING_RUNS_DIR, ML_DIR, ML_MODELS_DIR, RAG_DIR, TORCH_CACHE_DIR, IMAGE_DATASETS_DIR, IMAGE_MODELS_DIR, KEYPOINT_DATASETS_DIR, KEYPOINT_MODELS_DIR, RL_MODELS_DIR]) {
+for (const d of [TUNING_DIR, TUNING_DATA_DIR, TUNING_RUNS_DIR, TUNING_HF_CACHE_DIR, ML_DIR, ML_MODELS_DIR, RAG_DIR, TORCH_CACHE_DIR, IMAGE_DATASETS_DIR, IMAGE_MODELS_DIR, KEYPOINT_DATASETS_DIR, KEYPOINT_MODELS_DIR, RL_MODELS_DIR]) {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 }
 
@@ -2489,6 +2493,13 @@ app.post('/tuning/jobs', requireAuth, jsonParser, async (req, res) => {
     HSA_OVERRIDE_GFX_VERSION: '12.0.1',
     PYTORCH_HIP_ALLOC_CONF: 'expandable_segments:True',
     HIP_VISIBLE_DEVICES: '0',  // 単一GPU限定（マルチGPU環境での暴走防止）
+    // HuggingFace / Transformers のモデル・トークナイザのキャッシュ先を、
+    // 書き込み可能なアプリ内ディレクトリに明示する。本番では ~/.cache が
+    // systemd の ProtectHome 等で読み取り専用のことがあるため必須。
+    HF_HOME: TUNING_HF_CACHE_DIR,
+    HUGGINGFACE_HUB_CACHE: path.join(TUNING_HF_CACHE_DIR, 'hub'),
+    TRANSFORMERS_CACHE: TUNING_HF_CACHE_DIR,  // 古いtransformers向けの互換
+    XDG_CACHE_HOME: TUNING_HF_CACHE_DIR,      // 他キャッシュ系ライブラリも巻き込んで吸収
     ...(appConfig.tuning?.env || appConfig.tuningEnv || {}),
   };
   const proc = spawn(pythonPath, [tuneScript, jobDir], {
@@ -2669,7 +2680,16 @@ app.post('/tuning/jobs/:id/postprocess', requireAuth, jsonParser, (req, res) => 
   function runStep(label, cmd, args, cwd, onDone) {
     postLog.write(`\n=== ${label} ===\n`);
     postLog.write(`$ ${cmd} ${args.join(' ')}\n`);
-    const p = spawn(cmd, args, { cwd, env: { ...process.env } });
+    // 後処理 (マージ・GGUF変換) も tokenizer をロードするため、
+    // HuggingFace キャッシュ先をアプリ内に明示する (本番の ~/.cache 読み取り専用対策)
+    const postEnv = {
+      ...process.env,
+      HF_HOME: TUNING_HF_CACHE_DIR,
+      HUGGINGFACE_HUB_CACHE: path.join(TUNING_HF_CACHE_DIR, 'hub'),
+      TRANSFORMERS_CACHE: TUNING_HF_CACHE_DIR,
+      XDG_CACHE_HOME: TUNING_HF_CACHE_DIR,
+    };
+    const p = spawn(cmd, args, { cwd, env: postEnv });
     currentPostprocess = { jobId, proc: p, step: label };
     let errored = false;
     p.on('error', (err) => {
