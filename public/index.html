@@ -2364,7 +2364,7 @@ function App() {
                 continue;
               }
 
-              searchQueries.push({ query: `🎨 画像生成: ${prompt.slice(0, 50)}`, resultCount: null, type: 'image' });
+              searchQueries.push({ query: `画像生成: ${prompt.slice(0, 50)}`, resultCount: null, type: 'image' });
               setMessages(prev => {
                 const copy = [...prev];
                 copy[copy.length - 1] = {
@@ -2432,7 +2432,7 @@ function App() {
                 continue;
               }
 
-              searchQueries.push({ query: `🔊 音声合成: ${ttsText.slice(0, 40)}`, resultCount: null, type: 'audio' });
+              searchQueries.push({ query: `音声合成: ${ttsText.slice(0, 40)}`, resultCount: null, type: 'audio' });
               setMessages(prev => {
                 const copy = [...prev];
                 copy[copy.length - 1] = {
@@ -4926,7 +4926,10 @@ ${conversationText}
                       </div>
                       {msg.searchQueries?.map((sq, si) => (
                         <div key={si} className="agent-search-item">
-                          <span className="agent-search-icon">{sq.type === 'web' ? '🌐' : sq.type === 'file' ? '📁' : sq.type === 'image' ? '🎨' : sq.type === 'audio' ? '🔊' : sq.type === 'data' ? '🗂️' : '🔍'}</span>
+                          {/* 画像/音声生成はクエリ文に説明があるため、2行目のアイコンは省略（重複防止） */}
+                          {sq.type !== 'image' && sq.type !== 'audio' && (
+                            <span className="agent-search-icon">{sq.type === 'web' ? '🌐' : sq.type === 'file' ? '📁' : sq.type === 'data' ? '🗂️' : '🔍'}</span>
+                          )}
                           <span className="agent-search-query">{sq.query}</span>
                           {sq.resultCount != null && (
                             <span className="agent-search-result">{sq.resultCount}件</span>

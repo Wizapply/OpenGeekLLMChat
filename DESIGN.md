@@ -3362,6 +3362,7 @@ PostProcessDialog で量子化レベル選択時、モデル名からサイズ�
 
 - 🧠 モデル数 = `/ml/models` の `models[]`
 - 🖼️ 画像データセット = `/ml/image/datasets` の `datasets[]` / 画像学習モデル = `/ml/image/custom-models` の `models[]`
+- 🖐️ キーポイントデータセット = `/ml/image/keypoint/datasets` / キーポイントモデル = `/ml/image/keypoint/custom-models`
 - 🎮 強化学習エージェント = `/ml/rl/models` の `models[]`
 
 各取得は `try/catch` で失敗を 0 に丸め、1つのエンドポイントが落ちても他の件数表示を止めない。重い処理ではないが、件数は概況把握用なので取得は画面表示時の1回（学習直後に即時更新したい場合はリロード）。
@@ -4268,6 +4269,98 @@ ml/image_jobs.json          画像学習ジョブ履歴
 ### 主な罠
 
 罠 107〜117 を参照 (キャッシュパス、stdout汚染、プロセスグループkill、status競合、幽霊ジョブ、`\r`正規化、矩形残留、隠しファイル、自前zip)。
+
+---
+
+## 🖐️ 画像キーポイント検出 (2D / 3D)
+
+`/ml.html` の「画像学習」タブ内、上部の**タスク切替「📦 物体検出 / 🖐️ キーポイント」**で利用。手の関節など「対象 (バウンディングボックス) ＋順序付きのキーポイント (点)」を関連付けて学習・推論する。物体検出と同じ系統 (検出 / データセット / 学習) の上に、別ディレクトリ・別ジョブで実装している。
+
+### なぜ独立タブではなく「画像学習」内に統合したか
+
+最初は独立タブ (`activeTab === 'keypoint'`) で実装したが、物体検出と操作フローが同じで重複が大きい。`ImageTrainView` の中に**タスク切替**を置き、物体検出 (`ImageDetectView` / `DatasetManager` / `AnnotateView` / `ImageTrainRunner`) と キーポイント (`KeypointDetectView` / `KeypointDatasetManager` / `KeypointAnnotateView` / `KeypointTrainRunner`) を切り替える構成に変更した。
+- 切替時のレイアウトのズレ対策: `KeypointView` のラッパーは `image-train-view` を入れ子で再利用せず**フラグメント**にし、コンテンツ側 `image-detect-view` の `padding` も 0 にして、タスクタブ・サブタブ・コンテンツの左端を統一している。
+
+### 2D と 3D の使い分け (モデルの設計が異なる)
+
+データセットは `dataset.json` の `dim` ("2d" / "3d") で種別を持ち、学習・推論のスクリプトを自動で振り分ける。
+
+| | 2D | 3D |
+|:--|:--|:--|
+| モデル | torchvision **Keypoint R-CNN** (`keypointrcnn_resnet50_fpn`) | **ResNet 回帰** (resnet18/34/50 + `Linear(K*3)`) |
+| 出力 | (x, y) + 可視性 (ヒートマップ方式) | (x, y, z) 直接回帰 |
+| インスタンス | 複数可 | **単一前提** (画像内に対象1つ) |
+| 事前学習 | COCO人物キーポイント or scratch | ImageNet (バックボーン) |
+| z (奥行き) | なし | 相対深度 [-1,1] (学習時に手動付与) |
+| スクリプト | `image_keypoint_train.py` / `image_keypoint_detect.py` | `image_keypoint3d_train.py` / `image_keypoint3d_detect.py` |
+
+- **2D**: 既存の物体検出と同じ「ヒートマップ + R-CNN」系。COCO 事前学習の重みを読み込み、`box_predictor` を2クラス (背景+対象)、`keypoint_predictor` を K 点に付け替える転移学習。複数インスタンスを扱える。
+- **3D**: torchvision の Keypoint R-CNN は **2D専用 (z を出力できない)** ため、3D は別系統。`ResNet` バックボーンに `Linear(in, K*3)` ヘッドを付け、`(B,K,3)` を回帰する。`xy=sigmoid` ([0,1]正規化座標)、`z=tanh` ([-1,1]相対深度)。loss は可視点のみの L1。単眼RGBから絶対距離は復元できないため z は相対値とし、**MediaPipe は使わない** (回帰モデルを自前で学習する)。
+
+### なぜ MediaPipe を使わないか
+
+3D を相談された際、MediaPipe を避けたいという要件があった。MediaPipe は一実装にすぎず、3Dキーポイント自体は PyTorch/torchvision の回帰モデルで学習できる。単眼RGBからの z が相対値止まりになるのは MediaPipe でも同じ**原理的制約** (奥行き情報が画像に無い)。絶対距離が要るなら撮影時に深度カメラ(RGB-D)が必要になる。
+
+### データ構造とアノテーション
+
+```jsonc
+// keypoint_datasets/<name>/dataset.json
+{
+  "dim": "3d",                       // "2d" | "3d"
+  "keypoints": ["wrist", ...],       // 順序が学習に直結 (全画像で同じ番号で打つ)
+  "skeleton": [[0,1],[1,2], ...],    // 描画用エッジ (任意)
+  "images": [{
+    "id": "...", "file": "...", "originalName": "...",
+    "instances": [{
+      "box": {"x1":..,"y1":..,"x2":..,"y2":..},
+      "keypoints": [{"x":..,"y":..,"v":2}, ...]   // 3D は {"x","y","z","v"}
+    }]
+  }]
+}
+```
+
+- 座標は**絶対ピクセル**で保存 (表示スケール非依存)。`v` は可視性 (0=未指定 / 1=隠れ / 2=可視)。学習では `v>0` を有効とする。
+- アノテーションUI (`KeypointAnnotateView`): 対象を矩形で囲んで1インスタンス生成 → 定義順にクリックして点を配置 → 次の未設定点へ自動で進む。可視/隠れ/クリアの切替、骨格描画あり。**3Dモードでは各点に z スライダー (-1〜1)** が出る。
+- プリセット: ✋手(21点) / 🧍人物(17点・COCO) / 🙂顔(5点)。手の並びは FreiHAND/MANO と同じ root→tip 順。
+
+### CSV インポート (ロング形式)
+
+画像はバイナリなので CSV には含めず、**先にアップロード済みの画像へ `filename` 列で紐付け**る (COCOインポートと同方針)。`parseCsv` はクォート内カンマ・改行・`""` エスケープに対応した自前実装。`buildImageFileIndex` が originalName / 保存名 / 拡張子なしベース名で照合する。
+
+- 物体検出: `filename,class,x1,y1,x2,y2` (`/ml/image/datasets/:name/import` の `format:'csv'`)
+- キーポイント: `filename,keypoint,x,y,v[,z][,instance]` (`/ml/image/keypoint/datasets/:name/import`)
+  - `keypoint` は定義名または 0始まり番号。`instance` で同一画像内の複数対象をグループ化。
+  - **box 列が無ければ可視点の外接矩形から自動生成** (余白は広がりの10%・最低8px)。3D 回帰は box を使わないが、データ構造の一貫性のため必ず持たせる。
+
+### FreiHAND 変換ツール
+
+`freihand_to_csv.py` (リポジトリ直下・標準ライブラリのみ) で、公開手データセット [FreiHAND](https://lmb.informatik.uni-freiburg.de/projects/freihand/) を「画像フォルダ + CSV」に変換する。
+
+- FreiHAND は 3Dキーポイント(21点・メートル) + カメラ内部行列 `K` を持つ。`uv = (K @ xyz) / w` で2Dへ投影。
+- 3D の z は wrist 基準の相対深度を `--z-scale` (既定0.1m) で正規化し [-1,1] にクランプ。
+- `keypoint` 列は 0..20 の番号で出力 → プリセット「✋手(21点)」の順番にそのまま一致。
+- 背景版 (gs/hom/sample/auto) は `画像通し番号 = idx + 32560 * version` で対応。サブセット (`--start`/`--limit`) を選べる。
+
+### 学習ジョブ・外部API
+
+- 学習は表データ (`currentMlJob`) / 物体検出 (`currentImageJob`) とも独立した **`currentKeypointJob`** で1ジョブ管理。`keypoint_jobs.json` に履歴。
+- `POST /ml/image/keypoint/detect` (Bearer, `ml:read`): COCO人物 / カスタム2D / カスタム3D。`runKeypointDetect` がカスタムモデルの `config.json.dim` を読んで 2D/3D スクリプトを振り分ける。
+- `GET /ml/image/keypoint/custom-models/:name/download`: model.pt + config.json + 推論サンプル (2D/3Dで内容を出し分け) + README を自前 zip 化。
+
+### ストレージ
+
+```
+ml/keypoint_datasets/<name>/   データセット (dataset.json + images/)
+ml/keypoint_models/<name>/     学習済みモデル (model.pt + config.json + metrics.json)
+ml/keypoint_jobs.json          キーポイント学習ジョブ履歴
+```
+
+### 主な罠 (3D特有)
+
+- torchvision の Keypoint R-CNN は z を扱えない → 3D は ResNet 回帰で別系統にする (混在させない)。
+- 回帰の目標は**正規化座標** (x,y を画像幅・高さで割る)。リサイズ非依存になり、入力サイズ変更で学習目標がぶれない。
+- 可視点が0のインスタンスは loss が計算できない (NaN要因) ので学習データから除外する。
+- z は単眼RGBから相対値しか出ない。UIでは点の大きさ (手前ほど大) で深度を可視化するに留める。
 
 ---
 

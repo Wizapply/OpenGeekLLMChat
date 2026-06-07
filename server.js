@@ -2135,12 +2135,16 @@ const TORCH_CACHE_DIR = path.join(ML_DIR, 'torch_cache');
 const IMAGE_DATASETS_DIR = path.join(ML_DIR, 'image_datasets'); // データセット (画像+アノテーション)
 const IMAGE_MODELS_DIR = path.join(ML_DIR, 'image_models');     // 学習済みカスタムモデル
 
+// 画像キーポイント検出のカスタム学習 (手の関節など、対象+順序付きの点を学習)
+const KEYPOINT_DATASETS_DIR = path.join(ML_DIR, 'keypoint_datasets'); // データセット (画像+キーポイントアノテーション)
+const KEYPOINT_MODELS_DIR = path.join(ML_DIR, 'keypoint_models');     // 学習済みカスタムモデル
+
 // 強化学習 (RL / DQN) — 組み込み環境でエージェントを学習
 const RL_MODELS_DIR = path.join(ML_DIR, 'rl_models');  // 学習済みエージェント (名前毎にディレクトリ)
 const RL_JOBS_FILE = path.join(ML_DIR, 'rl_jobs.json'); // RL 学習ジョブ履歴
 
 // ディレクトリ作成
-for (const d of [TUNING_DIR, TUNING_DATA_DIR, TUNING_RUNS_DIR, ML_DIR, ML_MODELS_DIR, RAG_DIR, TORCH_CACHE_DIR, IMAGE_DATASETS_DIR, IMAGE_MODELS_DIR, RL_MODELS_DIR]) {
+for (const d of [TUNING_DIR, TUNING_DATA_DIR, TUNING_RUNS_DIR, ML_DIR, ML_MODELS_DIR, RAG_DIR, TORCH_CACHE_DIR, IMAGE_DATASETS_DIR, IMAGE_MODELS_DIR, KEYPOINT_DATASETS_DIR, KEYPOINT_MODELS_DIR, RL_MODELS_DIR]) {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 }
 
@@ -5467,6 +5471,72 @@ function isValidDatasetName(name) {
   return typeof name === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(name);
 }
 
+// ─── CSV パーサ (アノテーションのCSVインポート用) ───
+// ヘッダ行必須。ダブルクォート("...")で囲んだフィールド内のカンマ・改行・""(エスケープ)に対応。
+// 返り値: ヘッダをキー(小文字・トリム)にした行オブジェクトの配列。
+function parseCsv(text) {
+  const s = String(text || '').replace(/^﻿/, '');  // BOM除去
+  const rows = [];
+  let field = '', row = [], inQuotes = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (s[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += c;
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === ',') { row.push(field); field = ''; }
+      else if (c === '\n') { row.push(field); rows.push(row); field = ''; row = []; }
+      else if (c === '\r') { /* CRLF の CR は無視 */ }
+      else field += c;
+    }
+  }
+  // 末尾フィールド/行
+  if (field.length > 0 || row.length > 0) { row.push(field); rows.push(row); }
+  // 完全な空行を除去
+  const cleaned = rows.filter(r => r.some(v => String(v).trim() !== ''));
+  if (cleaned.length === 0) return [];
+  const headers = cleaned[0].map(h => String(h).trim().toLowerCase());
+  const out = [];
+  for (let r = 1; r < cleaned.length; r++) {
+    const obj = {};
+    for (let c = 0; c < headers.length; c++) obj[headers[c]] = (cleaned[r][c] !== undefined ? cleaned[r][c] : '').trim();
+    out.push(obj);
+  }
+  return out;
+}
+
+// 行オブジェクトから、別名候補のいずれかに一致する値を返す (見つからなければ '')
+function csvField(rowObj, aliases) {
+  for (const a of aliases) {
+    if (rowObj[a] !== undefined && rowObj[a] !== '') return rowObj[a];
+  }
+  return '';
+}
+
+// CSVのファイル名を、データセット内の画像エントリに対応づける索引を作る。
+// originalName / 保存ファイル名 / それぞれの basename(パス・拡張子) で引けるようにする。
+function buildImageFileIndex(images) {
+  const index = {};
+  const add = (key, entry) => {
+    if (!key) return;
+    const k = String(key).trim().toLowerCase();
+    if (k && !(k in index)) index[k] = entry;
+  };
+  const variants = (nameStr) => {
+    const base = String(nameStr).replace(/\\/g, '/').split('/').pop();  // パス除去
+    const noext = base.replace(/\.[^.]+$/, '');
+    return [nameStr, base, noext];
+  };
+  for (const im of images) {
+    for (const v of variants(im.originalName || '')) add(v, im);
+    for (const v of variants(im.file || '')) add(v, im);
+  }
+  return index;
+}
+
 // データセットのメタ情報をロード
 function loadImageDataset(name) {
   const metaPath = path.join(IMAGE_DATASETS_DIR, name, 'dataset.json');
@@ -5771,8 +5841,53 @@ app.post('/ml/image/datasets/:name/import', requireAuth, requirePermission('ml:w
       saveImageDataset(name, meta);
       log(ip, `[画像学習] COCOインポート: ${name} (${applied}画像に適用)`);
       return res.json({ ok: true, appliedImages: applied });
+    } else if (format === 'csv') {
+      // CSV (ロング形式): 1行=1矩形。ファイル名で既存画像に紐付け。
+      //   列: filename, class, x1, y1, x2, y2  (別名: file/image/name, label/category, xmin..ymax)
+      const rows = parseCsv(data);
+      if (rows.length === 0) return res.status(400).json({ error: 'CSVに有効な行がありません (ヘッダ行が必要です)' });
+      const index = buildImageFileIndex(meta.images || []);
+      const grouped = {};   // imageId -> boxes[]
+      const errors = [];
+      let matched = 0, skipped = 0;
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        const fname = csvField(r, ['filename', 'file', 'image', 'name', 'img']);
+        const entry = fname ? index[String(fname).trim().toLowerCase()] : null;
+        if (!entry) { skipped++; if (errors.length < 10) errors.push(`行${i + 2}: 画像「${fname}」が見つかりません`); continue; }
+        const cls = csvField(r, ['class', 'label', 'category', 'classname']);
+        let ci = meta.classes.indexOf(cls);
+        if (ci === -1 && /^\d+$/.test(cls)) ci = parseInt(cls, 10);  // クラス番号も許可
+        if (!Number.isInteger(ci) || ci < 0 || ci >= meta.classes.length) {
+          skipped++; if (errors.length < 10) errors.push(`行${i + 2}: クラス「${cls}」が不明`); continue;
+        }
+        const x1 = Number(csvField(r, ['x1', 'xmin', 'left']));
+        const y1 = Number(csvField(r, ['y1', 'ymin', 'top']));
+        const x2 = Number(csvField(r, ['x2', 'xmax', 'right']));
+        const y2 = Number(csvField(r, ['y2', 'ymax', 'bottom']));
+        if ([x1, y1, x2, y2].some(v => !Number.isFinite(v))) {
+          skipped++; if (errors.length < 10) errors.push(`行${i + 2}: 座標が数値ではありません`); continue;
+        }
+        if (!grouped[entry.id]) grouped[entry.id] = [];
+        grouped[entry.id].push({
+          classIndex: ci,
+          x1: Math.min(x1, x2), y1: Math.min(y1, y2),
+          x2: Math.max(x1, x2), y2: Math.max(y1, y2),
+        });
+        matched++;
+      }
+      // CSVに出てきた画像だけ boxes を置き換える (出てこない画像は触らない)
+      let appliedImages = 0;
+      for (const [eid, boxes] of Object.entries(grouped)) {
+        const entry = meta.images.find(im => im.id === eid);
+        if (entry) { entry.boxes = boxes; appliedImages++; }
+      }
+      meta.updatedAt = Date.now();
+      saveImageDataset(name, meta);
+      log(ip, `[画像学習] CSVインポート: ${name} (${matched}矩形 / ${appliedImages}画像, スキップ${skipped})`);
+      return res.json({ ok: true, appliedImages, boxCount: matched, skipped, errors });
     } else {
-      return res.status(400).json({ error: 'format は yolo または coco' });
+      return res.status(400).json({ error: 'format は yolo / coco / csv' });
     }
   } catch (e) {
     res.status(500).json({ error: `インポート失敗: ${e.message}` });
@@ -6095,6 +6210,949 @@ ${'='.repeat(50)}
     res.end(zipBuf);
   } catch (e) {
     log(getIP(req), `[画像学習] モデルDL失敗: ${name} - ${e.message}`);
+    if (!res.headersSent) res.status(500).json({ error: `zip生成に失敗: ${e.message}` });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// 画像キーポイント検出 (torchvision Keypoint R-CNN)
+// ════════════════════════════════════════════════════════════════════════
+// 手の関節など「対象(バウンディングボックス)+順序付きのキーポイント(点)」を
+// 関連付けて学習・推論する。画像物体検出とは別系統のデータセット・モデルを使う。
+// COCO事前学習 (人物17点) での推論と、カスタム学習の両方に対応。
+
+// 画像のマジックバイトから形式を判定する (拡張子偽装の防止)。
+// 物体検出の画像追加と同じ基準: ブラウザ表示でき torchvision でも読める形式に限定。
+function detectImageMagic(buf) {
+  if (!buf || buf.length < 12) return null;
+  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return 'jpg';
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return 'png';
+  if (buf[0] === 0x42 && buf[1] === 0x4D) return 'bmp';
+  if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+      buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return 'webp';
+  if ((buf[0] === 0x49 && buf[1] === 0x49 && buf[2] === 0x2A && buf[3] === 0x00) ||
+      (buf[0] === 0x4D && buf[1] === 0x4D && buf[2] === 0x00 && buf[3] === 0x2A)) return 'tiff';
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return 'gif';
+  if (buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70) return 'heic';
+  return null;
+}
+
+// データセットのメタ情報をロード / 保存
+function loadKeypointDataset(name) {
+  const metaPath = path.join(KEYPOINT_DATASETS_DIR, name, 'dataset.json');
+  if (!fs.existsSync(metaPath)) return null;
+  try { return JSON.parse(fs.readFileSync(metaPath, 'utf-8')); }
+  catch { return null; }
+}
+function saveKeypointDataset(name, meta) {
+  const dir = path.join(KEYPOINT_DATASETS_DIR, name);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(path.join(dir, 'images'))) fs.mkdirSync(path.join(dir, 'images'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'dataset.json'), JSON.stringify(meta, null, 2), 'utf-8');
+}
+
+// ─── 推論モデル (COCO事前学習) ───
+const KEYPOINT_DETECT_MODELS = [
+  { name: 'keypointrcnn_resnet50_fpn', label: 'Keypoint R-CNN (ResNet50)', note: 'COCO人物17点', speed: '中' },
+];
+
+// キーポイント検出を実行 (base64画像 → 一時ファイル → image_keypoint_detect.py)
+function runKeypointDetect(imageBase64, threshold, customModelName, opts) {
+  return new Promise((resolve, reject) => {
+    const isCustom = !!customModelName;
+    let is3dModel = false;  // カスタムモデルが3D回帰モデルか
+    if (isCustom) {
+      if (!isValidDatasetName(customModelName)) {
+        return reject(new Error('無効なカスタムモデル名'));
+      }
+      const cfgPath = path.join(KEYPOINT_MODELS_DIR, customModelName, 'config.json');
+      if (!fs.existsSync(cfgPath)) {
+        return reject(new Error(`カスタムモデルが見つかりません: ${customModelName}`));
+      }
+      try { is3dModel = JSON.parse(fs.readFileSync(cfgPath, 'utf-8')).dim === '3d'; } catch {}
+    }
+    if (!imageBase64 || typeof imageBase64 !== 'string') {
+      return reject(new Error('image (base64) が必要です'));
+    }
+    const b64 = imageBase64.replace(/^data:image\/[a-zA-Z+]+;base64,/, '');
+    let buf;
+    try { buf = Buffer.from(b64, 'base64'); }
+    catch { return reject(new Error('base64 のデコードに失敗しました')); }
+    if (buf.length === 0) return reject(new Error('画像データが空です'));
+    if (buf.length > MAX_FILE_SIZE) return reject(new Error('画像が大きすぎます'));
+
+    const tmpPath = path.join(os.tmpdir(), `kpdetect_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.img`);
+    try { fs.writeFileSync(tmpPath, buf); }
+    catch (e) { return reject(new Error(`一時ファイル書き込み失敗: ${e.message}`)); }
+
+    const pythonCmd = appConfig.pythonPath || 'python3';
+    // 3Dモデルは ResNet回帰スクリプト、それ以外(COCO/2Dカスタム)は Keypoint R-CNN スクリプト
+    const scriptName = is3dModel ? 'image_keypoint3d_detect.py' : 'image_keypoint_detect.py';
+    const scriptPath = path.join(__dirname, scriptName);
+    if (!fs.existsSync(scriptPath)) {
+      try { fs.unlinkSync(tmpPath); } catch {}
+      return reject(new Error(`${scriptName} が見つかりません`));
+    }
+
+    const argv = [scriptPath, '--image', tmpPath, '--cache-dir', TORCH_CACHE_DIR];
+    if (is3dModel) {
+      // 3D回帰: しきい値/最大数の概念は無い。カスタムモデルディレクトリのみ。
+      argv.push('--custom-model-dir', path.join(KEYPOINT_MODELS_DIR, customModelName));
+    } else {
+      argv.push('--threshold', String(threshold ?? 0.5));
+      if (isCustom) {
+        argv.push('--custom-model-dir', path.join(KEYPOINT_MODELS_DIR, customModelName));
+      }
+      if (opts && Number.isInteger(opts.maxInstances) && opts.maxInstances > 0) {
+        argv.push('--max-instances', String(opts.maxInstances));
+      }
+    }
+
+    const { spawn } = require('child_process');
+    const proc = spawn(pythonCmd, argv, {
+      cwd: __dirname,
+      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    });
+
+    let stdout = '', stderr = '';
+    proc.stdout.on('data', d => { stdout += d.toString(); });
+    proc.stderr.on('data', d => { stderr += d.toString(); });
+    const timeout = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 120000);
+    const cleanup = () => { try { fs.unlinkSync(tmpPath); } catch {} };
+
+    proc.on('close', (code) => {
+      clearTimeout(timeout);
+      cleanup();
+      const tryParseJson = (s) => {
+        if (!s) return null;
+        try { return JSON.parse(s.trim()); } catch {}
+        const start = s.lastIndexOf('{');
+        const end = s.lastIndexOf('}');
+        if (start !== -1 && end > start) {
+          try { return JSON.parse(s.slice(start, end + 1)); } catch {}
+        }
+        return null;
+      };
+      const parsed = tryParseJson(stdout);
+      if (code !== 0) {
+        if (parsed && parsed.error) return reject(new Error(parsed.error));
+        const cleanErr = stderr
+          .split('\n')
+          .map(line => line.split('\r').pop())
+          .filter(line => !/^\s*\d+%\|/.test(line) && line.trim())
+          .join('\n')
+          .trim();
+        return reject(new Error(`検出失敗 (exit ${code}): ${cleanErr.slice(0, 400) || '詳細不明'}`));
+      }
+      if (parsed) return resolve(parsed);
+      reject(new Error(`検出結果のパース失敗: ${stdout.slice(0, 200)}`));
+    });
+    proc.on('error', (err) => { clearTimeout(timeout); cleanup(); reject(new Error(`検出プロセス起動失敗: ${err.message}`)); });
+  });
+}
+
+// 推論: 対応モデル一覧
+app.get('/ml/image/keypoint/models', requireAuth, requirePermission('ml:read'), (req, res) => {
+  res.json({ models: KEYPOINT_DETECT_MODELS });
+});
+
+// 推論: 実行
+// body: { image: "<base64 or data URL>", threshold?: 0.5, customModel?: "name", maxInstances?: n }
+app.post('/ml/image/keypoint/detect', requireAuth, requirePermission('ml:read'), jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  const { image, threshold, customModel, maxInstances } = req.body || {};
+  try {
+    const th = typeof threshold === 'number' ? Math.min(Math.max(threshold, 0), 1) : 0.5;
+    const opts = {};
+    if (Number.isInteger(maxInstances)) opts.maxInstances = maxInstances;
+    const result = await runKeypointDetect(image, th, customModel, opts);
+    log(ip, `[キーポイント検出] ${result.model}: ${result.count}個検出 (${result.device})`);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── データセット管理 ───
+
+// データセット一覧
+app.get('/ml/image/keypoint/datasets', requireAuth, requirePermission('ml:read'), (req, res) => {
+  try {
+    const datasets = [];
+    for (const name of fs.readdirSync(KEYPOINT_DATASETS_DIR)) {
+      const meta = loadKeypointDataset(name);
+      if (meta) {
+        datasets.push({
+          name,
+          keypoints: meta.keypoints || [],
+          dim: meta.dim === '3d' ? '3d' : '2d',
+          imageCount: (meta.images || []).length,
+          annotatedCount: (meta.images || []).filter(im => (im.instances || []).length > 0).length,
+          createdAt: meta.createdAt,
+          updatedAt: meta.updatedAt,
+        });
+      }
+    }
+    datasets.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    res.json({ datasets });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// データセット作成
+// body: { name, keypoints: ["wrist","thumb_tip",...], skeleton?: [[0,1],...], dim?: '2d'|'3d' }
+//   dim='3d' は奥行き z も学習する3Dキーポイント (ResNet回帰、単一インスタンス)
+app.post('/ml/image/keypoint/datasets', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  const ip = getIP(req);
+  const { name, keypoints, skeleton, dim } = req.body || {};
+  if (!isValidDatasetName(name)) {
+    return res.status(400).json({ error: 'データセット名は英数字・ハイフン・アンダースコア (1-64文字)' });
+  }
+  if (loadKeypointDataset(name)) {
+    return res.status(409).json({ error: `データセット「${name}」は既に存在します` });
+  }
+  if (!Array.isArray(keypoints) || keypoints.length === 0) {
+    return res.status(400).json({ error: '最低1つのキーポイント名が必要です' });
+  }
+  const cleanKp = keypoints.map(c => String(c).trim()).filter(Boolean);
+  if (cleanKp.length === 0) {
+    return res.status(400).json({ error: '有効なキーポイント名がありません' });
+  }
+  // 骨格エッジ (任意): [a,b] のペアで、各端点はキーポイント番号の範囲内
+  let cleanSkeleton = [];
+  if (Array.isArray(skeleton)) {
+    for (const e of skeleton) {
+      if (!Array.isArray(e) || e.length !== 2) continue;
+      const a = Number(e[0]), b = Number(e[1]);
+      if (!Number.isInteger(a) || !Number.isInteger(b)) continue;
+      if (a < 0 || a >= cleanKp.length || b < 0 || b >= cleanKp.length) continue;
+      cleanSkeleton.push([a, b]);
+    }
+  }
+  const meta = {
+    name,
+    task: 'keypoint',
+    dim: dim === '3d' ? '3d' : '2d',
+    keypoints: cleanKp,
+    skeleton: cleanSkeleton,
+    images: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  saveKeypointDataset(name, meta);
+  log(ip, `[キーポイント学習] データセット作成: ${name} (点: ${cleanKp.join(', ')})`);
+  res.json({ ok: true, dataset: meta });
+});
+
+// データセット詳細
+app.get('/ml/image/keypoint/datasets/:name', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const { name } = req.params;
+  if (!isValidDatasetName(name)) return res.status(400).json({ error: '無効なデータセット名' });
+  const meta = loadKeypointDataset(name);
+  if (!meta) return res.status(404).json({ error: 'データセットが見つかりません' });
+  res.json({ dataset: meta });
+});
+
+// データセット削除
+app.delete('/ml/image/keypoint/datasets/:name', requireAuth, requirePermission('ml:write'), (req, res) => {
+  const ip = getIP(req);
+  const { name } = req.params;
+  if (!isValidDatasetName(name)) return res.status(400).json({ error: '無効なデータセット名' });
+  const dir = path.join(KEYPOINT_DATASETS_DIR, name);
+  if (!fs.existsSync(dir)) return res.status(404).json({ error: 'データセットが見つかりません' });
+  fs.rmSync(dir, { recursive: true, force: true });
+  log(ip, `[キーポイント学習] データセット削除: ${name}`);
+  res.json({ ok: true });
+});
+
+// データセットに画像を追加 (base64)
+// body: { images: [{ name, data }] }  data は base64 or data URL
+app.post('/ml/image/keypoint/datasets/:name/images', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  const ip = getIP(req);
+  const { name } = req.params;
+  if (!isValidDatasetName(name)) return res.status(400).json({ error: '無効なデータセット名' });
+  const meta = loadKeypointDataset(name);
+  if (!meta) return res.status(404).json({ error: 'データセットが見つかりません' });
+
+  const { images } = req.body || {};
+  if (!Array.isArray(images) || images.length === 0) {
+    return res.status(400).json({ error: 'images が必要です' });
+  }
+  const imagesDir = path.join(KEYPOINT_DATASETS_DIR, name, 'images');
+  if (!fs.existsSync(imagesDir)) fs.mkdirSync(imagesDir, { recursive: true });
+  const added = [];
+  const errors = [];
+
+  for (const im of images) {
+    try {
+      const b64 = String(im.data || '').replace(/^data:image\/[a-zA-Z+]+;base64,/, '');
+      const buf = Buffer.from(b64, 'base64');
+      if (buf.length === 0) throw new Error('画像データが空');
+      if (buf.length > MAX_FILE_SIZE) throw new Error('画像が大きすぎます');
+      const detected = detectImageMagic(buf);
+      if (!detected) throw new Error('画像として認識できません');
+      if (detected === 'tiff') throw new Error('TIFF はブラウザで表示できないため非対応です (JPEG / PNG に変換してください)');
+      if (detected === 'heic') throw new Error('HEIC はブラウザで表示できないため非対応です (JPEG / PNG に変換してください)');
+      if (detected === 'gif') throw new Error('GIF は学習に向かないため非対応です (JPEG / PNG に変換してください)');
+      const ext = detected === 'jpg' ? '.jpg' : `.${detected}`;
+      const imgId = `img_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+      const fileName = `${imgId}${ext}`;
+      fs.writeFileSync(path.join(imagesDir, fileName), buf);
+      const imgEntry = { id: imgId, file: fileName, originalName: im.name || fileName, instances: [], addedAt: Date.now() };
+      meta.images.push(imgEntry);
+      added.push(imgEntry);
+    } catch (e) {
+      errors.push({ name: im.name, error: e.message });
+    }
+  }
+  meta.updatedAt = Date.now();
+  saveKeypointDataset(name, meta);
+  log(ip, `[キーポイント学習] ${name} に画像追加: ${added.length}件 (失敗: ${errors.length})`);
+  res.json({ ok: true, added, errors });
+});
+
+// データセットの画像ファイルを返す (アノテーション画面の表示用)
+app.get('/ml/image/keypoint/datasets/:name/images/:file', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const { name, file } = req.params;
+  if (!isValidDatasetName(name)) return res.status(400).json({ error: '無効なデータセット名' });
+  if (!/^[a-zA-Z0-9_.-]+$/.test(file)) return res.status(400).json({ error: '無効なファイル名' });
+  const filePath = path.join(KEYPOINT_DATASETS_DIR, name, 'images', file);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: '画像が見つかりません' });
+  res.sendFile(filePath);
+});
+
+// 画像のアノテーション (インスタンス = 対象box + キーポイント) を保存
+// body: { instances: [{ box:{x1,y1,x2,y2}, keypoints:[{x,y,v},...] }] }
+//   keypoints はデータセットのキーポイント順。v: 0=未指定, 1=隠れ, 2=可視
+app.put('/ml/image/keypoint/datasets/:name/annotations/:imageId', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  const { name, imageId } = req.params;
+  if (!isValidDatasetName(name)) return res.status(400).json({ error: '無効なデータセット名' });
+  const meta = loadKeypointDataset(name);
+  if (!meta) return res.status(404).json({ error: 'データセットが見つかりません' });
+  const img = (meta.images || []).find(im => im.id === imageId);
+  if (!img) return res.status(404).json({ error: '画像が見つかりません' });
+
+  const { instances } = req.body || {};
+  if (!Array.isArray(instances)) return res.status(400).json({ error: 'instances が必要です' });
+  const K = (meta.keypoints || []).length;
+  const is3d = meta.dim === '3d';
+
+  const clean = [];
+  for (const inst of instances) {
+    const b = inst && inst.box;
+    if (!b) continue;
+    const x1 = Number(b.x1), y1 = Number(b.y1), x2 = Number(b.x2), y2 = Number(b.y2);
+    if ([x1, y1, x2, y2].some(v => !Number.isFinite(v))) continue;
+    // キーポイント配列を K 個に正規化 (足りなければ v=0 で埋める)
+    const kpIn = Array.isArray(inst.keypoints) ? inst.keypoints : [];
+    const kps = [];
+    for (let i = 0; i < K; i++) {
+      const kp = kpIn[i];
+      if (!kp) { kps.push(is3d ? { x: 0, y: 0, z: 0, v: 0 } : { x: 0, y: 0, v: 0 }); continue; }
+      let v = Number(kp.v);
+      if (![0, 1, 2].includes(v)) v = 2;
+      const kx = Number(kp.x), ky = Number(kp.y);
+      if (v === 0 || !Number.isFinite(kx) || !Number.isFinite(ky)) {
+        kps.push(is3d ? { x: 0, y: 0, z: 0, v: 0 } : { x: 0, y: 0, v: 0 });
+      } else if (is3d) {
+        // z(相対深度)は [-1,1] にクランプ。未指定は0。
+        let z = Number(kp.z);
+        if (!Number.isFinite(z)) z = 0;
+        z = Math.min(1, Math.max(-1, z));
+        kps.push({ x: kx, y: ky, z, v });
+      } else {
+        kps.push({ x: kx, y: ky, v });
+      }
+    }
+    clean.push({
+      box: {
+        x1: Math.min(x1, x2), y1: Math.min(y1, y2),
+        x2: Math.max(x1, x2), y2: Math.max(y1, y2),
+      },
+      keypoints: kps,
+    });
+  }
+  img.instances = clean;
+  meta.updatedAt = Date.now();
+  saveKeypointDataset(name, meta);
+  res.json({ ok: true, instanceCount: clean.length });
+});
+
+// データセットから画像を削除
+app.delete('/ml/image/keypoint/datasets/:name/images/:imageId', requireAuth, requirePermission('ml:write'), (req, res) => {
+  const { name, imageId } = req.params;
+  if (!isValidDatasetName(name)) return res.status(400).json({ error: '無効なデータセット名' });
+  const meta = loadKeypointDataset(name);
+  if (!meta) return res.status(404).json({ error: 'データセットが見つかりません' });
+  const idx = (meta.images || []).findIndex(im => im.id === imageId);
+  if (idx === -1) return res.status(404).json({ error: '画像が見つかりません' });
+  const [removed] = meta.images.splice(idx, 1);
+  try { fs.unlinkSync(path.join(KEYPOINT_DATASETS_DIR, name, 'images', removed.file)); } catch {}
+  meta.updatedAt = Date.now();
+  saveKeypointDataset(name, meta);
+  res.json({ ok: true });
+});
+
+// キーポイントのアノテーションを CSV (ロング形式) でインポート
+// body: { format: 'csv', data: <CSV文字列> }
+//   列: filename, keypoint, x, y, v[, z][, instance]
+//     - filename : 既存画像のファイル名 (originalName / 保存名 / basename で照合)
+//     - keypoint : キーポイント名 (データセットの定義名) または 0始まり番号
+//     - x, y     : ピクセル座標
+//     - v        : 可視性 0/1/2 (省略時2)
+//     - z        : 3Dデータセットのみ。相対深度 -1..1 (省略時0)
+//     - instance : 同一画像内の対象の区別 (省略時0)。任意で box 列(bx1,by1,bx2,by2)も可
+//   各インスタンスの矩形は box 列が無ければキーポイントの外接矩形から自動生成。
+app.post('/ml/image/keypoint/datasets/:name/import', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  const ip = getIP(req);
+  const { name } = req.params;
+  if (!isValidDatasetName(name)) return res.status(400).json({ error: '無効なデータセット名' });
+  const meta = loadKeypointDataset(name);
+  if (!meta) return res.status(404).json({ error: 'データセットが見つかりません' });
+
+  const { format, data } = req.body || {};
+  if (format !== 'csv') return res.status(400).json({ error: 'format は csv のみ対応です' });
+  const is3d = meta.dim === '3d';
+  const keypoints = meta.keypoints || [];
+  const K = keypoints.length;
+  const kpNameToIndex = {};
+  keypoints.forEach((nm, i) => { kpNameToIndex[String(nm).trim().toLowerCase()] = i; });
+
+  try {
+    const rows = parseCsv(data);
+    if (rows.length === 0) return res.status(400).json({ error: 'CSVに有効な行がありません (ヘッダ行が必要です)' });
+    const index = buildImageFileIndex(meta.images || []);
+
+    // imageId -> (instanceKey -> { kps:[K], box? })
+    const perImage = {};
+    const errors = [];
+    let matchedPts = 0, skipped = 0;
+
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      const fname = csvField(r, ['filename', 'file', 'image', 'name', 'img']);
+      const entry = fname ? index[String(fname).trim().toLowerCase()] : null;
+      if (!entry) { skipped++; if (errors.length < 10) errors.push(`行${i + 2}: 画像「${fname}」が見つかりません`); continue; }
+
+      const kpRaw = csvField(r, ['keypoint', 'kp', 'point', 'name2', 'joint']);
+      let ki = kpNameToIndex[String(kpRaw).trim().toLowerCase()];
+      if (ki === undefined && /^\d+$/.test(kpRaw)) ki = parseInt(kpRaw, 10);
+      if (!Number.isInteger(ki) || ki < 0 || ki >= K) {
+        skipped++; if (errors.length < 10) errors.push(`行${i + 2}: キーポイント「${kpRaw}」が不明`); continue;
+      }
+      const x = Number(csvField(r, ['x', 'px', 'u']));
+      const y = Number(csvField(r, ['y', 'py', 'vcoord']));
+      if (![x, y].some(Number.isFinite) || !Number.isFinite(x) || !Number.isFinite(y)) {
+        skipped++; if (errors.length < 10) errors.push(`行${i + 2}: x,y が数値ではありません`); continue;
+      }
+      let v = Number(csvField(r, ['v', 'visibility', 'vis']));
+      if (![0, 1, 2].includes(v)) v = 2;  // 省略時は可視
+      let z = 0;
+      if (is3d) {
+        const zr = csvField(r, ['z', 'depth']);
+        z = Number(zr);
+        if (!Number.isFinite(z)) z = 0;
+        z = Math.min(1, Math.max(-1, z));
+      }
+      const instKey = String(csvField(r, ['instance', 'inst', 'id', 'object']) || '0');
+
+      if (!perImage[entry.id]) perImage[entry.id] = {};
+      if (!perImage[entry.id][instKey]) {
+        perImage[entry.id][instKey] = {
+          kps: Array.from({ length: K }, () => (is3d ? { x: 0, y: 0, z: 0, v: 0 } : { x: 0, y: 0, v: 0 })),
+          box: null,
+        };
+      }
+      const inst = perImage[entry.id][instKey];
+      inst.kps[ki] = is3d ? { x, y, z, v } : { x, y, v };
+      // box 列があれば採用 (任意)
+      const bx1 = Number(csvField(r, ['bx1', 'box_x1', 'boxxmin']));
+      const by1 = Number(csvField(r, ['by1', 'box_y1', 'boxymin']));
+      const bx2 = Number(csvField(r, ['bx2', 'box_x2', 'boxxmax']));
+      const by2 = Number(csvField(r, ['by2', 'box_y2', 'boxymax']));
+      if ([bx1, by1, bx2, by2].every(Number.isFinite)) {
+        inst.box = { x1: Math.min(bx1, bx2), y1: Math.min(by1, by2), x2: Math.max(bx1, bx2), y2: Math.max(by1, by2) };
+      }
+      matchedPts++;
+    }
+
+    // インスタンスを確定し、box が無ければ可視キーポイントの外接矩形から生成
+    let appliedImages = 0, instanceCount = 0;
+    for (const [imageId, instMap] of Object.entries(perImage)) {
+      const entry = meta.images.find(im => im.id === imageId);
+      if (!entry) continue;
+      const instances = [];
+      for (const inst of Object.values(instMap)) {
+        const vis = inst.kps.filter(kp => kp.v > 0);
+        if (vis.length === 0) continue;  // 可視点が無いインスタンスは捨てる
+        let box = inst.box;
+        if (!box) {
+          // 外接矩形 + 余白 (キーポイントの広がりの10%、最低8px)
+          const xs = vis.map(kp => kp.x), ys = vis.map(kp => kp.y);
+          let minX = Math.min(...xs), maxX = Math.max(...xs);
+          let minY = Math.min(...ys), maxY = Math.max(...ys);
+          const padX = Math.max(8, (maxX - minX) * 0.1);
+          const padY = Math.max(8, (maxY - minY) * 0.1);
+          box = { x1: minX - padX, y1: minY - padY, x2: maxX + padX, y2: maxY + padY };
+        }
+        instances.push({ box, keypoints: inst.kps });
+        instanceCount++;
+      }
+      if (instances.length > 0) { entry.instances = instances; appliedImages++; }
+    }
+
+    meta.updatedAt = Date.now();
+    saveKeypointDataset(name, meta);
+    log(ip, `[キーポイント学習] CSVインポート: ${name} (${matchedPts}点 / ${instanceCount}対象 / ${appliedImages}画像, スキップ${skipped})`);
+    res.json({ ok: true, appliedImages, instanceCount, pointCount: matchedPts, skipped, errors });
+  } catch (e) {
+    res.status(500).json({ error: `インポート失敗: ${e.message}` });
+  }
+});
+
+// ─── キーポイント学習ジョブ (物体検出・表データ学習とは別系統) ───
+let currentKeypointJob = null;  // { jobId, datasetName, modelName, proc, log: [] }
+
+const KEYPOINT_JOBS_FILE = path.join(ML_DIR, 'keypoint_jobs.json');
+function loadKeypointJobs() {
+  if (!fs.existsSync(KEYPOINT_JOBS_FILE)) return [];
+  try { return JSON.parse(fs.readFileSync(KEYPOINT_JOBS_FILE, 'utf-8')); }
+  catch { return []; }
+}
+function saveKeypointJobs(jobs) {
+  fs.writeFileSync(KEYPOINT_JOBS_FILE, JSON.stringify(jobs.slice(0, 50), null, 2), 'utf-8');
+}
+
+const KEYPOINT_TRAIN_BASE_MODELS = [
+  { name: 'keypointrcnn_resnet50_fpn', label: 'Keypoint R-CNN (ResNet50)', note: 'COCO事前学習・少量データ向き' },
+  { name: 'scratch', label: '事前学習なし (ゼロから学習)', note: '⚠️ 大量データ・多エポックが必要、少量では精度が出ません' },
+];
+
+// 3Dキーポイント回帰 (ResNetバックボーン) のバックボーン候補
+const KEYPOINT3D_BACKBONES = [
+  { name: 'resnet18', label: 'ResNet18', note: '軽量・高速 (少量データ向き)' },
+  { name: 'resnet34', label: 'ResNet34', note: '中庸' },
+  { name: 'resnet50', label: 'ResNet50', note: '高精度・やや重い' },
+];
+const KEYPOINT3D_BACKBONE_NAMES = KEYPOINT3D_BACKBONES.map(b => b.name);
+
+app.get('/ml/image/keypoint/train/models', requireAuth, requirePermission('ml:read'), (req, res) => {
+  res.json({ baseModels: KEYPOINT_TRAIN_BASE_MODELS, backbones3d: KEYPOINT3D_BACKBONES });
+});
+
+// カスタムモデル学習を開始
+// body: { datasetName, modelName, baseModel?, epochs?, batchSize?, lr? }
+app.post('/ml/image/keypoint/train', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  const ip = getIP(req);
+  if (currentKeypointJob) {
+    return res.status(409).json({ error: `既にキーポイント学習中: ${currentKeypointJob.modelName}` });
+  }
+  const { datasetName, modelName, baseModel, epochs, batchSize, lr } = req.body || {};
+  if (!isValidDatasetName(datasetName)) return res.status(400).json({ error: '無効なデータセット名' });
+  if (!isValidDatasetName(modelName)) return res.status(400).json({ error: 'モデル名は英数字・ハイフン・アンダースコア' });
+
+  const meta = loadKeypointDataset(datasetName);
+  if (!meta) return res.status(404).json({ error: 'データセットが見つかりません' });
+  const annotated = (meta.images || []).filter(im => (im.instances || []).length > 0);
+  if (annotated.length === 0) {
+    return res.status(400).json({ error: 'アノテーション済みの画像がありません。対象を囲み、キーポイントを打ってから学習してください' });
+  }
+  const is3d = meta.dim === '3d';
+  const datasetDir = path.join(KEYPOINT_DATASETS_DIR, datasetName);
+  const outputDir = path.join(KEYPOINT_MODELS_DIR, modelName);
+  const pythonCmd = appConfig.pythonPath || 'python3';
+
+  // 2D (Keypoint R-CNN) と 3D (ResNet回帰) でスクリプト・引数が異なる
+  let scriptName, base, argv;
+  if (is3d) {
+    base = (baseModel && KEYPOINT3D_BACKBONE_NAMES.includes(baseModel)) ? baseModel : 'resnet18';
+    scriptName = 'image_keypoint3d_train.py';
+    argv = [
+      path.join(__dirname, scriptName),
+      '--dataset-dir', datasetDir,
+      '--output-dir', outputDir,
+      '--backbone', base,
+      '--epochs', String(Math.min(Math.max(parseInt(epochs) || 30, 1), 500)),
+      '--batch-size', String(Math.min(Math.max(parseInt(batchSize) || 8, 1), 32)),
+      '--lr', String(typeof lr === 'number' ? lr : 0.0005),
+      '--cache-dir', TORCH_CACHE_DIR,
+    ];
+  } else {
+    base = (baseModel && KEYPOINT_TRAIN_BASE_MODELS.some(m => m.name === baseModel))
+      ? baseModel : 'keypointrcnn_resnet50_fpn';
+    scriptName = 'image_keypoint_train.py';
+    argv = [
+      path.join(__dirname, scriptName),
+      '--dataset-dir', datasetDir,
+      '--output-dir', outputDir,
+      '--base-model', base,
+      '--epochs', String(Math.min(Math.max(parseInt(epochs) || 10, 1), 200)),
+      '--batch-size', String(Math.min(Math.max(parseInt(batchSize) || 2, 1), 16)),
+      '--lr', String(typeof lr === 'number' ? lr : 0.005),
+      '--cache-dir', TORCH_CACHE_DIR,
+    ];
+  }
+  const scriptPath = path.join(__dirname, scriptName);
+  if (!fs.existsSync(scriptPath)) return res.status(500).json({ error: `${scriptName} が見つかりません` });
+
+  const jobId = `kpjob_${Date.now()}`;
+
+  const { spawn } = require('child_process');
+  const proc = spawn(pythonCmd, argv, { cwd: __dirname, env: { ...process.env, PYTHONUNBUFFERED: '1' }, detached: true });
+
+  currentKeypointJob = { jobId, datasetName, modelName, baseModel: base, proc, log: [], startedAt: Date.now() };
+  log(ip, `[キーポイント学習] 開始: ${modelName} (データセット: ${datasetName}, ${annotated.length}枚, ${base})`);
+
+  proc.stdout.on('data', d => { currentKeypointJob.log.push(d.toString()); });
+  proc.stderr.on('data', d => {
+    const s = d.toString();
+    if (!/^\s*\d+%\|/.test(s)) currentKeypointJob.log.push(s);
+  });
+
+  proc.on('close', (code) => {
+    const fullLog = currentKeypointJob.log.join('');
+    const wasCancelled = currentKeypointJob.cancelled;
+    let result = null;
+    const m = fullLog.match(/RESULT_JSON:(.+)/);
+    if (m) { try { result = JSON.parse(m[1]); } catch {} }
+
+    const jobs = loadKeypointJobs();
+    jobs.unshift({
+      jobId, datasetName, modelName, baseModel: base,
+      status: wasCancelled ? 'cancelled' : ((code === 0 && result?.status === 'completed') ? 'completed' : 'failed'),
+      finalLoss: result?.finalLoss ?? null,
+      device: result?.device ?? null,
+      note: result?.note ?? null,
+      error: wasCancelled ? null : (result?.error ?? (code !== 0 ? `exit ${code}` : null)),
+      startedAt: currentKeypointJob.startedAt,
+      finishedAt: Date.now(),
+      log: fullLog.slice(-5000),
+    });
+    saveKeypointJobs(jobs);
+    log('-', `[キーポイント学習] 終了: ${modelName} (exit ${code}, ${wasCancelled ? 'cancelled' : (result?.status || 'failed')})`);
+    currentKeypointJob = null;
+  });
+  proc.on('error', (err) => {
+    log('-', `[キーポイント学習] プロセスエラー: ${err.message}`);
+    currentKeypointJob = null;
+  });
+
+  res.json({ ok: true, jobId });
+});
+
+// 学習ジョブの状態 + ログ
+app.get('/ml/image/keypoint/train/status', requireAuth, requirePermission('ml:read'), (req, res) => {
+  if (currentKeypointJob) {
+    return res.json({
+      running: true,
+      jobId: currentKeypointJob.jobId,
+      modelName: currentKeypointJob.modelName,
+      datasetName: currentKeypointJob.datasetName,
+      log: currentKeypointJob.log.join(''),
+    });
+  }
+  const jobs = loadKeypointJobs();
+  res.json({ running: false, recentJobs: jobs.slice(0, 10) });
+});
+
+// 学習中ジョブのキャンセル
+app.post('/ml/image/keypoint/train/cancel', requireAuth, requirePermission('ml:write'), (req, res) => {
+  if (!currentKeypointJob) return res.status(400).json({ error: '学習中のジョブがありません' });
+  currentKeypointJob.cancelled = true;
+  const pid = currentKeypointJob.proc && currentKeypointJob.proc.pid;
+  if (pid) {
+    try { process.kill(-pid, 'SIGKILL'); }
+    catch { try { currentKeypointJob.proc.kill('SIGKILL'); } catch {} }
+  }
+  res.json({ ok: true });
+});
+
+// カスタム学習済みモデル一覧
+app.get('/ml/image/keypoint/custom-models', requireAuth, requirePermission('ml:read'), (req, res) => {
+  try {
+    const models = [];
+    for (const name of fs.readdirSync(KEYPOINT_MODELS_DIR)) {
+      const cfgPath = path.join(KEYPOINT_MODELS_DIR, name, 'config.json');
+      const modelPath = path.join(KEYPOINT_MODELS_DIR, name, 'model.pt');
+      if (fs.existsSync(cfgPath) && fs.existsSync(modelPath)) {
+        try {
+          const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+          let metrics = null;
+          const mpath = path.join(KEYPOINT_MODELS_DIR, name, 'metrics.json');
+          if (fs.existsSync(mpath)) { try { metrics = JSON.parse(fs.readFileSync(mpath, 'utf-8')); } catch {} }
+          models.push({
+            name,
+            keypoints: cfg.keypoints || [],
+            dim: cfg.dim === '3d' ? '3d' : '2d',
+            baseModel: cfg.baseModel || cfg.backbone,
+            datasetName: cfg.datasetName,
+            trainedAt: cfg.trainedAt,
+            finalLoss: metrics?.finalLoss ?? null,
+          });
+        } catch {}
+      }
+    }
+    models.sort((a, b) => (b.trainedAt || 0) - (a.trainedAt || 0));
+    res.json({ models });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// カスタムモデル削除
+app.delete('/ml/image/keypoint/custom-models/:name', requireAuth, requirePermission('ml:write'), (req, res) => {
+  const { name } = req.params;
+  if (!isValidDatasetName(name)) return res.status(400).json({ error: '無効なモデル名' });
+  const dir = path.join(KEYPOINT_MODELS_DIR, name);
+  if (!fs.existsSync(dir)) return res.status(404).json({ error: 'モデルが見つかりません' });
+  fs.rmSync(dir, { recursive: true, force: true });
+  res.json({ ok: true });
+});
+
+// カスタムモデルを zip でダウンロード (model.pt + config.json + metrics.json + 推論サンプル)
+app.get('/ml/image/keypoint/custom-models/:name/download', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const { name } = req.params;
+  if (!isValidDatasetName(name)) return res.status(400).json({ error: '無効なモデル名' });
+  const dir = path.join(KEYPOINT_MODELS_DIR, name);
+  const cfgPath = path.join(dir, 'config.json');
+  if (!fs.existsSync(cfgPath)) return res.status(404).json({ error: 'モデルが見つかりません' });
+
+  let cfg;
+  try { cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8')); }
+  catch { return res.status(500).json({ error: 'config.json の読み込みに失敗' }); }
+
+  const kpPy = JSON.stringify(cfg.keypoints || []);
+  const isScratch = cfg.baseModel === 'scratch';
+  const numClasses = cfg.numClasses || 2;
+  let exampleScript = `#!/usr/bin/env python3
+"""
+${name} - OpenGeekLLMChat カスタムキーポイント検出モデルの推論サンプル
+
+必要なパッケージ:
+  pip install torch torchvision pillow
+
+使い方:
+  python predict_example.py <画像ファイル>
+"""
+import sys
+import json
+import torch
+import torchvision
+from torchvision.io import read_image
+from torchvision.transforms.functional import convert_image_dtype
+
+# このモデルの情報 (config.json と同じ)
+KEYPOINTS = ${kpPy}  # 順序付きのキーポイント名
+BASE_MODEL = ${JSON.stringify(cfg.baseModel || 'keypointrcnn_resnet50_fpn')}
+NUM_KEYPOINTS = len(KEYPOINTS)
+NUM_CLASSES = ${numClasses}  # 背景 + 対象
+THRESHOLD = 0.5
+
+def build_model():
+    from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+    from torchvision.models.detection.keypoint_rcnn import KeypointRCNNPredictor
+    if BASE_MODEL == 'scratch':
+        model = torchvision.models.detection.keypointrcnn_resnet50_fpn(
+            weights=None, weights_backbone=None,
+            num_classes=NUM_CLASSES, num_keypoints=NUM_KEYPOINTS)
+    else:
+        model = torchvision.models.detection.keypointrcnn_resnet50_fpn(weights=None)
+        in_features = model.roi_heads.box_predictor.cls_score.in_features
+        model.roi_heads.box_predictor = FastRCNNPredictor(in_features, NUM_CLASSES)
+        kp_in = model.roi_heads.keypoint_predictor.kps_score_lowres.in_channels
+        model.roi_heads.keypoint_predictor = KeypointRCNNPredictor(kp_in, num_keypoints=NUM_KEYPOINTS)
+    return model
+
+def main():
+    if len(sys.argv) < 2:
+        print("使い方: python predict_example.py <画像ファイル>")
+        sys.exit(1)
+    image_path = sys.argv[1]
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = build_model()
+    model.load_state_dict(torch.load('model.pt', map_location='cpu'))
+    model.eval().to(device)
+
+    img = read_image(image_path)
+    if img.shape[0] == 1:
+        img = img.repeat(3, 1, 1)
+    elif img.shape[0] == 4:
+        img = img[:3, :, :]
+    img_f = convert_image_dtype(img, dtype=torch.float).to(device)
+
+    with torch.no_grad():
+        out = model([img_f])[0]
+
+    results = []
+    boxes = out['boxes'].tolist()
+    scores = out['scores'].tolist()
+    keypoints = out['keypoints'].tolist()
+    for box, score, kps in zip(boxes, scores, keypoints):
+        if score < THRESHOLD:
+            continue
+        named = [{'name': KEYPOINTS[i] if i < len(KEYPOINTS) else f'kp{i}',
+                  'x': round(kps[i][0], 1), 'y': round(kps[i][1], 1)}
+                 for i in range(len(kps))]
+        results.append({'score': round(score, 3), 'box': [round(v, 1) for v in box], 'keypoints': named})
+    print(json.dumps({'detections': results, 'count': len(results)}, ensure_ascii=False, indent=2))
+
+if __name__ == '__main__':
+    main()
+`;
+
+  let readme = `OpenGeekLLMChat カスタムキーポイント検出モデル: ${name}
+${'='.repeat(50)}
+
+このモデルについて:
+  ベースモデル   : ${cfg.baseModel || '-'}${isScratch ? ' (事前学習なし)' : ''}
+  キーポイント   : ${(cfg.keypoints || []).join(', ')}
+  学習日時       : ${cfg.trainedAt ? new Date(cfg.trainedAt * 1000).toLocaleString('ja-JP') : '-'}
+
+含まれるファイル:
+  model.pt            学習済みの重み (PyTorch state_dict)
+  config.json         モデル設定 (キーポイント名・ベースモデル等)
+  metrics.json        学習指標 (loss推移)
+  predict_example.py  推論サンプルスクリプト
+
+使い方:
+  1. pip install torch torchvision pillow
+  2. python predict_example.py 画像.jpg
+
+注意:
+  - これは torchvision の Keypoint R-CNN 形式の state_dict です。
+  - predict_example.py と同じディレクトリに model.pt を置いてください。
+  - GPU(CUDA/ROCm)があれば自動で使われます。なければCPUで動作します。
+`;
+
+  // 3Dキーポイント回帰モデルは ResNet 回帰なので、サンプルとREADMEを差し替える
+  if (cfg.dim === '3d') {
+    const backbone = cfg.backbone || 'resnet18';
+    const imageSize = cfg.imageSize || 256;
+    exampleScript = `#!/usr/bin/env python3
+"""
+${name} - OpenGeekLLMChat カスタム3Dキーポイント回帰モデルの推論サンプル
+
+必要なパッケージ:
+  pip install torch torchvision pillow
+
+使い方:
+  python predict_example.py <画像ファイル>
+
+出力: 各キーポイントの x, y (ピクセル) と z (相対深度 -1..1)。
+"""
+import sys
+import json
+import torch
+import torchvision
+from torchvision.io import read_image
+from torchvision.transforms.functional import convert_image_dtype, resize
+
+KEYPOINTS = ${kpPy}          # 順序付きのキーポイント名
+BACKBONE = ${JSON.stringify(backbone)}
+IMAGE_SIZE = ${imageSize}
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+K = len(KEYPOINTS)
+
+def build_model():
+    tvm = torchvision.models
+    if BACKBONE == 'resnet18':
+        m = tvm.resnet18(weights=None)
+    elif BACKBONE == 'resnet34':
+        m = tvm.resnet34(weights=None)
+    else:
+        m = tvm.resnet50(weights=None)
+    m.fc = torch.nn.Linear(m.fc.in_features, K * 3)
+    return m
+
+def main():
+    if len(sys.argv) < 2:
+        print("使い方: python predict_example.py <画像ファイル>")
+        sys.exit(1)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = build_model()
+    model.load_state_dict(torch.load('model.pt', map_location='cpu'))
+    model.eval().to(device)
+
+    img = read_image(sys.argv[1])
+    if img.shape[0] == 1:
+        img = img.repeat(3, 1, 1)
+    elif img.shape[0] == 4:
+        img = img[:3, :, :]
+    _, H, W = img.shape
+    f = convert_image_dtype(img, dtype=torch.float)
+    f = resize(f, [IMAGE_SIZE, IMAGE_SIZE], antialias=True)
+    mean = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_STD).view(3, 1, 1)
+    f = ((f - mean) / std).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        out = model(f).view(1, K, 3)
+        xy = torch.sigmoid(out[..., :2])
+        z = torch.tanh(out[..., 2:3])
+        pred = torch.cat([xy, z], dim=-1)[0].cpu()
+
+    kps = [{'name': KEYPOINTS[i],
+            'x': round(float(pred[i, 0]) * W, 1),
+            'y': round(float(pred[i, 1]) * H, 1),
+            'z': round(float(pred[i, 2]), 4)} for i in range(K)]
+    print(json.dumps({'keypoints': kps}, ensure_ascii=False, indent=2))
+
+if __name__ == '__main__':
+    main()
+`;
+    readme = `OpenGeekLLMChat カスタム3Dキーポイント回帰モデル: ${name}
+${'='.repeat(50)}
+
+このモデルについて:
+  種別           : 3Dキーポイント回帰 (RGB1枚 → x,y,z)
+  バックボーン   : ${cfg.backbone || '-'}
+  入力サイズ     : ${cfg.imageSize || 256}
+  キーポイント   : ${(cfg.keypoints || []).join(', ')}
+  学習日時       : ${cfg.trainedAt ? new Date(cfg.trainedAt * 1000).toLocaleString('ja-JP') : '-'}
+
+出力座標:
+  x, y : 画像のピクセル座標
+  z    : 相対深度 (-1..1)。学習時に手動で付けた奥行きの相対値。
+
+含まれるファイル:
+  model.pt            学習済みの重み (PyTorch state_dict, ResNet回帰)
+  config.json         モデル設定 (キーポイント名・バックボーン・入力サイズ等)
+  metrics.json        学習指標 (loss推移)
+  predict_example.py  推論サンプルスクリプト
+
+使い方:
+  1. pip install torch torchvision pillow
+  2. python predict_example.py 画像.jpg
+
+注意:
+  - 単一インスタンス (画像内に対象1つ) を前提としています。
+  - z は単眼RGBからの相対深度です (絶対距離ではありません)。
+  - GPU(CUDA/ROCm)があれば自動で使われます。なければCPUで動作します。
+`;
+  }
+
+  try {
+    const files = [];
+    files.push({ name: `${name}/model.pt`, data: fs.readFileSync(path.join(dir, 'model.pt')), store: true });
+    files.push({ name: `${name}/config.json`, data: fs.readFileSync(cfgPath) });
+    const metricsPath = path.join(dir, 'metrics.json');
+    if (fs.existsSync(metricsPath)) {
+      files.push({ name: `${name}/metrics.json`, data: fs.readFileSync(metricsPath) });
+    }
+    files.push({ name: `${name}/predict_example.py`, data: Buffer.from(exampleScript, 'utf-8') });
+    files.push({ name: `${name}/README.txt`, data: Buffer.from(readme, 'utf-8') });
+
+    log(getIP(req), `[キーポイント学習] モデルDL開始: ${name}`);
+    const zipBuf = buildZipBuffer(files);
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${name}.zip"`);
+    res.setHeader('Content-Length', zipBuf.length);
+    res.end(zipBuf);
+  } catch (e) {
+    log(getIP(req), `[キーポイント学習] モデルDL失敗: ${name} - ${e.message}`);
     if (!res.headersSent) res.status(500).json({ error: `zip生成に失敗: ${e.message}` });
   }
 });

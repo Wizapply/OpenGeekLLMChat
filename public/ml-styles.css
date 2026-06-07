@@ -295,7 +295,7 @@
   display: flex;
   flex-direction: column;
   gap: 16px;
-  padding: 4px;
+  padding: 0;
 }
 .image-detect-controls {
   display: flex;
@@ -415,6 +415,13 @@
 
 /* ─── 画像学習 (Phase 2) ─── */
 .image-train-view { display: flex; flex-direction: column; gap: 16px; padding: 4px; }
+/* タスク切替 (物体検出 / キーポイント) — サブタブより一段上の階層 */
+.image-train-tasktabs { display: flex; gap: 8px; }
+.tasktab {
+  padding: 8px 18px; background: var(--bg, #12121e); border: 1px solid var(--border, #2a2a3e);
+  border-radius: 8px; color: var(--text-secondary, #aaa); cursor: pointer; font-size: 14px; font-weight: 600;
+}
+.tasktab.active { background: var(--accent, #7c4dff); border-color: var(--accent, #7c4dff); color: #fff; }
 .image-train-subtabs { display: flex; gap: 8px; border-bottom: 1px solid var(--border, #2a2a3e); padding-bottom: 8px; }
 .subtab {
   padding: 8px 16px; background: transparent; border: none; border-radius: 6px 6px 0 0;
@@ -575,6 +582,57 @@
 .annotate-thumb-delete:hover {
   background: #ff3b30; transform: scale(1.1);
 }
+
+/* ─── 🖐️ キーポイント アノテーション ─── */
+.annotate-layout { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+.annotate-layout .annotate-canvas-wrap { flex: 1 1 460px; min-width: 0; }
+.annotate-sidebar {
+  flex: 0 0 280px; max-width: 100%; display: flex; flex-direction: column; gap: 10px;
+  background: var(--surface, #1a1a2e); border: 1px solid var(--border, #2a2a3e);
+  border-radius: 10px; padding: 12px;
+}
+.annotate-sidebar h4 { margin: 4px 0; font-size: 13px; color: var(--text-secondary, #aaa); }
+.kp-instance-list { display: flex; flex-direction: column; gap: 4px; }
+.kp-instance-item {
+  display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 6px;
+  background: var(--bg, #12121e);
+}
+.kp-instance-item.active { outline: 2px solid var(--accent, #7c4dff); }
+.kp-instance-color { width: 12px; height: 12px; border-radius: 3px; flex: 0 0 auto; }
+.kp-instance-select {
+  flex: 1; text-align: left; background: transparent; border: none; cursor: pointer;
+  color: var(--text, #eee); font-size: 12px; font-weight: 600;
+}
+.kp-list { display: flex; flex-direction: column; gap: 2px; max-height: 320px; overflow-y: auto; }
+.kp-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  padding: 3px 6px; border-radius: 5px; font-size: 12px;
+}
+.kp-row.next { background: var(--accent-dim, rgba(124,77,255,0.18)); }
+.kp-row-name {
+  display: flex; align-items: center; gap: 6px; flex: 1; text-align: left;
+  background: transparent; border: none; cursor: pointer; color: var(--text, #eee); font-size: 12px;
+}
+.kp-row-actions { display: flex; gap: 3px; }
+.kp-dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; border: 1px solid var(--border, #444); }
+.kp-dot.set { background: #34c759; border-color: #34c759; }
+.kp-dot.hidden { background: #888; border-color: #888; }
+.kp-dot.unset { background: transparent; }
+.btn.tiny { padding: 2px 6px; font-size: 11px; line-height: 1.2; }
+.btn.tiny.danger { background: rgba(255,59,48,0.15); color: #ff6b60; }
+
+/* 3Dキーポイント */
+.kp-3d-toggle { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text, #eee); cursor: pointer; }
+.kp-3d-toggle input { width: 16px; height: 16px; }
+.kp-3d-badge {
+  display: inline-block; font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 8px;
+  background: linear-gradient(135deg, #00c2ff, #7c4dff); color: #fff; vertical-align: middle;
+}
+.kp-row-main { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.kp-z-row { display: flex; align-items: center; gap: 6px; padding: 2px 0 2px 18px; }
+.kp-z-label { font-size: 11px; color: var(--text-secondary, #888); width: 12px; }
+.kp-z-slider { flex: 1; }
+.kp-z-val { font-size: 11px; color: var(--text-secondary, #aaa); width: 38px; text-align: right; font-variant-numeric: tabular-nums; }
 
 /* ─── 🎮 強化学習 (RL) ビュー ─── */
 .rl-view { display: flex; flex-direction: column; gap: 12px; }

@@ -278,12 +278,33 @@ config.json から HTTPサーバーや llama-server の細かな設定を調整�
 - **COCO事前学習モデルで即検出**: Faster R-CNN / RetinaNet / SSD など5モデルから選択。人・車・動物・家具など80クラスを検出。信頼度しきい値の調整、クラス別色分け表示
 - **カスタムモデル学習 (転移学習)**: 独自データセットを作り、Faster R-CNN をファインチューニング。少クラス・少量データ (数十枚〜) でも実用的。ベースモデルは ResNet50 / MobileNetV3 / 事前学習なし (scratch) から選択
 - **ブラウザ完結アノテーション**: 画像をアップロードし、ブラウザ上で矩形を描画してラベル付け。2つの入力方式 (ドラッグで矩形 / クリックで固定サイズ矩形を生成、サイズ4〜300px)。矢印キーで画像送り、↑キーで保存。サムネイル一覧で進捗 (矩形個数バッジ) を一覧表示しクリックでジャンプ
-- **YOLO / COCO インポート**: 既存の YOLO 形式 (正規化座標) や COCO 形式のアノテーションを取り込み可能
+- **YOLO / COCO / CSV インポート**: 既存の YOLO 形式 (正規化座標) や COCO 形式のアノテーションを取り込み可能。さらに **CSV (ロング形式)** にも対応 — `filename,class,x1,y1,x2,y2` で、先にアップロード済みの画像にファイル名で紐付けて一括ラベル付け
 - **LLM チャット連携**: 画像を添付して「何が写ってる?」と聞くと、LLM が `detect_objects` ツールを呼んで物体を検出し、結果を解釈して回答 (Vision対応モデルなら誤認識の訂正も)
 - **学習ジョブ管理**: 表データ学習とは独立した系統 (`currentImageJob`) で管理。リアルタイムログ、停止 (プロセスグループごとkill)、学習履歴
 - **モデルのダウンロード**: 学習済みモデルを zip でダウンロード (model.pt + config.json + 推論サンプル `predict_example.py` + README)。Node標準のzlibで生成するため外部コマンド不要。ダウンロードすれば torchvision さえあれば他環境でも単体推論できる
 - **外部API**: `POST /ml/image/detect` に画像を base64 で送ると検出結果を JSON で返す。COCO・カスタム両対応。`Authorization: Bearer <token>` (`ml:read` 権限)
 - **GPU自動フォールバック**: ROCm/CUDA で実行し、失敗時はCPUに自動切替。MIOpenキャッシュパスもアプリ内に設定済み
+
+---
+
+### 🖐️ 画像キーポイント検出 (2D / 3D)
+`/ml.html` の「画像学習」タブ内、上部の **タスク切替「📦 物体検出 / 🖐️ キーポイント」** で利用。手の関節などを「対象(バウンディングボックス)＋順序付きのキーポイント(点)」として関連付け、学習・推論する。物体検出と同じ操作フロー (検出 / データセット / 学習) で扱える。**追加パッケージは torchvision のみ**、MediaPipe 等の外部依存なし。
+
+- **2D キーポイント (torchvision Keypoint R-CNN)**:
+  - **COCO事前学習で即検出**: 人物の姿勢17点を検出
+  - **カスタム学習 (転移学習)**: 独自のキーポイント定義 (手21点など) を学習。COCO事前学習バックボーンを初期値に使うため少量データでも立ち上がりやすい。複数インスタンス対応
+  - ベースモデル: Keypoint R-CNN (ResNet50) / 事前学習なし (scratch)
+- **3D キーポイント (ResNet 回帰・MediaPipe不使用)**:
+  - RGB画像1枚から各キーポイントの **(x, y, z)** を回帰。z は学習時に手動で付けた **相対深度 (-1〜1)**
+  - バックボーン: ResNet18 / 34 / 50 (ImageNet事前学習)
+  - 単一インスタンス前提 (画像内に対象1つ)。z は単眼RGBからの相対値 (絶対距離ではない)
+- **アノテーションUI**: 対象を矩形で囲み、定義した順番にキーポイントをクリックして配置。可視/隠れ(occluded)/クリアの切替、骨格エッジ描画。3Dモードでは各点に **z スライダー** が出る
+- **プリセット**: ✋ 手 (21点・MediaPipe風スケルトン)、🧍 人物 (17点/COCO)、🙂 顔 (5点) をワンクリックで投入
+- **CSV インポート**: ロング形式 CSV でアノテーションを一括取り込み。2D は `filename,keypoint,x,y,v[,instance]`、3D は z 列を追加。矩形(box)列が無ければ可視点の外接矩形から自動生成
+- **FreiHAND 変換ツール**: `freihand_to_csv.py` で公開手データセット [FreiHAND](https://lmb.informatik.uni-freiburg.de/projects/freihand/) を画像フォルダ + CSV に変換 (3D→2D投影、相対深度の正規化込み)。標準ライブラリのみで動作
+- **モデルのダウンロード**: 学習済みモデルを zip でダウンロード (model.pt + config.json + 推論サンプル + README)。2D/3D それぞれに合った推論サンプルを同梱
+- **外部API**: `POST /ml/image/keypoint/detect` に画像を base64 で送ると検出結果を JSON で返す (COCO人物 / カスタム2D / カスタム3D)。`Authorization: Bearer <token>` (`ml:read` 権限)
+- **GPU自動フォールバック**: 物体検出と同様、ROCm/CUDA → CPU に自動切替
 
 ---
 
@@ -2435,6 +2456,35 @@ print(r.json())
 | POST | `/ml/jobs/:id/stop` | `ml:write` | 学習停止 |
 | GET | `/ml/jobs/:id/log` | `ml:read` | 学習ログ取得 |
 
+#### 画像物体検出
+
+| メソッド | パス | 権限 | 説明 |
+|:--|:--|:--|:--|
+| GET | `/ml/image/models` | `ml:read` | 検出モデル一覧 (COCO) |
+| POST | `/ml/image/detect` | `ml:read` | 物体検出 (base64画像) |
+| GET/POST | `/ml/image/datasets` | `ml:read`/`write` | データセット一覧/作成 |
+| POST | `/ml/image/datasets/:name/images` | `ml:write` | 画像追加 |
+| PUT | `/ml/image/datasets/:name/annotations/:imageId` | `ml:write` | 矩形アノテーション保存 |
+| POST | `/ml/image/datasets/:name/import` | `ml:write` | YOLO / COCO / **CSV** インポート |
+| POST | `/ml/image/train` | `ml:write` | カスタム学習開始 |
+| GET | `/ml/image/custom-models` | `ml:read` | 学習済みモデル一覧 |
+| GET | `/ml/image/custom-models/:name/download` | `ml:read` | モデルを zip でDL |
+
+#### 画像キーポイント (2D / 3D)
+
+| メソッド | パス | 権限 | 説明 |
+|:--|:--|:--|:--|
+| GET | `/ml/image/keypoint/models` | `ml:read` | 検出モデル一覧 (COCO人物) |
+| POST | `/ml/image/keypoint/detect` | `ml:read` | キーポイント検出 (COCO/カスタム2D/3D) |
+| GET/POST | `/ml/image/keypoint/datasets` | `ml:read`/`write` | データセット一覧/作成 (`dim`: 2d/3d) |
+| POST | `/ml/image/keypoint/datasets/:name/images` | `ml:write` | 画像追加 |
+| PUT | `/ml/image/keypoint/datasets/:name/annotations/:imageId` | `ml:write` | インスタンス(box+点+z)保存 |
+| POST | `/ml/image/keypoint/datasets/:name/import` | `ml:write` | **CSV** インポート |
+| GET | `/ml/image/keypoint/train/models` | `ml:read` | ベースモデル/バックボーン一覧 |
+| POST | `/ml/image/keypoint/train` | `ml:write` | 学習開始 (dim で2D/3D自動振り分け) |
+| GET | `/ml/image/keypoint/custom-models` | `ml:read` | 学習済みモデル一覧 |
+| GET | `/ml/image/keypoint/custom-models/:name/download` | `ml:read` | モデルを zip でDL |
+
 ### ストレージ
 
 ```
@@ -2443,14 +2493,19 @@ ml/
 ├── meta.json           # テーブル説明・取得元URL等のメタ情報
 ├── models.json         # モデル定義一覧
 ├── jobs.json           # 学習ジョブ履歴
-└── models/             # 学習成果物
-    └── <model_name>/
-        ├── config.json       # モデル設定 + 派生情報
-        ├── model.pt          # PyTorch state_dict
-        ├── scaler.pkl        # StandardScaler 情報
-        ├── label_encoders.pkl  # カテゴリ列のエンコーダ
-        ├── metrics.json      # 学習指標 + 履歴
-        └── train.log         # 学習ログ
+├── models/             # 表データ学習の成果物
+│   └── <model_name>/
+│       ├── config.json       # モデル設定 + 派生情報
+│       ├── model.pt          # PyTorch state_dict
+│       ├── scaler.pkl        # StandardScaler 情報
+│       ├── label_encoders.pkl  # カテゴリ列のエンコーダ
+│       ├── metrics.json      # 学習指標 + 履歴
+│       └── train.log         # 学習ログ
+├── image_datasets/     # 物体検出データセット (画像 + dataset.json)
+├── image_models/       # 物体検出カスタムモデル
+├── keypoint_datasets/  # キーポイントデータセット (dataset.json に dim:2d/3d)
+├── keypoint_models/    # キーポイントカスタムモデル (config.json に dim)
+└── torch_cache/        # torchvision の重みキャッシュ (ROCm MIOpen 含む)
 ```
 
 ### 留意点

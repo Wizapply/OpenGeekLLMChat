@@ -23,7 +23,7 @@ function App() {
   const [duckdbAvailable, setDuckdbAvailable] = useState(true);
   const [duckdbHint, setDuckdbHint] = useState('');
   // サイドバー統計（モデル数・画像学習・強化学習などの件数）
-  const [stats, setStats] = useState({ models: 0, imageDatasets: 0, imageModels: 0, rlModels: 0 });
+  const [stats, setStats] = useState({ models: 0, imageDatasets: 0, imageModels: 0, keypointDatasets: 0, keypointModels: 0, rlModels: 0 });
   const [activeTab, setActiveTab] = useState('tables');
   const [selectedTable, setSelectedTable] = useState(null);
   const [tableSchema, setTableSchema] = useState(null);
@@ -64,13 +64,15 @@ function App() {
         return Array.isArray(d[key]) ? d[key].length : 0;
       } catch { return 0; }
     };
-    const [models, imageDatasets, imageModels, rlModels] = await Promise.all([
+    const [models, imageDatasets, imageModels, keypointDatasets, keypointModels, rlModels] = await Promise.all([
       count('/ml/models', 'models'),
       count('/ml/image/datasets', 'datasets'),
       count('/ml/image/custom-models', 'models'),
+      count('/ml/image/keypoint/datasets', 'datasets'),
+      count('/ml/image/keypoint/custom-models', 'models'),
       count('/ml/rl/models', 'models'),
     ]);
-    setStats({ models, imageDatasets, imageModels, rlModels });
+    setStats({ models, imageDatasets, imageModels, keypointDatasets, keypointModels, rlModels });
   }
 
   async function loadTables() {
@@ -182,6 +184,14 @@ function App() {
           <div className="stats-card">
             <div className="stats-card-label">🖼️ 画像学習モデル</div>
             <div className="stats-card-value">{stats.imageModels}</div>
+          </div>
+          <div className="stats-card">
+            <div className="stats-card-label">🖐️ キーポイントデータセット</div>
+            <div className="stats-card-value">{stats.keypointDatasets}</div>
+          </div>
+          <div className="stats-card">
+            <div className="stats-card-label">🖐️ キーポイントモデル</div>
+            <div className="stats-card-value">{stats.keypointModels}</div>
           </div>
           <div className="stats-card">
             <div className="stats-card-label">🎮 強化学習エージェント</div>
@@ -408,6 +418,7 @@ function formatCell(v) {
 // ─── 画像物体検出ビュー (torchvision COCO事前学習) ───
 // ─── 画像学習ビュー (Phase 2: データセット + アノテーション + 学習) ───
 function ImageTrainView({ showToast }) {
+  const [task, setTask] = useState('detect');      // 'detect'=物体検出 | 'keypoint'=キーポイント
   const [subTab, setSubTab] = useState('detect');  // detect | datasets | annotate(ボタンからのみ) | train
   const [datasets, setDatasets] = useState([]);
   const [selectedDataset, setSelectedDataset] = useState(null);  // データセット名
@@ -438,35 +449,47 @@ function ImageTrainView({ showToast }) {
 
   return (
     <div className="image-train-view">
-      <div className="image-train-subtabs">
-        <button className={`subtab ${subTab === 'detect' ? 'active' : ''}`} onClick={() => setSubTab('detect')}>🔍 検出</button>
-        <button className={`subtab ${subTab === 'datasets' ? 'active' : ''}`} onClick={() => setSubTab('datasets')}>📊 データセット</button>
-        <button className={`subtab ${subTab === 'train' ? 'active' : ''}`} onClick={() => setSubTab('train')}>🚀 学習</button>
+      {/* タスク選択: 物体検出 (矩形) と キーポイント (関節など) を同じ「画像学習」内で切替 */}
+      <div className="image-train-tasktabs">
+        <button className={`tasktab ${task === 'detect' ? 'active' : ''}`} onClick={() => setTask('detect')}>📦 物体検出</button>
+        <button className={`tasktab ${task === 'keypoint' ? 'active' : ''}`} onClick={() => setTask('keypoint')}>🖐️ キーポイント</button>
       </div>
 
-      {subTab === 'detect' && (
-        <ImageDetectView showToast={showToast} />
-      )}
-      {subTab === 'datasets' && (
-        <DatasetManager
-          datasets={datasets}
-          onReload={loadDatasets}
-          onReloadDataset={(name) => reloadAll(name)}
-          onSelect={(name) => { loadDatasetDetail(name); setSubTab('annotate'); }}
-          showToast={showToast}
-        />
-      )}
-      {subTab === 'annotate' && selectedDataset && datasetDetail && (
-        <AnnotateView
-          datasetName={selectedDataset}
-          dataset={datasetDetail}
-          onReload={() => reloadAll(selectedDataset)}
-          onBack={() => setSubTab('datasets')}
-          showToast={showToast}
-        />
-      )}
-      {subTab === 'train' && (
-        <ImageTrainRunner datasets={datasets} onReload={loadDatasets} showToast={showToast} />
+      {task === 'keypoint' ? (
+        <KeypointView showToast={showToast} />
+      ) : (
+        <>
+          <div className="image-train-subtabs">
+            <button className={`subtab ${subTab === 'detect' ? 'active' : ''}`} onClick={() => setSubTab('detect')}>🔍 検出</button>
+            <button className={`subtab ${subTab === 'datasets' ? 'active' : ''}`} onClick={() => setSubTab('datasets')}>📊 データセット</button>
+            <button className={`subtab ${subTab === 'train' ? 'active' : ''}`} onClick={() => setSubTab('train')}>🚀 学習</button>
+          </div>
+
+          {subTab === 'detect' && (
+            <ImageDetectView showToast={showToast} />
+          )}
+          {subTab === 'datasets' && (
+            <DatasetManager
+              datasets={datasets}
+              onReload={loadDatasets}
+              onReloadDataset={(name) => reloadAll(name)}
+              onSelect={(name) => { loadDatasetDetail(name); setSubTab('annotate'); }}
+              showToast={showToast}
+            />
+          )}
+          {subTab === 'annotate' && selectedDataset && datasetDetail && (
+            <AnnotateView
+              datasetName={selectedDataset}
+              dataset={datasetDetail}
+              onReload={() => reloadAll(selectedDataset)}
+              onBack={() => setSubTab('datasets')}
+              showToast={showToast}
+            />
+          )}
+          {subTab === 'train' && (
+            <ImageTrainRunner datasets={datasets} onReload={loadDatasets} showToast={showToast} />
+          )}
+        </>
       )}
     </div>
   );
@@ -582,6 +605,28 @@ function DatasetManager({ datasets, onReload, onReloadDataset, onSelect, showToa
     }
   }
 
+  // CSV (ロング形式) から矩形アノテーションをインポート (ファイル名で既存画像に紐付け)
+  async function importCsv(name, file) {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const res = await fetch(`/ml/image/datasets/${name}/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ format: 'csv', data: text }),
+      });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
+      let msg = `CSVインポート: ${d.boxCount}矩形 / ${d.appliedImages}画像`;
+      if (d.skipped) msg += ` (スキップ${d.skipped})`;
+      showToast(msg);
+      if (d.errors && d.errors.length) showToast(`注意: ${d.errors[0]}`);
+      if (onReloadDataset) onReloadDataset(name); else onReload();
+    } catch (e) {
+      showToast(`CSVインポート失敗: ${e.message}`);
+    }
+  }
+
   return (
     <div className="dataset-manager">
       <div className="dataset-create">
@@ -610,6 +655,11 @@ function DatasetManager({ datasets, onReload, onReloadDataset, onSelect, showToa
                 画像追加
                 <input type="file" accept="image/jpeg,image/png,image/bmp,image/webp,.jpg,.jpeg,.png,.bmp,.webp" multiple style={{ display: 'none' }}
                   onChange={e => addImages(ds.name, Array.from(e.target.files))} />
+              </label>
+              <label className="btn small" title="ロング形式CSV: filename,class,x1,y1,x2,y2 (先に画像を追加しておき、ファイル名で紐付け)">
+                📄 CSV取込
+                <input type="file" accept=".csv,text/csv" style={{ display: 'none' }}
+                  onChange={e => { if (e.target.files[0]) importCsv(ds.name, e.target.files[0]); e.target.value = ''; }} />
               </label>
               <button className="btn small primary" onClick={() => onSelect(ds.name)}>✏️ アノテーション</button>
               <button className="btn small danger" onClick={() => deleteDataset(ds.name)}>削除</button>
@@ -1483,6 +1533,1106 @@ function ImageDetectView({ showToast }) {
                 ))}
               </tbody>
             </table>
+          </details>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// 🖐️ キーポイント検出ビュー (torchvision Keypoint R-CNN)
+// 対象(バウンディングボックス)+順序付きのキーポイント(関節など)を関連付けて
+// 学習・推論する。画像物体検出と同じ構成 (検出 / データセット / 学習)。
+// ════════════════════════════════════════════════════════════════════════
+
+// よく使うキーポイント構成のプリセット (データセット作成時の入力補助)
+const KEYPOINT_PRESETS = {
+  hand: {
+    label: '✋ 手 (21点)',
+    keypoints: [
+      'wrist',
+      'thumb_cmc', 'thumb_mcp', 'thumb_ip', 'thumb_tip',
+      'index_mcp', 'index_pip', 'index_dip', 'index_tip',
+      'middle_mcp', 'middle_pip', 'middle_dip', 'middle_tip',
+      'ring_mcp', 'ring_pip', 'ring_dip', 'ring_tip',
+      'pinky_mcp', 'pinky_pip', 'pinky_dip', 'pinky_tip',
+    ],
+    skeleton: [
+      [0, 1], [1, 2], [2, 3], [3, 4],
+      [0, 5], [5, 6], [6, 7], [7, 8],
+      [5, 9], [9, 10], [10, 11], [11, 12],
+      [9, 13], [13, 14], [14, 15], [15, 16],
+      [13, 17], [17, 18], [18, 19], [19, 20], [0, 17],
+    ],
+  },
+  person: {
+    label: '🧍 人物 (17点 / COCO)',
+    keypoints: [
+      'nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
+      'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
+      'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
+      'left_knee', 'right_knee', 'left_ankle', 'right_ankle',
+    ],
+    skeleton: [
+      [0, 1], [0, 2], [1, 3], [2, 4], [5, 6], [5, 7], [7, 9], [6, 8], [8, 10],
+      [5, 11], [6, 12], [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
+    ],
+  },
+  face5: {
+    label: '🙂 顔 (5点)',
+    keypoints: ['left_eye', 'right_eye', 'nose', 'left_mouth', 'right_mouth'],
+    skeleton: [[0, 2], [1, 2], [2, 3], [2, 4], [3, 4]],
+  },
+};
+
+const KP_COLORS = ['#ff3b30', '#34c759', '#007aff', '#ff9500', '#af52de', '#ff2d55', '#5ac8fa', '#ffcc00'];
+
+function KeypointView({ showToast }) {
+  const [subTab, setSubTab] = useState('detect');  // detect | datasets | annotate | train
+  const [datasets, setDatasets] = useState([]);
+  const [selectedDataset, setSelectedDataset] = useState(null);
+  const [datasetDetail, setDatasetDetail] = useState(null);
+
+  function loadDatasets() {
+    fetch('/ml/image/keypoint/datasets')
+      .then(r => r.ok ? r.json() : { datasets: [] })
+      .then(d => setDatasets(d.datasets || []))
+      .catch(() => {});
+  }
+  useEffect(() => { loadDatasets(); }, []);
+
+  function loadDatasetDetail(name) {
+    return fetch(`/ml/image/keypoint/datasets/${name}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d) { setDatasetDetail(d.dataset); setSelectedDataset(name); } })
+      .catch(() => {});
+  }
+
+  function reloadAll(name) {
+    loadDatasets();
+    const target = name || selectedDataset;
+    if (target) loadDatasetDetail(target);
+  }
+
+  return (
+    <>
+      <div className="image-train-subtabs">
+        <button className={`subtab ${subTab === 'detect' ? 'active' : ''}`} onClick={() => setSubTab('detect')}>🔍 検出</button>
+        <button className={`subtab ${subTab === 'datasets' ? 'active' : ''}`} onClick={() => setSubTab('datasets')}>📊 データセット</button>
+        <button className={`subtab ${subTab === 'train' ? 'active' : ''}`} onClick={() => setSubTab('train')}>🚀 学習</button>
+      </div>
+
+      {subTab === 'detect' && (
+        <KeypointDetectView showToast={showToast} />
+      )}
+      {subTab === 'datasets' && (
+        <KeypointDatasetManager
+          datasets={datasets}
+          onReload={loadDatasets}
+          onReloadDataset={(name) => reloadAll(name)}
+          onSelect={(name) => { loadDatasetDetail(name); setSubTab('annotate'); }}
+          showToast={showToast}
+        />
+      )}
+      {subTab === 'annotate' && selectedDataset && datasetDetail && (
+        <KeypointAnnotateView
+          datasetName={selectedDataset}
+          dataset={datasetDetail}
+          onReload={() => reloadAll(selectedDataset)}
+          onBack={() => setSubTab('datasets')}
+          showToast={showToast}
+        />
+      )}
+      {subTab === 'train' && (
+        <KeypointTrainRunner datasets={datasets} onReload={loadDatasets} showToast={showToast} />
+      )}
+    </>
+  );
+}
+
+// データセット管理 (一覧・作成・削除・画像追加)
+function KeypointDatasetManager({ datasets, onReload, onReloadDataset, onSelect, showToast }) {
+  const [newName, setNewName] = useState('');
+  const [newKeypoints, setNewKeypoints] = useState('');
+  const [newSkeleton, setNewSkeleton] = useState('');
+  const [is3d, setIs3d] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState('');
+
+  function applyPreset(key) {
+    const p = KEYPOINT_PRESETS[key];
+    if (!p) return;
+    setNewKeypoints(p.keypoints.join(', '));
+    setNewSkeleton(p.skeleton.map(e => `${e[0]}-${e[1]}`).join(', '));
+  }
+
+  function parseSkeleton(text, kpCount) {
+    const out = [];
+    for (const part of text.split(',').map(s => s.trim()).filter(Boolean)) {
+      const m = part.split('-').map(s => parseInt(s.trim(), 10));
+      if (m.length !== 2 || m.some(n => !Number.isInteger(n))) continue;
+      if (m[0] < 0 || m[0] >= kpCount || m[1] < 0 || m[1] >= kpCount) continue;
+      out.push([m[0], m[1]]);
+    }
+    return out;
+  }
+
+  async function createDataset() {
+    const keypoints = newKeypoints.split(',').map(c => c.trim()).filter(Boolean);
+    if (!newName.trim()) { setError('データセット名を入力してください'); return; }
+    if (keypoints.length === 0) { setError('キーポイント名を最低1つ (カンマ区切り)'); return; }
+    const skeleton = parseSkeleton(newSkeleton, keypoints.length);
+    setCreating(true);
+    setError('');
+    try {
+      const res = await fetch('/ml/image/keypoint/datasets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newName.trim(), keypoints, skeleton, dim: is3d ? '3d' : '2d' }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      showToast(`データセット「${newName}」を作成しました`);
+      setNewName(''); setNewKeypoints(''); setNewSkeleton(''); setIs3d(false);
+      onReload();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function deleteDataset(name) {
+    if (!confirm(`データセット「${name}」を削除しますか? (画像・アノテーションも全て削除されます)`)) return;
+    try {
+      const res = await fetch(`/ml/image/keypoint/datasets/${name}`, { method: 'DELETE' });
+      if (!res.ok) { const d = await res.json(); throw new Error(d.error); }
+      showToast('削除しました');
+      onReload();
+    } catch (e) {
+      showToast(`削除失敗: ${e.message}`);
+    }
+  }
+
+  const SUPPORTED_EXTS_RE = /\.(jpg|jpeg|png|bmp|webp)$/i;
+  const UNSUPPORTED_EXTS_RE = /\.(tif|tiff|heic|heif|raw|cr2|nef|arw|dng|gif)$/i;
+  async function addImages(name, files) {
+    if (!files || files.length === 0) return;
+    const images = [];
+    const skipped = [];
+    for (const file of files) {
+      const fname = file.name || '';
+      if (UNSUPPORTED_EXTS_RE.test(fname)) { skipped.push(`${fname}: 非対応形式`); continue; }
+      if (!SUPPORTED_EXTS_RE.test(fname) && !/image\/(jpeg|png|bmp|webp)/.test(file.type || '')) {
+        skipped.push(`${fname}: 画像ファイルではありません`); continue;
+      }
+      const data = await new Promise(resolve => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.readAsDataURL(file);
+      });
+      images.push({ name: file.name, data });
+    }
+    if (skipped.length > 0) showToast(`${skipped.length}件スキップ: ${skipped[0]}`);
+    if (images.length === 0) {
+      if (skipped.length === 0) showToast('画像ファイルがありません');
+      return;
+    }
+    try {
+      const res = await fetch(`/ml/image/keypoint/datasets/${name}/images`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ images }),
+      });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error);
+      const addedCount = (d.added || []).length;
+      const errCount = (d.errors || []).length;
+      if (addedCount > 0) showToast(`${addedCount}枚の画像を追加しました${errCount ? ` (${errCount}件失敗)` : ''}`);
+      else showToast(`画像追加に失敗しました${errCount ? `: ${d.errors[0].error}` : ''}`);
+      if (onReloadDataset) onReloadDataset(name); else onReload();
+    } catch (e) {
+      showToast(`画像追加失敗: ${e.message}`);
+    }
+  }
+
+  // CSV (ロング形式) からキーポイントのアノテーションをインポート
+  async function importCsv(name, file) {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const res = await fetch(`/ml/image/keypoint/datasets/${name}/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ format: 'csv', data: text }),
+      });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
+      let msg = `CSVインポート: ${d.pointCount}点 / ${d.instanceCount}対象 / ${d.appliedImages}画像`;
+      if (d.skipped) msg += ` (スキップ${d.skipped})`;
+      showToast(msg);
+      if (d.errors && d.errors.length) showToast(`注意: ${d.errors[0]}`);
+      if (onReloadDataset) onReloadDataset(name); else onReload();
+    } catch (e) {
+      showToast(`CSVインポート失敗: ${e.message}`);
+    }
+  }
+
+  return (
+    <div className="dataset-manager">
+      <div className="dataset-create">
+        <h3>新規キーポイントデータセット作成</h3>
+        <div className="dataset-create-row" style={{ marginBottom: 8 }}>
+          <span className="image-detect-label">プリセット:</span>
+          {Object.entries(KEYPOINT_PRESETS).map(([k, p]) => (
+            <button key={k} type="button" className="btn small" onClick={() => applyPreset(k)}>{p.label}</button>
+          ))}
+        </div>
+        <div className="dataset-create-row">
+          <input className="ml-input" placeholder="データセット名 (英数字)" value={newName} onChange={e => setNewName(e.target.value)} />
+        </div>
+        <div className="dataset-create-row">
+          <input className="ml-input" placeholder="キーポイント名 (カンマ区切り、順番が重要: wrist, thumb_tip, ...)" value={newKeypoints} onChange={e => setNewKeypoints(e.target.value)} style={{ flex: 3 }} />
+        </div>
+        <div className="dataset-create-row">
+          <input className="ml-input" placeholder="骨格エッジ (任意、0始まり番号: 0-1, 1-2, ...)" value={newSkeleton} onChange={e => setNewSkeleton(e.target.value)} style={{ flex: 3 }} />
+          <button className="btn primary" onClick={createDataset} disabled={creating}>作成</button>
+        </div>
+        <div className="dataset-create-row">
+          <label className="kp-3d-toggle">
+            <input type="checkbox" checked={is3d} onChange={e => setIs3d(e.target.checked)} />
+            <span><strong>3D (奥行き z を学習)</strong> — RGB1枚から x,y,z を回帰 (ResNet・単一インスタンス)</span>
+          </label>
+        </div>
+        <div className="image-detect-hint">
+          キーポイントは「順番」が学習に使われます。全ての画像で同じ順番(番号)で打ってください。
+          骨格エッジは表示用で、キーポイント番号のペアをつなぎます (任意)。
+          {is3d && <><br />🧊 <strong>3Dモード</strong>: アノテーション時に各点の z(相対深度 -1〜1) をスライダーで設定します。z は単眼RGBからの相対値です。</>}
+        </div>
+        {error && <div className="warn-banner">{error}</div>}
+      </div>
+
+      <div className="dataset-list">
+        <h3>データセット一覧 ({datasets.length})</h3>
+        {datasets.length === 0 && <div className="empty-state">データセットがありません。上で作成してください。</div>}
+        {datasets.map(ds => (
+          <div key={ds.name} className="dataset-card">
+            <div className="dataset-card-info">
+              <div className="dataset-card-name">{ds.name} {ds.dim === '3d' && <span className="kp-3d-badge">3D</span>}</div>
+              <div className="dataset-card-meta">
+                キーポイント {ds.keypoints.length}点 · 画像 {ds.imageCount}枚 · アノテーション済 {ds.annotatedCount}枚
+              </div>
+              <div className="dataset-card-meta" style={{ opacity: 0.7 }}>{ds.keypoints.join(', ')}</div>
+            </div>
+            <div className="dataset-card-actions">
+              <label className="btn small">
+                画像追加
+                <input type="file" accept="image/jpeg,image/png,image/bmp,image/webp,.jpg,.jpeg,.png,.bmp,.webp" multiple style={{ display: 'none' }}
+                  onChange={e => addImages(ds.name, Array.from(e.target.files))} />
+              </label>
+              <label className="btn small" title={ds.dim === '3d'
+                ? 'ロング形式CSV: filename,keypoint,x,y,z,v[,instance] (先に画像を追加。ファイル名で紐付け)'
+                : 'ロング形式CSV: filename,keypoint,x,y,v[,instance] (先に画像を追加。ファイル名で紐付け)'}>
+                📄 CSV取込
+                <input type="file" accept=".csv,text/csv" style={{ display: 'none' }}
+                  onChange={e => { if (e.target.files[0]) importCsv(ds.name, e.target.files[0]); e.target.value = ''; }} />
+              </label>
+              <button className="btn small primary" onClick={() => onSelect(ds.name)}>✏️ アノテーション</button>
+              <button className="btn small danger" onClick={() => deleteDataset(ds.name)}>削除</button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// アノテーションビュー (対象boxドラッグ + キーポイント点打ち)
+function KeypointAnnotateView({ datasetName, dataset, onReload, onBack, showToast }) {
+  const keypointNames = dataset.keypoints || [];
+  const skeleton = dataset.skeleton || [];
+  const K = keypointNames.length;
+  const is3d = dataset.dim === '3d';
+
+  const [currentIdx, setCurrentIdx] = useState(0);
+  const [instances, setInstances] = useState([]);   // [{box:{x1,y1,x2,y2}, keypoints:[{x,y,v}]}]
+  const [activeInst, setActiveInst] = useState(-1);  // 編集中インスタンス
+  const [activeKp, setActiveKp] = useState(0);       // 次に打つキーポイント番号
+  const [mode, setMode] = useState('box');           // 'box' | 'point'
+  const [drawing, setDrawing] = useState(null);
+  const [imgSize, setImgSize] = useState({ w: 0, h: 0 });
+  const [saving, setSaving] = useState(false);
+  const canvasRef = useRef(null);
+  const imgRef = useRef(null);
+
+  const images = dataset.images || [];
+  const currentImage = images[currentIdx];
+  const currentImageId = currentImage ? currentImage.id : null;
+
+  // K個のキーポイント配列を生成 (足りない分は v=0 で埋める)。3Dなら z も保持。
+  function normalizeKps(kps) {
+    const out = [];
+    for (let i = 0; i < K; i++) {
+      const kp = (kps && kps[i]) || null;
+      if (kp && Number(kp.v) > 0) {
+        const o = { x: Number(kp.x) || 0, y: Number(kp.y) || 0, v: Number(kp.v) };
+        if (is3d) o.z = Number.isFinite(Number(kp.z)) ? Number(kp.z) : 0;
+        out.push(o);
+      } else {
+        out.push(is3d ? { x: 0, y: 0, z: 0, v: 0 } : { x: 0, y: 0, v: 0 });
+      }
+    }
+    return out;
+  }
+
+  function loadInstancesFrom(im) {
+    if (!im || !Array.isArray(im.instances)) return [];
+    return im.instances.map(inst => ({
+      box: { ...(inst.box || { x1: 0, y1: 0, x2: 0, y2: 0 }) },
+      keypoints: normalizeKps(inst.keypoints),
+    }));
+  }
+
+  useEffect(() => {
+    setInstances(loadInstancesFrom(currentImage));
+    setActiveInst(-1);
+    setActiveKp(0);
+    setMode('box');
+    setDrawing(null);
+  }, [currentIdx, currentImageId]);
+
+  // canvas 描画
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const img = imgRef.current;
+    if (!canvas || !img) return;
+    const draw = () => {
+      const naturalW = img.naturalWidth, naturalH = img.naturalHeight;
+      if (!naturalW) return;
+      const dispW = Math.min(naturalW, 800);
+      const scale = dispW / naturalW;
+      canvas.width = naturalW;
+      canvas.height = naturalH;
+      canvas.style.width = dispW + 'px';
+      canvas.style.height = (naturalH * scale) + 'px';
+      setImgSize({ w: naturalW, h: naturalH });
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0);
+
+      const r = Math.max(4, naturalW / 150);  // キーポイント半径
+      const lw = Math.max(2, naturalW / 350);
+
+      instances.forEach((inst, ii) => {
+        const color = KP_COLORS[ii % KP_COLORS.length];
+        const isActive = ii === activeInst;
+        // バウンディングボックス
+        ctx.strokeStyle = color;
+        ctx.lineWidth = isActive ? lw * 1.8 : lw;
+        const b = inst.box;
+        ctx.strokeRect(b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1);
+        // 骨格エッジ
+        ctx.strokeStyle = color;
+        ctx.lineWidth = lw;
+        skeleton.forEach(([a, c]) => {
+          const ka = inst.keypoints[a], kc = inst.keypoints[c];
+          if (ka && kc && ka.v > 0 && kc.v > 0) {
+            ctx.beginPath();
+            ctx.moveTo(ka.x, ka.y);
+            ctx.lineTo(kc.x, kc.y);
+            ctx.stroke();
+          }
+        });
+        // キーポイント
+        inst.keypoints.forEach((kp, ki) => {
+          if (kp.v <= 0) return;
+          ctx.beginPath();
+          ctx.arc(kp.x, kp.y, r, 0, Math.PI * 2);
+          ctx.fillStyle = kp.v === 1 ? '#888' : color;  // v=1(隠れ)はグレー
+          ctx.fill();
+          ctx.lineWidth = Math.max(1, lw / 2);
+          ctx.strokeStyle = '#fff';
+          ctx.stroke();
+          // アクティブインスタンスでは番号を表示
+          if (isActive) {
+            const fs2 = Math.max(10, naturalW / 70);
+            ctx.font = `bold ${fs2}px sans-serif`;
+            ctx.fillStyle = '#fff';
+            ctx.fillText(String(ki), kp.x - fs2 / 3, kp.y - r - 2);
+          }
+        });
+      });
+
+      if (drawing) {
+        ctx.strokeStyle = '#00c2ff';
+        ctx.lineWidth = lw;
+        ctx.setLineDash([6, 4]);
+        ctx.strokeRect(drawing.x1, drawing.y1, drawing.x2 - drawing.x1, drawing.y2 - drawing.y1);
+        ctx.setLineDash([]);
+      }
+    };
+    if (img.complete) draw();
+    else img.onload = draw;
+  }, [instances, drawing, activeInst, currentIdx, skeleton]);
+
+  function toCanvasCoord(e) {
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    return {
+      x: (e.clientX - rect.left) * scaleX,
+      y: (e.clientY - rect.top) * scaleY,
+    };
+  }
+
+  function placeKeypoint(x, y) {
+    if (activeInst < 0 || activeInst >= instances.length) {
+      showToast('先に対象を四角で囲んでください'); return;
+    }
+    if (activeKp < 0 || activeKp >= K) return;
+    setInstances(prev => prev.map((inst, ii) => {
+      if (ii !== activeInst) return inst;
+      const kps = inst.keypoints.map((kp, ki) => {
+        if (ki !== activeKp) return kp;
+        // 3D は z を保持 (既存があれば引き継ぎ、無ければ0)
+        return is3d ? { x, y, v: 2, z: Number.isFinite(Number(kp.z)) ? Number(kp.z) : 0 } : { x, y, v: 2 };
+      });
+      return { ...inst, keypoints: kps };
+    }));
+    // 次の未設定キーポイントへ自動で進む
+    setActiveKp(prev => {
+      let next = prev + 1;
+      while (next < K && instances[activeInst] && instances[activeInst].keypoints[next] && instances[activeInst].keypoints[next].v > 0) next++;
+      return Math.min(next, K);
+    });
+  }
+
+  function onMouseDown(e) {
+    const { x, y } = toCanvasCoord(e);
+    if (mode === 'point') { placeKeypoint(x, y); return; }
+    setDrawing({ x1: x, y1: y, x2: x, y2: y });
+  }
+  function onMouseMove(e) {
+    if (mode === 'point' || !drawing) return;
+    const { x, y } = toCanvasCoord(e);
+    setDrawing(prev => ({ ...prev, x2: x, y2: y }));
+  }
+  function onMouseUp() {
+    if (mode === 'point' || !drawing) return;
+    const b = drawing;
+    if (Math.abs(b.x2 - b.x1) > 5 && Math.abs(b.y2 - b.y1) > 5) {
+      const newInst = {
+        box: {
+          x1: Math.min(b.x1, b.x2), y1: Math.min(b.y1, b.y2),
+          x2: Math.max(b.x1, b.x2), y2: Math.max(b.y1, b.y2),
+        },
+        keypoints: normalizeKps([]),
+      };
+      setInstances(prev => {
+        const next = [...prev, newInst];
+        setActiveInst(next.length - 1);
+        return next;
+      });
+      setActiveKp(0);
+      setMode('point');  // box を引いたら自動で点打ちモードへ
+      showToast('対象を追加しました。キーポイントを順番にクリックしてください');
+    }
+    setDrawing(null);
+  }
+
+  function removeInstance(i) {
+    setInstances(prev => prev.filter((_, j) => j !== i));
+    if (activeInst === i) { setActiveInst(-1); setMode('box'); }
+    else if (activeInst > i) setActiveInst(activeInst - 1);
+  }
+
+  // アクティブインスタンスの特定キーポイントの可視性を切り替え/クリア
+  function setKpVisibility(ki, v) {
+    if (activeInst < 0) return;
+    setInstances(prev => prev.map((inst, ii) => {
+      if (ii !== activeInst) return inst;
+      const kps = inst.keypoints.map((kp, idx) => {
+        if (idx !== ki) return kp;
+        if (v === 0) return is3d ? { x: 0, y: 0, z: 0, v: 0 } : { x: 0, y: 0, v: 0 };
+        return { ...kp, v };
+      });
+      return { ...inst, keypoints: kps };
+    }));
+  }
+
+  // 3D: アクティブインスタンスの特定キーポイントの z(相対深度) を設定
+  function setKpZ(ki, z) {
+    if (activeInst < 0) return;
+    setInstances(prev => prev.map((inst, ii) => {
+      if (ii !== activeInst) return inst;
+      const kps = inst.keypoints.map((kp, idx) => idx === ki ? { ...kp, z } : kp);
+      return { ...inst, keypoints: kps };
+    }));
+  }
+
+  async function saveInstances() {
+    if (!currentImage) return;
+    setSaving(true);
+    try {
+      const res = await fetch(`/ml/image/keypoint/datasets/${datasetName}/annotations/${currentImage.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ instances }),
+      });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error);
+      showToast(`保存しました (${d.instanceCount}個の対象)`);
+      onReload();
+    } catch (e) {
+      showToast(`保存失敗: ${e.message}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function gotoImage(idx) {
+    if (idx < 0 || idx >= images.length) return;
+    setInstances(loadInstancesFrom(images[idx]));
+    setActiveInst(-1);
+    setActiveKp(0);
+    setMode('box');
+    setCurrentIdx(idx);
+    setDrawing(null);
+  }
+
+  async function deleteImage(im, idx) {
+    if (!confirm(`画像「${im.originalName || im.file}」を削除しますか? (アノテーションも削除されます)`)) return;
+    try {
+      const res = await fetch(`/ml/image/keypoint/datasets/${datasetName}/images/${im.id}`, { method: 'DELETE' });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error);
+      showToast('画像を削除しました');
+      if (idx === currentIdx) {
+        const newLen = images.length - 1;
+        setCurrentIdx(idx >= newLen ? Math.max(0, newLen - 1) : idx);
+        setInstances([]);
+      } else if (idx < currentIdx) {
+        setCurrentIdx(currentIdx - 1);
+      }
+      onReload();
+    } catch (e) {
+      showToast(`削除失敗: ${e.message}`);
+    }
+  }
+
+  if (images.length === 0) {
+    return (
+      <div className="annotate-view">
+        <button className="btn small" onClick={onBack}>← データセット一覧へ</button>
+        <div className="empty-state">画像がありません。「📊 データセット」タブから画像を追加してください。</div>
+      </div>
+    );
+  }
+
+  const activeKps = activeInst >= 0 && instances[activeInst] ? instances[activeInst].keypoints : null;
+  const placedCount = activeKps ? activeKps.filter(k => k.v > 0).length : 0;
+
+  return (
+    <div className="annotate-view">
+      <div className="annotate-toolbar">
+        <button className="btn small" onClick={onBack}>← 一覧へ</button>
+        <span className="annotate-counter">{currentIdx + 1} / {images.length}</span>
+        <button className="btn small" onClick={() => gotoImage(currentIdx - 1)} disabled={currentIdx === 0}>← 前</button>
+        <button className="btn small" onClick={() => gotoImage(currentIdx + 1)} disabled={currentIdx >= images.length - 1}>次 →</button>
+        <span style={{ flex: 1 }} />
+        <button className={`btn small ${mode === 'box' ? 'primary' : ''}`} onClick={() => { setMode('box'); }}>⬚ 対象を囲む</button>
+        <button className={`btn small ${mode === 'point' ? 'primary' : ''}`} onClick={() => { if (activeInst < 0 && instances.length > 0) setActiveInst(instances.length - 1); setMode('point'); }}>📍 点を打つ</button>
+        <button className="btn small primary" onClick={saveInstances} disabled={saving}>{saving ? '保存中…' : '💾 保存'}</button>
+      </div>
+
+      <div className="annotate-layout">
+        <div className="annotate-canvas-wrap">
+          <img ref={imgRef} src={`/ml/image/keypoint/datasets/${datasetName}/images/${currentImage.file}`} style={{ display: 'none' }} alt="source" crossOrigin="anonymous" />
+          <canvas
+            ref={canvasRef}
+            className="annotate-canvas"
+            style={{ cursor: mode === 'point' ? 'crosshair' : 'default' }}
+            onMouseDown={onMouseDown}
+            onMouseMove={onMouseMove}
+            onMouseUp={onMouseUp}
+            onMouseLeave={onMouseUp}
+          />
+        </div>
+
+        <div className="annotate-sidebar">
+          <div className="annotate-hint">
+            {mode === 'box'
+              ? '① 「⬚ 対象を囲む」で手などをドラッグして囲みます。'
+              : '② キーポイントを下のリストの順番にクリックして打ちます。'}
+          </div>
+
+          <h4>対象 (インスタンス) {instances.length}個</h4>
+          <div className="kp-instance-list">
+            {instances.length === 0 && <div className="empty-state" style={{ padding: 8 }}>まだありません</div>}
+            {instances.map((inst, ii) => {
+              const n = inst.keypoints.filter(k => k.v > 0).length;
+              return (
+                <div key={ii} className={`kp-instance-item ${ii === activeInst ? 'active' : ''}`}>
+                  <span className="kp-instance-color" style={{ background: KP_COLORS[ii % KP_COLORS.length] }} />
+                  <button className="kp-instance-select" onClick={() => { setActiveInst(ii); setMode('point'); }}>
+                    対象#{ii + 1} ({n}/{K}点)
+                  </button>
+                  <button className="btn small danger" onClick={() => removeInstance(ii)}>×</button>
+                </div>
+              );
+            })}
+          </div>
+
+          {activeKps && (
+            <div className="kp-list">
+              <h4>キーポイント ({placedCount}/{K})</h4>
+              <div className="image-detect-hint" style={{ marginBottom: 6 }}>
+                次に打つ点: <strong>{activeKp < K ? `${activeKp}: ${keypointNames[activeKp]}` : '完了'}</strong>
+              </div>
+              {keypointNames.map((kpName, ki) => {
+                const kp = activeKps[ki];
+                return (
+                  <div key={ki} className={`kp-row ${ki === activeKp ? 'next' : ''}`}>
+                    <div className="kp-row-main">
+                      <button className="kp-row-name" onClick={() => setActiveKp(ki)} title="この点を次に打つ">
+                        <span className={`kp-dot ${kp.v > 0 ? (kp.v === 1 ? 'hidden' : 'set') : 'unset'}`} />
+                        {ki}: {kpName}
+                      </button>
+                      <span className="kp-row-actions">
+                        {kp.v === 2 && <button className="btn tiny" title="隠れている(occluded)" onClick={() => setKpVisibility(ki, 1)}>👁</button>}
+                        {kp.v === 1 && <button className="btn tiny" title="可視に戻す" onClick={() => setKpVisibility(ki, 2)}>🚫</button>}
+                        {kp.v > 0 && <button className="btn tiny danger" title="クリア" onClick={() => setKpVisibility(ki, 0)}>×</button>}
+                      </span>
+                    </div>
+                    {is3d && kp.v > 0 && (
+                      <div className="kp-z-row" title="奥行き z (相対深度): 手前 -1 〜 奥 +1">
+                        <span className="kp-z-label">z</span>
+                        <input type="range" min="-1" max="1" step="0.05"
+                          value={Number.isFinite(Number(kp.z)) ? kp.z : 0}
+                          onChange={e => setKpZ(ki, parseFloat(e.target.value))}
+                          className="kp-z-slider" />
+                        <span className="kp-z-val">{(Number.isFinite(Number(kp.z)) ? kp.z : 0).toFixed(2)}</span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="annotate-gallery">
+        <div className="annotate-gallery-header">画像一覧 ({images.length}) — クリックで切り替え</div>
+        <div className="annotate-gallery-grid">
+          {images.map((im, idx) => (
+            <div key={im.id} className={`annotate-thumb ${idx === currentIdx ? 'active' : ''}`}>
+              <img src={`/ml/image/keypoint/datasets/${datasetName}/images/${im.file}`} onClick={() => gotoImage(idx)} alt={im.originalName} />
+              {(im.instances || []).length > 0 && <span className="annotate-thumb-badge has-box">{(im.instances || []).length}</span>}
+              <button className="annotate-thumb-delete" onClick={() => deleteImage(im, idx)}>×</button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 学習ランナー
+function KeypointTrainRunner({ datasets, onReload, showToast }) {
+  const [baseModels, setBaseModels] = useState([]);
+  const [backbones3d, setBackbones3d] = useState([]);
+  const [datasetName, setDatasetName] = useState('');
+  const [modelName, setModelName] = useState('');
+  const [baseModel, setBaseModel] = useState('keypointrcnn_resnet50_fpn');
+  const [epochs, setEpochs] = useState(10);
+  const [batchSize, setBatchSize] = useState(2);
+  const [running, setRunning] = useState(false);
+  const [trainLog, setTrainLog] = useState('');
+  const [recentJobs, setRecentJobs] = useState([]);
+  const [customModels, setCustomModels] = useState([]);
+  const [downloading, setDownloading] = useState(null);
+  const pollRef = useRef(null);
+
+  useEffect(() => {
+    fetch('/ml/image/keypoint/train/models').then(r => r.json()).then(d => {
+      setBaseModels(d.baseModels || []);
+      setBackbones3d(d.backbones3d || []);
+    }).catch(() => {});
+    loadStatus();
+    loadCustomModels();
+    if (onReload) onReload();
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+  }, []);
+
+  function loadCustomModels() {
+    fetch('/ml/image/keypoint/custom-models').then(r => r.json()).then(d => setCustomModels(d.models || [])).catch(() => {});
+  }
+  function loadStatus() {
+    fetch('/ml/image/keypoint/train/status').then(r => r.json()).then(d => {
+      if (d.running) { setRunning(true); setTrainLog(d.log || ''); startPolling(); }
+      else { setRunning(false); setRecentJobs(d.recentJobs || []); }
+    }).catch(() => {});
+  }
+  function startPolling() {
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = setInterval(async () => {
+      const d = await fetch('/ml/image/keypoint/train/status').then(r => r.json()).catch(() => null);
+      if (!d) return;
+      if (d.running) { setTrainLog(d.log || ''); }
+      else {
+        clearInterval(pollRef.current); pollRef.current = null;
+        setRunning(false); setRecentJobs(d.recentJobs || []);
+        loadCustomModels(); onReload(); showToast('学習が完了しました');
+      }
+    }, 2000);
+  }
+  async function startTrain() {
+    if (!datasetName) { showToast('データセットを選択してください'); return; }
+    if (!modelName.trim()) { showToast('モデル名を入力してください'); return; }
+    try {
+      const res = await fetch('/ml/image/keypoint/train', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ datasetName, modelName: modelName.trim(), baseModel, epochs, batchSize }),
+      });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error);
+      setRunning(true); setTrainLog('学習を開始しました...\n'); startPolling();
+    } catch (e) {
+      showToast(`学習開始失敗: ${e.message}`);
+    }
+  }
+  async function cancelTrain() {
+    if (!confirm('学習を中止しますか?')) return;
+    await fetch('/ml/image/keypoint/train/cancel', { method: 'POST' }).catch(() => {});
+  }
+  async function deleteModel(name) {
+    if (!confirm(`モデル「${name}」を削除しますか?`)) return;
+    await fetch(`/ml/image/keypoint/custom-models/${name}`, { method: 'DELETE' }).catch(() => {});
+    loadCustomModels(); showToast('削除しました');
+  }
+  async function downloadModel(name) {
+    setDownloading(name);
+    showToast('ダウンロードを準備中... (モデルサイズによっては数十秒かかります)');
+    try {
+      const res = await fetch(`/ml/image/keypoint/custom-models/${name}/download`);
+      if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.error || `HTTP ${res.status}`); }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = `${name}.zip`;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showToast(`ダウンロードしました (${(blob.size / 1024 / 1024).toFixed(1)} MB)`);
+    } catch (e) {
+      showToast(`ダウンロード失敗: ${e.message}`);
+    } finally {
+      setDownloading(null);
+    }
+  }
+
+  const annotatedReady = datasets.filter(d => d.annotatedCount > 0);
+  // 選択中データセットが3Dか (バックボーン選択に切替)
+  const selectedDataset = datasets.find(d => d.name === datasetName);
+  const selected3d = selectedDataset && selectedDataset.dim === '3d';
+
+  // データセット選択に応じて baseModel を妥当な既定値へ
+  useEffect(() => {
+    if (!selectedDataset) return;
+    if (selected3d) {
+      if (!backbones3d.some(b => b.name === baseModel)) setBaseModel('resnet18');
+    } else {
+      if (!baseModels.some(m => m.name === baseModel)) setBaseModel('keypointrcnn_resnet50_fpn');
+    }
+  }, [datasetName, selected3d, baseModels, backbones3d]);
+
+  return (
+    <div className="image-train-runner">
+      {!running && (
+        <div className="train-config">
+          <h3>カスタムキーポイントモデルを学習</h3>
+          <div className="train-row">
+            <label className="image-detect-label">データセット:</label>
+            <select className="image-detect-select" value={datasetName} onChange={e => setDatasetName(e.target.value)}>
+              <option value="">選択してください</option>
+              {annotatedReady.map(d => (
+                <option key={d.name} value={d.name}>{d.name}{d.dim === '3d' ? ' [3D]' : ''} (アノテーション済 {d.annotatedCount}枚, {d.keypoints.length}点)</option>
+              ))}
+            </select>
+          </div>
+          {annotatedReady.length === 0 && (
+            <div className="warn-banner">アノテーション済みのデータセットがありません。先にデータセットを作成し、対象を囲んでキーポイントを打ってください。</div>
+          )}
+          <div className="train-row">
+            <label className="image-detect-label">モデル名:</label>
+            <input className="ml-input" placeholder={selected3d ? 'my_hand_3d (英数字)' : 'my_hand_pose (英数字)'} value={modelName} onChange={e => setModelName(e.target.value)} />
+          </div>
+          <div className="train-row">
+            <label className="image-detect-label">{selected3d ? 'バックボーン:' : 'ベースモデル:'}</label>
+            {selected3d ? (
+              <select className="image-detect-select" value={baseModel} onChange={e => setBaseModel(e.target.value)}>
+                {backbones3d.map(m => <option key={m.name} value={m.name}>{m.label} ({m.note})</option>)}
+              </select>
+            ) : (
+              <select className="image-detect-select" value={baseModel} onChange={e => setBaseModel(e.target.value)}>
+                {baseModels.map(m => <option key={m.name} value={m.name}>{m.label} ({m.note})</option>)}
+              </select>
+            )}
+          </div>
+          {selected3d && (
+            <div className="image-detect-hint" style={{ marginTop: -4 }}>
+              🧊 <strong>3Dモード</strong>: RGB1枚から各点の x,y,z(相対深度) を回帰します (ResNet・単一インスタンス前提)。
+              z は手動で付けた相対値を学習します。3Dはエポック多め(30〜)が目安です。
+            </div>
+          )}
+          {!selected3d && baseModel === 'scratch' && (
+            <div className="warn-banner" style={{ marginTop: -4 }}>
+              ⚠️ <strong>事前学習なし (ゼロから学習)</strong> を選択中です。少量データではほとんど精度が出ません。
+              まずは「Keypoint R-CNN (ResNet50) COCO事前学習」を推奨します。
+            </div>
+          )}
+          <div className="train-row">
+            <label className="image-detect-label">エポック: {epochs}</label>
+            <input type="range" min="1" max={selected3d ? 200 : 50} value={epochs} onChange={e => setEpochs(parseInt(e.target.value))} className="image-detect-slider" />
+            <label className="image-detect-label">バッチ: {batchSize}</label>
+            <input type="range" min="1" max={selected3d ? 32 : 8} value={batchSize} onChange={e => setBatchSize(parseInt(e.target.value))} className="image-detect-slider" />
+          </div>
+          <button className="btn primary" onClick={startTrain} disabled={annotatedReady.length === 0}>🚀 学習開始</button>
+        </div>
+      )}
+
+      {running && (
+        <div className="train-running">
+          <div className="train-running-header">
+            <span className="train-spinner">⏳ 学習中...</span>
+            <button className="btn small danger" onClick={cancelTrain}>中止</button>
+          </div>
+          <pre className="train-log">{trainLog}</pre>
+        </div>
+      )}
+
+      {!running && customModels.length > 0 && (
+        <div className="train-models">
+          <h3>学習済みカスタムモデル ({customModels.length})</h3>
+          {customModels.map(m => (
+            <div key={m.name} className="dataset-card">
+              <div className="dataset-card-info">
+                <div className="dataset-card-name">🎓 {m.name} {m.dim === '3d' && <span className="kp-3d-badge">3D</span>}</div>
+                <div className="dataset-card-meta">
+                  キーポイント: {(m.keypoints || []).length}点 · ベース: {m.baseModel} · loss: {m.finalLoss ?? '-'}
+                </div>
+              </div>
+              <div className="dataset-card-actions">
+                <button className="btn small" onClick={() => downloadModel(m.name)} disabled={downloading === m.name}>
+                  {downloading === m.name ? '⏳ 準備中…' : '⬇ ダウンロード'}
+                </button>
+                <button className="btn small danger" onClick={() => deleteModel(m.name)}>削除</button>
+              </div>
+            </div>
+          ))}
+          <div className="train-hint">学習済みモデルは「🔍 検出」サブタブから選んで使えます。</div>
+        </div>
+      )}
+
+      {!running && recentJobs.length > 0 && (
+        <div className="train-jobs">
+          <h3>学習履歴</h3>
+          {recentJobs.slice(0, 5).map(j => (
+            <div key={j.jobId} className={`train-job-item ${j.status}`}>
+              <span>{j.status === 'completed' ? '✅' : '❌'} {j.modelName}</span>
+              <span className="train-job-meta">
+                {j.status === 'completed' ? `loss: ${j.finalLoss}, ${j.device}` : `エラー: ${j.error || '不明'}`}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// 検出ビュー (COCO人物17点 / カスタムモデル)
+function KeypointDetectView({ showToast }) {
+  const [customModels, setCustomModels] = useState([]);
+  const [selectedModel, setSelectedModel] = useState('coco:keypointrcnn_resnet50_fpn');
+  const [threshold, setThreshold] = useState(0.5);
+  const [imageDataUrl, setImageDataUrl] = useState(null);
+  const [detecting, setDetecting] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState('');
+  const canvasRef = useRef(null);
+  const imgRef = useRef(null);
+
+  useEffect(() => {
+    fetch('/ml/image/keypoint/custom-models')
+      .then(r => r.ok ? r.json() : { models: [] })
+      .then(d => setCustomModels(d.models || []))
+      .catch(() => {});
+  }, []);
+
+  function onFileSelect(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) { setError('画像ファイルを選択してください'); return; }
+    const reader = new FileReader();
+    reader.onload = () => { setImageDataUrl(reader.result); setResult(null); setError(''); };
+    reader.readAsDataURL(file);
+  }
+
+  useEffect(() => {
+    if (!result || !imageDataUrl || !canvasRef.current || !imgRef.current) return;
+    const img = imgRef.current;
+    const draw = () => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      canvas.width = result.imageWidth;
+      canvas.height = result.imageHeight;
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+      const skeleton = result.skeleton || [];
+      const r = Math.max(3, canvas.width / 200);
+      const lw = Math.max(2, canvas.width / 400);
+      (result.detections || []).forEach((det, di) => {
+        const color = KP_COLORS[di % KP_COLORS.length];
+        const { x1, y1, x2, y2 } = det.box;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = lw;
+        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+        const kps = det.keypoints || [];
+        ctx.lineWidth = lw;
+        skeleton.forEach(([a, c]) => {
+          if (kps[a] && kps[c]) {
+            ctx.beginPath();
+            ctx.moveTo(kps[a].x, kps[a].y);
+            ctx.lineTo(kps[c].x, kps[c].y);
+            ctx.stroke();
+          }
+        });
+        kps.forEach(kp => {
+          // 3D: z(相対深度)で点の大きさを変える (手前ほど大きく)。-1..1 → 半径 ×0.5..1.5
+          const rr = result.is3d && typeof kp.z === 'number' ? r * (1 - kp.z * 0.5) : r;
+          ctx.beginPath();
+          ctx.arc(kp.x, kp.y, Math.max(2, rr), 0, Math.PI * 2);
+          ctx.fillStyle = color;
+          ctx.fill();
+          ctx.lineWidth = Math.max(1, lw / 2);
+          ctx.strokeStyle = '#fff';
+          ctx.stroke();
+        });
+      });
+    };
+    if (img.complete) draw();
+    else img.onload = draw;
+  }, [result, imageDataUrl]);
+
+  async function runDetect() {
+    if (!imageDataUrl) { setError('画像を選択してください'); return; }
+    setDetecting(true); setError(''); setResult(null);
+    try {
+      const [kind, mname] = selectedModel.split(':');
+      const body = kind === 'custom'
+        ? { image: imageDataUrl, customModel: mname, threshold }
+        : { image: imageDataUrl, threshold };
+      const res = await fetch('/ml/image/keypoint/detect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      setResult(data);
+      if (data.count === 0) showToast('対象が検出されませんでした (しきい値を下げてみてください)');
+      else showToast(`${data.count}個を検出しました`);
+    } catch (e) {
+      setError(`検出失敗: ${e.message}`);
+    } finally {
+      setDetecting(false);
+    }
+  }
+
+  return (
+    <div className="image-detect-view">
+      <div className="image-detect-controls">
+        <div className="image-detect-row">
+          <label className="image-detect-label">モデル:</label>
+          <select value={selectedModel} onChange={e => setSelectedModel(e.target.value)} className="image-detect-select">
+            <optgroup label="COCO 事前学習 (人物17点)">
+              <option value="coco:keypointrcnn_resnet50_fpn">Keypoint R-CNN (ResNet50) — 人物の姿勢17点</option>
+            </optgroup>
+            {customModels.length > 0 && (
+              <optgroup label="カスタム学習済みモデル">
+                {customModels.map(m => (
+                  <option key={m.name} value={`custom:${m.name}`}>🎓 {m.name}{m.dim === '3d' ? ' [3D]' : ''} ({(m.keypoints || []).length}点)</option>
+                ))}
+              </optgroup>
+            )}
+          </select>
+        </div>
+        <div className="image-detect-row">
+          <label className="image-detect-label">信頼度しきい値: {threshold.toFixed(2)}</label>
+          <input type="range" min="0.05" max="0.95" step="0.05" value={threshold}
+            onChange={e => setThreshold(parseFloat(e.target.value))} className="image-detect-slider" />
+        </div>
+        <div className="image-detect-row">
+          <input type="file" accept="image/jpeg,image/png,image/bmp,image/webp,.jpg,.jpeg,.png,.bmp,.webp" onChange={onFileSelect} className="image-detect-file" />
+          <button className="btn primary" onClick={runDetect} disabled={!imageDataUrl || detecting}>
+            {detecting ? '🔍 検出中...' : '🔍 キーポイント検出を実行'}
+          </button>
+        </div>
+        <div className="image-detect-hint">
+          COCO事前学習モデルは人物の姿勢 (17点) を検出します。手など独自のキーポイントは
+          「📊 データセット」で作成し「🚀 学習」したカスタムモデルを使ってください。
+        </div>
+      </div>
+
+      {error && <div className="warn-banner">{error}</div>}
+
+      <div className="image-detect-canvas-wrap">
+        {imageDataUrl && (
+          <>
+            <img ref={imgRef} src={imageDataUrl} style={{ display: 'none' }} alt="source" />
+            <canvas ref={canvasRef} className="image-detect-canvas" />
+          </>
+        )}
+        {!imageDataUrl && <div className="empty-state">画像ファイルを選択してください</div>}
+      </div>
+
+      {result && (
+        <div className="image-detect-result">
+          <div className="image-detect-summary">
+            <strong>{result.count}個</strong> 検出 ·
+            モデル: {result.model} ·
+            デバイス: {result.device} ·
+            画像: {result.imageWidth}×{result.imageHeight}
+          </div>
+          {result.note && (
+            <div className="image-detect-summary" style={{ color: 'var(--orange, #ff9500)' }}>⚠️ {result.note}</div>
+          )}
+          <details className="image-detect-details">
+            <summary>検出の詳細 ({result.count}件)</summary>
+            {(result.detections || []).map((d, i) => (
+              <div key={i} style={{ marginBottom: 8 }}>
+                <div><strong>対象#{i + 1}</strong>{!result.is3d && ` 信頼度 ${(d.score * 100).toFixed(1)}%`}</div>
+                <table className="image-detect-table">
+                  <thead><tr><th>#</th><th>名前</th><th>x</th><th>y</th>{result.is3d ? <th>z(深度)</th> : <th>信頼度</th>}</tr></thead>
+                  <tbody>
+                    {(d.keypoints || []).map((kp, ki) => (
+                      <tr key={ki}>
+                        <td>{ki}</td><td>{kp.name}</td><td>{kp.x}</td><td>{kp.y}</td>
+                        {result.is3d
+                          ? <td>{kp.z != null ? kp.z.toFixed(3) : '-'}</td>
+                          : <td>{kp.score != null ? kp.score.toFixed(2) : '-'}</td>}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ))}
           </details>
         </div>
       )}
