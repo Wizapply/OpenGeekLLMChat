@@ -1,5 +1,18 @@
 const { useState, useRef, useEffect, useCallback } = React;
 
+// ─── Utility: ユーザー指定の役割をシステムプロンプト先頭に差し込む ───
+// LLM はシステムプロンプト先頭の指示を最優先しやすいため、末尾追加ではなく
+// 先頭に「最優先指示」として配置し、汎用ルール(meta 等)より役割を優先させる。
+function applyRolePrompt(basePrompt, chatRole) {
+  if (!chatRole || !chatRole.trim()) return basePrompt;
+  const roleBlock =
+    '【最優先指示: ユーザー指定の役割】\n' +
+    '以下の役割・指示に厳密に従って応答してください。これは以降のどの一般的なルールよりも優先されます。\n\n' +
+    chatRole.trim() +
+    '\n\n────────────────────\n\n';
+  return roleBlock + (basePrompt || '');
+}
+
 // ─── Utility: バイト数フォーマット ───
 function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes}B`;
@@ -1668,10 +1681,8 @@ function App() {
         if (sp.meta) {
           agentSystem += '\n\n' + sp.meta;
         }
-        // ユーザー設定の役割（最後に追加して最も影響力を持たせる）
-        if (chatRole && chatRole.trim()) {
-          agentSystem += '\n\n【ユーザー指定の役割・指示】\n' + chatRole.trim();
-        }
+        // ユーザー設定の役割（システムプロンプト先頭に置き、汎用ルールより優先させる）
+        agentSystem = applyRolePrompt(agentSystem, chatRole);
 
         let apiMessages = [{ role: 'system', content: agentSystem }, ...history];
         let allContexts = [];
@@ -2839,10 +2850,8 @@ function App() {
           const ctxText = contexts.map((c, i) => `[資料${i + 1}: ${c.docName}]\n${c.chunk}`).join('\n\n');
           fullSystemPrompt += `\n\n以下の参考資料に基づいて回答してください。資料に無い情報は推測であることを明示してください。\n\n${ctxText}`;
         }
-        // ユーザー設定の役割
-        if (chatRole && chatRole.trim()) {
-          fullSystemPrompt += '\n\n【ユーザー指定の役割・指示】\n' + chatRole.trim();
-        }
+        // ユーザー設定の役割（システムプロンプト先頭に置き、汎用ルールより優先させる）
+        fullSystemPrompt = applyRolePrompt(fullSystemPrompt, chatRole);
 
         const res = await fetchWithRetry('/v1/chat/completions', {
           method: 'POST',
@@ -3885,8 +3894,9 @@ function App() {
 
       // 途中までの思考+応答を「部分応答」として追加し、続きを書くよう促す
       const partial = [target.thinking ? `<think>${target.thinking}</think>` : '', target.content || ''].filter(Boolean).join('\n').trim();
+      // 中断応答の続きでも、ユーザー設定の役割を維持する
       const nudgeMessages = [
-        { role: 'system', content: systemPrompt },
+        { role: 'system', content: applyRolePrompt(systemPrompt, chatRole) },
         ...history,
       ];
       if (partial) {
