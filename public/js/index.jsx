@@ -860,6 +860,9 @@ function OrchestraPanel({ orch }) {
                   <span className={`orch-node-caret ${isOpen ? 'open' : ''}`}>▶</span>
                 )}
               </div>
+              {n.status === 'skipped' && n.skipReason && (
+                <div className="orch-node-skip">スキップ: {n.skipReason}</div>
+              )}
               {n.error && <div className="orch-node-error">{n.error}</div>}
               {isOpen && n.text && (
                 <div className="orch-node-body">{n.text}</div>
@@ -1423,9 +1426,12 @@ function App() {
           } else if (ev.type === 'node_done') {
             const n = findNode(ev.id);
             if (n) { n.status = 'done'; n.ms = ev.ms; if (ev.text) n.text = ev.text; n.speaker = null; }
+          } else if (ev.type === 'node_condition') {
+            const n = findNode(ev.id);
+            if (n) n.condition = ev.reason;
           } else if (ev.type === 'node_skipped') {
             const n = findNode(ev.id);
-            if (n) n.status = 'skipped';
+            if (n) { n.status = 'skipped'; if (ev.reason) n.skipReason = ev.reason; }
           } else if (ev.type === 'node_error') {
             const n = findNode(ev.id);
             if (n) { n.status = 'error'; n.error = ev.error; }

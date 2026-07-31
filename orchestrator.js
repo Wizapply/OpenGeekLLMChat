@@ -163,6 +163,19 @@ function validateWorkflow(wf, availableModels) {
       const rs = Array.isArray(n.routes) ? n.routes : [];
       if (rs.length < 2) errors.push(`ルーターには2つ以上の分岐が必要です: ${n.label || n.id}`);
     }
+    // 実行条件
+    if (n.when && n.when.mode && n.when.mode !== 'always') {
+      if (!['keyword', 'llm'].includes(n.when.mode)) {
+        errors.push(`不明な実行条件の種別: ${n.when.mode} (${n.label || n.id})`);
+      }
+      if (n.when.mode === 'keyword' && !(n.when.keywords || []).some(k => String(k).trim())) {
+        errors.push(`実行条件のキーワードが空です: ${n.label || n.id}`);
+      }
+      if (n.when.mode === 'llm' && n.when.model
+          && availableModels && availableModels.length && !availableModels.includes(n.when.model)) {
+        errors.push(`実行条件の判定モデルが存在しません: ${n.when.model} (${n.label || n.id})`);
+      }
+    }
   }
   // 入力参照の健全性
   for (const n of nodes) {
@@ -407,6 +420,58 @@ function createOrchestrator(deps) {
     });
   }
 
+  /**
+   * ノードの実行条件 (node.when) を評価する。
+   * ルーターが「N択で必ず1つ選ぶ」のに対し、こちらは「条件を満たすときだけ走らせる」。
+   * 「通常の回答に加えて、コードが要るときだけコード専用モデルも動かす」
+   * のような構成はルーターでは表現できないため用意した。
+   *
+   * @returns {Promise<{run: boolean, reason: string}>}
+   */
+  async function evaluateCondition(node, ctx, runState) {
+    const w = node.when;
+    if (!w || !w.mode || w.mode === 'always') return { run: true, reason: '' };
+
+    if (w.mode === 'keyword') {
+      const words = (w.keywords || []).map(s => String(s).trim()).filter(Boolean);
+      if (words.length === 0) return { run: true, reason: 'キーワード未設定のため常に実行' };
+      const target = String(ctx.query || '').toLowerCase();
+      const hit = words.find(k => target.includes(k.toLowerCase()));
+      return hit
+        ? { run: true, reason: `キーワード「${hit}」に一致` }
+        : { run: false, reason: `キーワード(${words.join(', ')})に一致せず` };
+    }
+
+    if (w.mode === 'llm') {
+      const judgeModel = w.model || node.model;
+      if (!judgeModel) return { run: true, reason: '判定モデル未設定のため常に実行' };
+      const question = w.question || 'この質問はプログラムコードの生成を必要としますか？';
+      const messages = [
+        { role: 'system', content: 'あなたは質問を分類する判定器です。指示された形式だけで答えてください。' },
+        {
+          role: 'user',
+          content: `次のユーザーの質問について判定してください。\n\n【質問】\n${ctx.query}\n\n`
+            + `【判定してほしいこと】\n${question}\n\n`
+            + `「はい」か「いいえ」のどちらか一語だけを出力してください。説明は不要です。`,
+        },
+      ];
+      const text = await callModel({
+        modelName: judgeModel, messages,
+        node: { ...node, maxTokens: 16 }, mode: ctx.mode, run: runState,
+      });
+      const clean = stripThink(text).trim();
+      // 「はい」「yes」「true」「1」を肯定とみなす。判定不能なら安全側で実行する
+      const yes = /(はい|yes|true|^1\b)/i.test(clean);
+      const no = /(いいえ|no|false|^0\b)/i.test(clean);
+      if (!yes && !no) return { run: true, reason: `判定不能(${clean.slice(0, 20)})のため実行` };
+      return yes
+        ? { run: true, reason: `判定: はい（${question}）` }
+        : { run: false, reason: `判定: いいえ（${question}）` };
+    }
+
+    return { run: true, reason: '' };
+  }
+
   async function runRouterNode(node, ctx, run) {
     const routes = node.routes || [];
     const list = routes.map((r, i) => `${i + 1}. ${r.label}${r.description ? ` — ${r.description}` : ''}`).join('\n');
@@ -581,6 +646,30 @@ function createOrchestrator(deps) {
         ctx.results.set(node.id, { status: 'skipped', text: '', label: node.label || node.id, model: node.model || null });
         emit({ type: 'node_skipped', id: node.id, label: node.label || node.id });
         return;
+      }
+
+      // 実行条件が設定されていれば、満たさないノードはここで飛ばす
+      if (node.when && node.when.mode && node.when.mode !== 'always') {
+        let cond;
+        try {
+          cond = await evaluateCondition(node, ctx, run);
+        } catch (e) {
+          // 判定自体が失敗したら、黙って落とさず実行する（機会損失より安全）
+          cond = { run: true, reason: `条件判定に失敗したため実行: ${e.message}` };
+        }
+        emit({
+          type: 'node_condition', id: node.id, label: node.label || node.id,
+          willRun: cond.run, reason: cond.reason,
+        });
+        if (!cond.run) {
+          ctx.skipped.add(node.id);
+          ctx.results.set(node.id, {
+            status: 'skipped', text: '', label: node.label || node.id,
+            model: node.model || null, skipReason: cond.reason,
+          });
+          emit({ type: 'node_skipped', id: node.id, label: node.label || node.id, reason: cond.reason });
+          return;
+        }
       }
 
       const label = node.label || node.id;

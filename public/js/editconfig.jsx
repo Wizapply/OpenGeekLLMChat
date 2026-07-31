@@ -87,6 +87,30 @@ function orchTemplates(models) {
       }),
     },
     {
+      key: 'codegen', icon: '💻', name: '通常回答＋コード生成',
+      desc: 'いつもの回答に加えて、コードが必要なときだけコード特化モデルを走らせます。',
+      build: () => ({
+        name: '通常回答＋コード生成',
+        description: 'コードが必要な質問のときだけコード専用モデルを追加で動かす',
+        nodes: [
+          { id: 'answer', type: 'llm', label: '通常回答', model: m(1), inputs: [],
+            role: 'あなたは親切で分かりやすい説明が得意なアシスタントです。' },
+          { id: 'coder', type: 'llm', label: 'コード生成（条件付き）', model: m(2), inputs: [],
+            role: 'あなたは熟練のソフトウェアエンジニアです。'
+              + '説明は最小限にして、そのまま動作する完全なコードを提示してください。',
+            when: {
+              mode: 'llm', model: m(0),
+              question: 'この質問はプログラムのコードを書くことを求めていますか？',
+            } },
+          { id: 'merge', type: 'aggregate', label: '統合', model: m(1), inputs: ['answer', 'coder'],
+            role: 'あなたは複数の担当の出力をまとめる編集者です。',
+            instruction: 'コードが提供されている場合は、説明の適切な位置にコードブロックとして組み込んでください。'
+              + 'コードが無い場合は説明だけを整えて出力してください。誰が書いたかの説明は不要です。' },
+          { id: 'out', type: 'output', label: '最終回答', inputs: ['merge'] },
+        ],
+      }),
+    },
+    {
       key: 'debate', icon: '⚖️', name: '討論→結論',
       desc: '2モデルが賛否に分かれて議論し、司会役が結論をまとめます。判断が割れる問いに有効。',
       build: () => ({
@@ -518,6 +542,58 @@ function OrchestraEditor({ hasUnsavedText, onSaved }) {
                           )}
                           {node.useImages && visionWarning(node) && (
                             <div className="orch-node-warn">⚠️ {visionWarning(node)}</div>
+                          )}
+                        </div>
+                      )}
+
+                      {/* 実行条件: 満たさないノードは飛ばす（ルーターと違い排他ではない） */}
+                      {node.type !== 'output' && (
+                        <div className="orch-field">
+                          <span className="orch-field-label">
+                            実行条件
+                            <select className="orch-select orch-select-inline"
+                              value={node.when?.mode || 'always'}
+                              onChange={e => updateNode(node.id, n => {
+                                const mode = e.target.value;
+                                if (mode === 'always') { delete n.when; return; }
+                                n.when = n.when || {};
+                                n.when.mode = mode;
+                                if (mode === 'keyword' && !n.when.keywords) n.when.keywords = [];
+                                if (mode === 'llm') {
+                                  if (!n.when.model) n.when.model = models[0]?.name || '';
+                                  if (!n.when.question) n.when.question = 'この質問はプログラムのコードを書くことを求めていますか？';
+                                }
+                              })}>
+                              <option value="always">常に実行</option>
+                              <option value="keyword">キーワードを含むとき</option>
+                              <option value="llm">LLMが「はい」と判定したとき</option>
+                            </select>
+                          </span>
+                          {node.when?.mode === 'keyword' && (
+                            <input className="orch-input"
+                              value={(node.when.keywords || []).join(', ')}
+                              placeholder="コード, プログラム, python, 実装（カンマ区切り・大文字小文字は区別しません）"
+                              onChange={e => updateNode(node.id, n => {
+                                n.when.keywords = e.target.value.split(',').map(x => x.trim()).filter(Boolean);
+                              })} />
+                          )}
+                          {node.when?.mode === 'llm' && (
+                            <div className="orch-route-row">
+                              <select className="orch-select" value={node.when.model || ''}
+                                onChange={e => updateNode(node.id, n => { n.when.model = e.target.value; })}>
+                                <option value="">（判定モデル）</option>
+                                {models.map(mm => <option key={mm.name} value={mm.name}>{mm.name}</option>)}
+                              </select>
+                              <input className="orch-input" value={node.when.question || ''}
+                                placeholder="判定してほしいこと（はい/いいえで答えられる形）"
+                                onChange={e => updateNode(node.id, n => { n.when.question = e.target.value; })} />
+                            </div>
+                          )}
+                          {node.when?.mode && node.when.mode !== 'always' && (
+                            <div className="orch-hint">
+                              条件を満たさない場合このノードは実行されず、下流には他のノードの出力だけが渡ります。
+                              {node.when.mode === 'llm' && ' 判定は小型モデルが速くて安上がりです。'}
+                            </div>
                           )}
                         </div>
                       )}
