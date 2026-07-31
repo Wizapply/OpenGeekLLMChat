@@ -809,7 +809,10 @@ function OrchestraPanel({ orch }) {
                 </div>
               ))}
               <div className="orch-vram-sum">
-                合計 {gb(orch.requiredVramMB)}GB ＋ 安全余裕 {gb(orch.marginVramMB)}GB
+                ワークフロー全体 {gb(orch.footprintVramMB ?? orch.requiredVramMB)}GB
+                {orch.loadedVramMB > 0 && `（うち ${gb(orch.loadedVramMB)}GB はロード済み）`}
+                <br />
+                追加で必要 {gb(orch.requiredVramMB)}GB ＋ 安全余裕 {gb(orch.marginVramMB)}GB
                 {' '}{orch.shortageVramMB > 0 ? '＞' : '≦'} 空きVRAM {gb(orch.freeVramMB)}GB
                 {orch.shortageVramMB > 0 && (
                   <span className="orch-vram-short">（{gb(orch.shortageVramMB)}GB 不足）</span>
@@ -1359,6 +1362,8 @@ function App() {
             orch.requiredVramMB = ev.requiredVramMB;
             orch.marginVramMB = ev.marginVramMB;
             orch.shortageVramMB = ev.shortageVramMB;
+            orch.footprintVramMB = ev.footprintVramMB;
+            orch.loadedVramMB = ev.loadedVramMB;
             orch.vramBreakdown = ev.vramBreakdown;
             orch.nodes = (ev.nodes || []).map(n => ({
               id: n.id, label: n.label, model: n.model, type: n.type,

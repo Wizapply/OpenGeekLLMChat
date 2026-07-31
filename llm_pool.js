@@ -472,13 +472,15 @@ function createLlmPool(deps) {
 
     // モデルごとの内訳。UIに出して「何にどれだけ要るか」を見えるようにする
     const breakdown = [];
-    let requiredMB = 0;
+    let requiredMB = 0;      // 今から追加で確保が要る量（ロード済みは除く）
+    let footprintMB = 0;     // ワークフロー全体がVRAMを占める量（ロード済みも含む）
     let anyApprox = false;
     for (const name of uniq) {
       const m = findModelByName(name);
       if (!m) continue;
       const est = estimateModelVram(m);
       const alreadyLoaded = resident.has(name);
+      footprintMB += est.totalMB;
       if (!alreadyLoaded) requiredMB += est.totalMB;
       if (!est.exact) anyApprox = true;
       breakdown.push({
@@ -493,7 +495,11 @@ function createLlmPool(deps) {
     // GPU情報が取れないときの「不足量」は意味を持たないので null にする
     // （0 や適当な数字を出すと、足りているように見えたり嘘の不足量を表示してしまう）
     const shortageMB = freeMB > 0 ? Math.max(0, requiredMB + margin - freeMB) : null;
-    const base = { freeMB, requiredMB, marginMB: margin, shortageMB, breakdown, approx: anyApprox };
+    const loadedMB = footprintMB - requiredMB;   // 既にVRAM上にある分
+    const base = {
+      freeMB, requiredMB, footprintMB, loadedMB,
+      marginMB: margin, shortageMB, breakdown, approx: anyApprox,
+    };
 
     if (mode === 'resident') {
       return { ...base, mode: 'resident', reason: '設定で常駐並列モード固定' };
@@ -511,16 +517,20 @@ function createLlmPool(deps) {
       };
     }
     const gb = (mb) => (mb / 1024).toFixed(1);
+    // ロード済みのぶんは追加確保が不要なので、そのことを明示する
+    // （でないと「必要 0.0GB」とだけ出て何が起きているか分からない）
+    const loadedNote = loadedMB > 0 ? `${gb(loadedMB)}GBはロード済みのため追加確保は不要。` : '';
     if (shortageMB === 0) {
       return {
         ...base, mode: 'resident',
-        reason: `全モデルを同時に載せられます（必要 ${gb(requiredMB)}GB + 余裕 ${gb(margin)}GB ≦ 空き ${gb(freeMB)}GB）`,
+        reason: `全モデルを同時に載せられます。${loadedNote}`
+          + `追加で必要 ${gb(requiredMB)}GB + 余裕 ${gb(margin)}GB ≦ 空き ${gb(freeMB)}GB`,
       };
     }
     return {
       ...base, mode: 'swap',
-      reason: `VRAMが ${gb(shortageMB)}GB 足りないため1モデルずつ入れ替えて実行します`
-        + `（必要 ${gb(requiredMB)}GB + 余裕 ${gb(margin)}GB > 空き ${gb(freeMB)}GB）`,
+      reason: `VRAMが ${gb(shortageMB)}GB 足りないため1モデルずつ入れ替えて実行します。${loadedNote}`
+        + `追加で必要 ${gb(requiredMB)}GB + 余裕 ${gb(margin)}GB > 空き ${gb(freeMB)}GB`,
     };
   }
 
@@ -782,6 +792,26 @@ function createLlmPool(deps) {
     } finally { unreserve(modelName); }
   }
 
+  /**
+   * プール外のプロセス（メインチャットの llama-server）が落ちたことを記録する。
+   * reuseMainChat でメインチャットを間借りしている間にそれが落ちると、
+   * プールには何の記録も残らず、呼び出し側には生の "socket hang up" しか見えない。
+   * server.js から通知してもらうことでこの穴を塞ぐ。
+   */
+  function recordExternalCrash(modelName, info) {
+    if (!modelName) return;
+    crashes.set(modelName, {
+      code: info?.code ?? null,
+      signal: info?.signal ?? null,
+      tail: info?.tail || '',
+      gpu: info?.gpu || null,
+      external: true,     // プール管理外（メインチャット）で落ちた
+      at: Date.now(),
+    });
+    log('-', `[LLMプール] メインチャットの llama-server が異常終了: ${modelName}`
+      + ` (code=${info?.code}${info?.signal ? `, signal=${info.signal}` : ''})`);
+  }
+
   /** 直近にそのモデルのワーカーが異常終了していれば、その記録を返す */
   function getCrash(modelName) {
     const c = crashes.get(modelName);
@@ -888,7 +918,7 @@ function createLlmPool(deps) {
 
   return {
     acquire, planMode, status, unloadAll, killAll, getCrash, awaitCrash,
-    estimateModelVram, estimateModelVramMB, freeVramMB, getMeasured,
+    estimateModelVram, estimateModelVramMB, freeVramMB, getMeasured, recordExternalCrash,
   };
 }
 

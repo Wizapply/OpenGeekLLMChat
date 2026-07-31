@@ -387,8 +387,11 @@ function OrchestraEditor({ hasUnsavedText, onSaved }) {
                       ))}
                       <tr className="sum">
                         <td colSpan={4}>
-                          合計 {(plan.requiredMB / 1024).toFixed(1)}GB ＋ 余裕 {(plan.marginMB / 1024).toFixed(1)}GB
-                          {' '}／ 空きVRAM {(plan.freeMB / 1024).toFixed(1)}GB
+                          ワークフロー全体 {((plan.footprintMB ?? plan.requiredMB) / 1024).toFixed(1)}GB
+                          {plan.loadedMB > 0 && `（うち ${(plan.loadedMB / 1024).toFixed(1)}GB はロード済み）`}
+                          {' '}／ 追加で必要 {(plan.requiredMB / 1024).toFixed(1)}GB
+                          ＋ 余裕 {(plan.marginMB / 1024).toFixed(1)}GB
+                          ／ 空きVRAM {(plan.freeMB / 1024).toFixed(1)}GB
                         </td>
                         <td className="num total">
                           {plan.shortageMB > 0

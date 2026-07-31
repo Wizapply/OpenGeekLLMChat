@@ -964,8 +964,35 @@ async function startChatModel(modelName) {
       ...(model.chatTemplate ? ['--chat-template', model.chatTemplate] : []),
       ...(model.extraArgs || []),
     ];
-    chatProc = spawnLlamaServer(args, `chat:${model.name}`);
+    // オーケストレーションはメインチャットのモデルを間借りすることがある。
+    // その最中にこのプロセスが落ちると、プール側には何の記録も残らず
+    // 呼び出し側には生の "socket hang up" しか見えないため、出力を保持して
+    // 異常終了をプールに通知できるようにしておく。
+    const logTail = [];
+    const startedModel = model.name;
+    chatProc = spawnLlamaServer(args, `chat:${model.name}`, (chunk) => {
+      for (const line of String(chunk).split('\n')) {
+        if (!line.trim()) continue;
+        logTail.push(line);
+        if (logTail.length > 40) logTail.shift();
+      }
+    });
     chatProcModel = model.name;
+    const startedProc = chatProc;
+    chatProc.on('exit', (code, signal) => {
+      // stopChatModel() 由来なら chatProc は既に差し替わっているので通知しない
+      if (chatProc !== startedProc) return;
+      chatProc = null;
+      try {
+        llmPool.recordExternalCrash(startedModel, {
+          code, signal,
+          tail: logTail.slice(-12).join('\n'),
+          gpu: (cachedGpuData || []).map(g => ({
+            id: g.id || '', totalMB: g.vramTotalMB || 0, usedMB: g.vramUsedMB || 0,
+          })),
+        });
+      } catch {}
+    });
 
     const ready = await waitForReady(ls.chatHost, ls.chatPort, ls.readyTimeoutMs);
     if (!ready) {

@@ -26,6 +26,13 @@ const http = require('http');
 const CONN_LOST_RE = /socket hang up|ECONNRESET|ECONNREFUSED|EPIPE|aborted/i;
 const CONN_LOST_CODES = ['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ERR_STREAM_PREMATURE_CLOSE'];
 
+// Node 19 以降 http.globalAgent は keepAlive: true が既定。
+// ノード間で間隔が空くと、llama-server 側が先に閉じた接続をプールから掴んでしまい、
+// リクエストを投げた瞬間に "socket hang up" になる（プロセスは生きている）。
+// ワークフローは「討論 → 数十秒後に結論」のように間が空くのが普通なので、
+// 専用エージェントで毎回新しい接続を張る。
+const httpAgent = new http.Agent({ keepAlive: false, maxSockets: 64 });
+
 // ─── 汎用ユーティリティ ───
 
 /** <think>...</think> を除去する。下流ノードに渡す際に思考文で文脈を汚さないため */
@@ -66,9 +73,11 @@ function chatCompletionStream({ host, port, messages, temperature, maxTokens, to
       port,
       path: '/v1/chat/completions',
       method: 'POST',
+      agent: httpAgent,           // keep-alive の使い回しを避ける（上のコメント参照）
       headers: {
         'content-type': 'application/json',
         'content-length': Buffer.byteLength(payload),
+        'connection': 'close',
       },
       timeout: 900000,
     }, (res) => {
@@ -302,12 +311,28 @@ function createOrchestrator(deps) {
     const handle = await pool.acquire(modelName, { mode });
     try {
       const s = samplerFor(node);
-      return await chatCompletionStream({
+      const opts = {
         host: handle.host, port: handle.port,
         messages,
         temperature: s.temperature, maxTokens: s.maxTokens,
         topP: s.topP, topK: s.topK,
-      }, onDelta, (req) => run.activeReqs.add(req));
+      };
+      const register = (req) => run.activeReqs.add(req);
+
+      let received = 0;
+      const countingOnDelta = (d) => { received++; if (onDelta) onDelta(d); };
+
+      try {
+        return await chatCompletionStream(opts, countingOnDelta, register);
+      } catch (e) {
+        // まだ1トークンも受け取っていない接続断は、接続そのものの問題である可能性が高い。
+        // ワーカーが生きているなら一度だけ張り直す（部分出力が二重にならないよう
+        // 受信済みの場合はやり直さない）。
+        const connLost = CONN_LOST_RE.test(e.message || '') || CONN_LOST_CODES.includes(e.code);
+        if (!connLost || received > 0 || pool.getCrash(modelName)) throw e;
+        log('-', `[オーケストレーション] 接続断のため再接続して再試行: ${modelName} (${e.message})`);
+        return await chatCompletionStream(opts, countingOnDelta, register);
+      }
     } catch (e) {
       // llama-server が落ちると呼び出し側には "socket hang up" しか見えない。
       // プールが記録した終了コードと最終出力を添えて、原因を追えるようにする。
@@ -324,8 +349,9 @@ function createOrchestrator(deps) {
               .map(g => `${g.id || 'GPU'} ${(g.usedMB / 1024).toFixed(1)}/${(g.totalMB / 1024).toFixed(1)}GB使用`)
               .join(' , ')
           : '';
+        const where = crash.external ? 'メインチャットの' : 'ワーカーの';
         const err = new Error(
-          `VRAM不足の可能性: モデル「${modelName}」のllama-serverが異常終了しました`
+          `VRAM不足の可能性: モデル「${modelName}」の${where}llama-serverが異常終了しました`
           + ` (exit=${crash.code}${crash.signal ? `, signal=${crash.signal}` : ''})`
           + gpuLine
           + `\n対処: モデルの ctx を下げる（KVキャッシュが比例して減ります）/ 使うモデルを減らす /`
@@ -472,6 +498,7 @@ function createOrchestrator(deps) {
       mode: plan.mode, reason: plan.reason,
       freeVramMB: plan.freeMB, requiredVramMB: plan.requiredMB,
       marginVramMB: plan.marginMB, shortageVramMB: plan.shortageMB,
+      footprintVramMB: plan.footprintMB, loadedVramMB: plan.loadedMB,
       vramBreakdown: plan.breakdown, vramApprox: plan.approx,
       finalNodeId,
       nodes: nodes.map(n => ({

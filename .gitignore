@@ -17,3 +17,5 @@ __pycache__/
 *.pyc
 # ML/RL の実行時データ (データセット・学習済みモデル等)
 ml/
+# マルチLLM: llama-serverが報告した実測VRAM（環境依存のキャッシュ）
+vram-measured.json
