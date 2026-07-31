@@ -495,3 +495,285 @@ body {
     align-items: flex-start;
   }
 }
+
+/* ════════════════════════════════════════════════
+   マルチLLM ワークフローエディタ
+   ════════════════════════════════════════════════ */
+
+.orch-layout {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  gap: 0;
+  overflow: hidden;
+}
+
+/* ── 左: ワークフロー一覧・テンプレート ── */
+.orch-list-pane {
+  width: 260px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  padding: 14px;
+  overflow-y: auto;
+  background: var(--bg-primary);
+}
+.orch-disabled-note {
+  background: var(--orange-dim);
+  border: 1px solid var(--orange);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  margin-bottom: 12px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--orange);
+}
+.orch-disabled-note code {
+  font-family: var(--font-mono);
+  background: rgba(0, 0, 0, 0.3);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+.orch-wf-item {
+  position: relative;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  cursor: pointer;
+  margin-bottom: 4px;
+  transition: all 0.15s;
+}
+.orch-wf-item:hover { background: var(--bg-hover); }
+.orch-wf-item.active { background: var(--accent-dim); border-color: var(--accent); }
+.orch-wf-name { font-size: 13px; color: var(--text-primary); padding-right: 22px; word-break: break-word; }
+.orch-wf-sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+.orch-wf-del {
+  position: absolute;
+  top: 6px; right: 6px;
+  background: none; border: none;
+  color: var(--text-muted);
+  cursor: pointer; font-size: 12px;
+  opacity: 0; transition: opacity 0.15s;
+}
+.orch-wf-item:hover .orch-wf-del { opacity: 1; }
+.orch-wf-del:hover { color: var(--red); }
+.orch-tpl-btn {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 7px 10px;
+  margin-bottom: 4px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.orch-tpl-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--border-active);
+}
+
+/* ── 右: ノード編集 ── */
+.orch-edit-pane {
+  flex: 1;
+  padding: 16px 20px;
+  overflow-y: auto;
+  min-width: 0;
+}
+.orch-editor-empty {
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+  padding: 60px 20px;
+  line-height: 1.7;
+}
+.orch-field-row { display: flex; gap: 12px; flex-wrap: wrap; }
+.orch-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 160px;
+  margin-bottom: 10px;
+}
+.orch-field-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.orch-input, .orch-select, .orch-textarea {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 9px;
+  color: var(--text-primary);
+  font-size: 12.5px;
+  font-family: inherit;
+  width: 100%;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.orch-input:focus, .orch-select:focus, .orch-textarea:focus { border-color: var(--accent); }
+.orch-textarea { resize: vertical; line-height: 1.6; }
+.orch-input-num { width: 62px; }
+.orch-input-label { flex: 1; min-width: 90px; }
+.orch-plan-hint {
+  font-size: 11.5px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  margin-bottom: 10px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  line-height: 1.5;
+}
+.orch-plan-hint.resident { border-color: var(--green); background: var(--green-dim); }
+.orch-plan-hint.swap { border-color: var(--orange); background: var(--orange-dim); }
+.orch-errors {
+  background: var(--red-dim);
+  border: 1px solid var(--red);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  font-size: 11.5px;
+  color: var(--red);
+  line-height: 1.7;
+}
+.orch-notice {
+  background: var(--accent-dim);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  font-size: 11.5px;
+  color: var(--accent);
+}
+.orch-nodes { display: flex; flex-direction: column; gap: 10px; }
+.orch-node-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface, var(--bg-secondary));
+  overflow: hidden;
+}
+.orch-node-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.orch-node-card-head .orch-select { width: auto; min-width: 110px; }
+.orch-node-icon { flex-shrink: 0; }
+.orch-node-card-actions { margin-left: auto; display: flex; gap: 4px; }
+.orch-node-card-body { padding: 10px; }
+.orch-mini-btn {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  padding: 4px 9px;
+  font-size: 11.5px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.orch-mini-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: var(--border-active);
+}
+.orch-mini-btn:disabled { opacity: 0.35; cursor: default; }
+.orch-mini-btn.danger:hover:not(:disabled) { color: var(--red); border-color: var(--red); }
+.orch-input-picker { display: flex; flex-wrap: wrap; gap: 6px; }
+.orch-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.orch-chip:hover { border-color: var(--border-active); }
+.orch-chip input { accent-color: var(--accent); }
+.orch-route-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+.orch-route-row .orch-input, .orch-route-row .orch-select { flex: 1; min-width: 110px; width: auto; }
+.orch-add-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border);
+}
+.orch-save-btn { margin-left: auto; }
+
+@media (max-width: 900px) {
+  .orch-layout { flex-direction: column; }
+  .orch-list-pane {
+    width: 100%;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    max-height: 200px;
+  }
+  .orch-save-btn { margin-left: 0; width: 100%; justify-content: center; }
+}
+
+.orch-vram-table {
+  width: 100%;
+  margin-top: 8px;
+  border-collapse: collapse;
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+.orch-vram-table td {
+  padding: 3px 6px;
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+}
+.orch-vram-table td:first-child {
+  color: var(--text-primary);
+  font-family: var(--font-sans, inherit);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+.orch-vram-table td.num { text-align: right; white-space: nowrap; }
+.orch-vram-table td.total { color: var(--text-secondary); font-weight: 600; }
+.orch-vram-table tr.sum td {
+  border-top: 1px solid var(--border-active);
+  color: var(--text-secondary);
+  padding-top: 6px;
+}
+.orch-plan-tip {
+  margin-top: 6px;
+  font-size: 10.5px;
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+.orch-plan-tip code {
+  font-family: var(--font-mono);
+  background: rgba(0, 0, 0, 0.25);
+  padding: 0 4px;
+  border-radius: 3px;
+}

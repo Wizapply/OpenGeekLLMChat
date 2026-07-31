@@ -88,13 +88,97 @@
       "HIP_VISIBLE_DEVICES": "0"
     },
     "modelPresets": [
-      { "value": "Qwen/Qwen2.5-0.5B-Instruct", "size": "0.5B", "vramLora": "~4GB", "desc": "個人検証・実験用", "epochs": 5, "lr": 0.0002, "batch": 2, "accum": 4, "r": 8, "alpha": 16, "maxLen": 2048 },
-      { "value": "Qwen/Qwen2.5-1.5B-Instruct", "size": "1.5B", "vramLora": "~6GB", "desc": "軽量タスク",       "epochs": 5, "lr": 0.0002, "batch": 2, "accum": 4, "r": 16, "alpha": 32, "maxLen": 2048 },
-      { "value": "Qwen/Qwen2.5-3B-Instruct",   "size": "3B",   "vramLora": "~10GB", "desc": "実用エッジ",       "epochs": 3, "lr": 0.0002, "batch": 2, "accum": 8, "r": 16, "alpha": 32, "maxLen": 2048 },
-      { "value": "Qwen/Qwen2.5-7B-Instruct",   "size": "7B",   "vramLora": "~22GB", "desc": "本命・推奨",       "epochs": 3, "lr": 0.0002, "batch": 1, "accum": 16, "r": 32, "alpha": 64, "maxLen": 2048 },
-      { "value": "Qwen/Qwen2.5-14B-Instruct",  "size": "14B",  "vramLora": "~40GB", "desc": "高品質、要マルチGPU", "epochs": 2, "lr": 0.0001, "batch": 1, "accum": 32, "r": 64, "alpha": 128, "maxLen": 2048 },
-      { "value": "google/gemma-2-9b-it",       "size": "9B",   "vramLora": "~26GB", "desc": "Google Gemma 2",    "epochs": 3, "lr": 0.0002, "batch": 1, "accum": 16, "r": 32, "alpha": 64, "maxLen": 2048 },
-      { "value": "meta-llama/Llama-3.1-8B-Instruct", "size": "8B", "vramLora": "~24GB", "desc": "Llama 3.1 (要HF token)", "epochs": 3, "lr": 0.0002, "batch": 1, "accum": 16, "r": 32, "alpha": 64, "maxLen": 2048 }
+      {
+        "value": "Qwen/Qwen2.5-0.5B-Instruct",
+        "size": "0.5B",
+        "vramLora": "~4GB",
+        "desc": "個人検証・実験用",
+        "epochs": 5,
+        "lr": 0.0002,
+        "batch": 2,
+        "accum": 4,
+        "r": 8,
+        "alpha": 16,
+        "maxLen": 2048
+      },
+      {
+        "value": "Qwen/Qwen2.5-1.5B-Instruct",
+        "size": "1.5B",
+        "vramLora": "~6GB",
+        "desc": "軽量タスク",
+        "epochs": 5,
+        "lr": 0.0002,
+        "batch": 2,
+        "accum": 4,
+        "r": 16,
+        "alpha": 32,
+        "maxLen": 2048
+      },
+      {
+        "value": "Qwen/Qwen2.5-3B-Instruct",
+        "size": "3B",
+        "vramLora": "~10GB",
+        "desc": "実用エッジ",
+        "epochs": 3,
+        "lr": 0.0002,
+        "batch": 2,
+        "accum": 8,
+        "r": 16,
+        "alpha": 32,
+        "maxLen": 2048
+      },
+      {
+        "value": "Qwen/Qwen2.5-7B-Instruct",
+        "size": "7B",
+        "vramLora": "~22GB",
+        "desc": "本命・推奨",
+        "epochs": 3,
+        "lr": 0.0002,
+        "batch": 1,
+        "accum": 16,
+        "r": 32,
+        "alpha": 64,
+        "maxLen": 2048
+      },
+      {
+        "value": "Qwen/Qwen2.5-14B-Instruct",
+        "size": "14B",
+        "vramLora": "~40GB",
+        "desc": "高品質、要マルチGPU",
+        "epochs": 2,
+        "lr": 0.0001,
+        "batch": 1,
+        "accum": 32,
+        "r": 64,
+        "alpha": 128,
+        "maxLen": 2048
+      },
+      {
+        "value": "google/gemma-2-9b-it",
+        "size": "9B",
+        "vramLora": "~26GB",
+        "desc": "Google Gemma 2",
+        "epochs": 3,
+        "lr": 0.0002,
+        "batch": 1,
+        "accum": 16,
+        "r": 32,
+        "alpha": 64,
+        "maxLen": 2048
+      },
+      {
+        "value": "meta-llama/Llama-3.1-8B-Instruct",
+        "size": "8B",
+        "vramLora": "~24GB",
+        "desc": "Llama 3.1 (要HF token)",
+        "epochs": 3,
+        "lr": 0.0002,
+        "batch": 1,
+        "accum": 16,
+        "r": 32,
+        "alpha": 64,
+        "maxLen": 2048
+      }
     ]
   },
   "webSearch": true,
@@ -135,12 +219,19 @@
     "model": "irodori-tts",
     "defaultVoice": "none",
     "defaultFormat": "wav",
-    "defaultSpeed": 1.0,
+    "defaultSpeed": 1,
     "captionField": "caption",
     "irodori": {},
     "timeoutMs": 180000,
     "command": "/home/[user]/Irodori-TTS-Server/venv/bin/python",
-    "args": ["-m", "irodori_openai_tts", "--host", "127.0.0.1", "--port", "8088"],
+    "args": [
+      "-m",
+      "irodori_openai_tts",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "8088"
+    ],
     "cwd": "/home/[user]/Irodori-TTS-Server",
     "env": {
       "HSA_OVERRIDE_GFX_VERSION": "12.0.1",
@@ -150,10 +241,207 @@
     "idleUnloadMs": 600000
   },
   "ttsVoices": [
-    { "name": "標準", "desc": "参照音声なし（VoiceDesign/既定話者）", "voiceId": "none" },
-    { "name": "30代男性", "desc": "落ち着いた30代男性の声", "instructions": "落ち着いた低めの30代男性の声で、明瞭で穏やかに、自然に読み上げてください。" },
-    { "name": "20代女性", "desc": "明るい20代女性の声", "instructions": "やや高めで明るい20代女性の声で、親しみやすく元気に読み上げてください。" }
+    {
+      "name": "標準",
+      "desc": "参照音声なし（VoiceDesign/既定話者）",
+      "voiceId": "none"
+    },
+    {
+      "name": "30代男性",
+      "desc": "落ち着いた30代男性の声",
+      "instructions": "落ち着いた低めの30代男性の声で、明瞭で穏やかに、自然に読み上げてください。"
+    },
+    {
+      "name": "20代女性",
+      "desc": "明るい20代女性の声",
+      "instructions": "やや高めで明るい20代女性の声で、親しみやすく元気に読み上げてください。"
+    }
   ],
+  "orchestration": {
+    "enabled": true,
+    "poolMode": "auto",
+    "portRange": [
+      8100,
+      8149
+    ],
+    "maxResident": 3,
+    "workerParallel": 1,
+    "workerHost": "127.0.0.1",
+    "idleUnloadMs": 600000,
+    "vramSafetyMarginMB": 2048,
+    "reuseMainChat": true,
+    "swapUnloadsMainChat": true,
+    "relayMaxChars": 6000,
+    "includeBaseSystemPrompt": true,
+    "stopOnNodeError": false,
+    "acquireTimeoutMs": 600000,
+    "defaultWorkflow": "",
+    "workflows": [
+      {
+        "id": "wf_ensemble",
+        "name": "並列合議",
+        "description": "複数モデルに同じ質問を投げ、統合役が1つの回答にまとめる（品質重視）",
+        "nodes": [
+          {
+            "id": "expert1",
+            "type": "llm",
+            "label": "専門家A（厳密）",
+            "model": "Gemma4 31B",
+            "inputs": [],
+            "role": "あなたは論理的で厳密な専門家です。事実関係と正確さを最優先し、不確かな点は不確かだと明示してください。"
+          },
+          {
+            "id": "expert2",
+            "type": "llm",
+            "label": "専門家B（発想）",
+            "model": "Qwen3.6 35B-A3B[MoE]",
+            "inputs": [],
+            "role": "あなたは発想力のある専門家です。多角的な視点や、見落とされがちな観点・代替案を挙げてください。"
+          },
+          {
+            "id": "merge",
+            "type": "aggregate",
+            "label": "統合",
+            "model": "Qwen3.6 35B-A3B[MoE]",
+            "inputs": [
+              "expert1",
+              "expert2"
+            ],
+            "role": "あなたは複数の意見を統合する編集者です。",
+            "instruction": "2つの回答を突き合わせ、矛盾があれば妥当な方を採用し、抜けを補って1つの完成した回答にまとめてください。どちらが何を言ったかの説明は不要で、完成した回答本文だけを書いてください。"
+          },
+          {
+            "id": "out",
+            "type": "output",
+            "label": "最終回答",
+            "inputs": [
+              "merge"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "wf_router",
+        "name": "ルーター振り分け",
+        "description": "小型モデルが質問を判定し、最適な1モデルにだけ処理させる（速度・VRAM効率重視）",
+        "nodes": [
+          {
+            "id": "router",
+            "type": "router",
+            "label": "振り分け",
+            "model": "Qwen2.5 0.5B",
+            "inputs": [],
+            "routes": [
+              {
+                "label": "コード・技術",
+                "description": "プログラミング、エラー解析、設計、技術的な質問",
+                "target": "coder"
+              },
+              {
+                "label": "一般・文章",
+                "description": "雑談、要約、文章作成、その他一般的な質問",
+                "target": "general"
+              }
+            ]
+          },
+          {
+            "id": "coder",
+            "type": "llm",
+            "label": "コード担当",
+            "model": "Qwen3.6 35B-A3B[MoE]",
+            "inputs": [],
+            "role": "あなたは熟練のソフトウェアエンジニアです。コードは省略せず、そのまま動作する完全な形で提示してください。"
+          },
+          {
+            "id": "general",
+            "type": "llm",
+            "label": "一般担当",
+            "model": "Gemma4 31B",
+            "inputs": [],
+            "role": "あなたは親切で分かりやすい説明が得意なアシスタントです。"
+          }
+        ]
+      },
+      {
+        "id": "wf_pipeline",
+        "name": "下書き→推敲",
+        "description": "高速モデルが下書きし、高品質モデルが批評・推敲して仕上げる",
+        "nodes": [
+          {
+            "id": "draft",
+            "type": "llm",
+            "label": "下書き",
+            "model": "Qwen2.5 0.5B",
+            "inputs": [],
+            "role": "あなたは素早く要点を押さえた下書きを作る担当です。細部の完璧さより、論点の網羅を優先してください。"
+          },
+          {
+            "id": "refine",
+            "type": "llm",
+            "label": "推敲",
+            "model": "Qwen3.6 35B-A3B[MoE]",
+            "inputs": [
+              "draft"
+            ],
+            "role": "あなたは厳しい編集者です。",
+            "instruction": "下書きの誤り・不足・冗長な部分を直し、完成した回答として書き直してください。「下書きを修正しました」等の前置きは不要で、完成版の本文だけを出力してください。"
+          },
+          {
+            "id": "out",
+            "type": "output",
+            "label": "最終回答",
+            "inputs": [
+              "refine"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "wf_debate",
+        "name": "討論→結論",
+        "description": "2モデルが賛否に分かれて議論し、司会役が結論をまとめる（判断が割れる問い向け）",
+        "nodes": [
+          {
+            "id": "debate",
+            "type": "debate",
+            "label": "討論",
+            "rounds": 2,
+            "participants": [
+              {
+                "model": "Gemma4 31B",
+                "label": "賛成派",
+                "role": "あなたは提案に賛成する立場です。利点と実現性を具体的に主張してください。"
+              },
+              {
+                "model": "Qwen3.6 35B-A3B[MoE]",
+                "label": "反対派",
+                "role": "あなたは提案に慎重な立場です。リスクと見落としを具体的に指摘してください。"
+              }
+            ]
+          },
+          {
+            "id": "conclude",
+            "type": "aggregate",
+            "label": "結論",
+            "model": "Qwen3.6 35B-A3B[MoE]",
+            "inputs": [
+              "debate"
+            ],
+            "role": "あなたは中立な司会者です。",
+            "instruction": "討論を踏まえ、双方の妥当な指摘を取り入れたうえで、ユーザーへの最終的な結論と理由を簡潔にまとめてください。"
+          },
+          {
+            "id": "out",
+            "type": "output",
+            "label": "最終回答",
+            "inputs": [
+              "conclude"
+            ]
+          }
+        ]
+      }
+    ]
+  },
   "ragTopK": 30,
   "ragMode": "agentic",
   "systemPrompts": {

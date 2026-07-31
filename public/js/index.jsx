@@ -732,6 +732,128 @@ function ThinkingBlock({ thinking, isStreaming }) {
   );
 }
 
+// ════════════════════════════════════════════════
+// マルチLLMオーケストレーション
+// ════════════════════════════════════════════════
+
+// ノード種別のメタ情報（ラベル・アイコン・説明）
+const ORCH_NODE_TYPES = [
+  { value: 'llm', icon: '🤖', label: 'LLM', desc: '1つのモデルに処理させる基本ノード' },
+  { value: 'aggregate', icon: '🧩', label: '統合', desc: '複数の上流ノードの出力を1つにまとめる' },
+  { value: 'router', icon: '🔀', label: 'ルーター', desc: 'モデルに分岐先を選ばせる。選ばれなかった枝は実行されない' },
+  { value: 'debate', icon: '💬', label: '討論', desc: '複数モデルが複数ラウンド議論する' },
+  { value: 'output', icon: '🎯', label: '最終出力', desc: 'ユーザーへの回答にするノードを指定する' },
+];
+
+function orchNodeMeta(type) {
+  return ORCH_NODE_TYPES.find(t => t.value === type) || ORCH_NODE_TYPES[0];
+}
+
+// ─── 実行中の進捗パネル（チャット内に表示） ───
+function OrchestraPanel({ orch }) {
+  const [openNodes, setOpenNodes] = useState({});
+  const [showVram, setShowVram] = useState(false);
+  if (!orch) return null;
+
+  const modeLabel = orch.mode === 'resident' ? '常駐並列'
+    : orch.mode === 'swap' ? '逐次スワップ' : '判定中';
+  const gb = (mb) => (mb / 1024).toFixed(1);
+  const doneCount = (orch.nodes || []).filter(n => n.status === 'done' || n.status === 'skipped').length;
+  const total = (orch.nodes || []).filter(n => n.type !== 'output').length || (orch.nodes || []).length;
+
+  return (
+    <div className="orch-panel">
+      <div className="orch-panel-header">
+        <span className={`orch-panel-dot ${orch.status === 'running' ? '' : 'done'}`} />
+        <span className="orch-panel-title">🎼 {orch.workflowName || 'オーケストレーション'}</span>
+        <span className={`orch-mode-badge ${orch.mode || ''}`} title={orch.reason || ''}>{modeLabel}</span>
+        <span className="orch-panel-count">{doneCount}/{total}</span>
+      </div>
+      {orch.reason && (
+        <div className={`orch-panel-reason ${orch.shortageVramMB > 0 ? 'short' : ''}`}>
+          {orch.shortageVramMB > 0 && <span className="orch-short-badge">VRAM不足</span>}
+          {orch.reason}
+        </div>
+      )}
+      {/* VRAMの内訳。「なぜ足りないのか」をモデル単位で示す */}
+      {orch.vramBreakdown && orch.vramBreakdown.length > 0 && (
+        <div className="orch-vram-box">
+          <button className="orch-vram-toggle" onClick={() => setShowVram(v => !v)}>
+            <span className={`orch-node-caret ${showVram ? 'open' : ''}`}>▶</span>
+            VRAM内訳（必要 {gb(orch.requiredVramMB)}GB ／ 空き {gb(orch.freeVramMB)}GB）
+          </button>
+          {showVram && (
+            <div className="orch-vram-list">
+              {orch.vramBreakdown.map(m => (
+                <div key={m.name} className={`orch-vram-row ${m.alreadyLoaded ? 'loaded' : ''}`}>
+                  <div className="orch-vram-name">
+                    {m.name}
+                    <span className="orch-vram-ctx">ctx {Math.round(m.ctx / 1024)}k</span>
+                    {m.alreadyLoaded && <span className="orch-vram-tag">ロード済み・追加消費なし</span>}
+                    {!m.exact && <span className="orch-vram-tag approx">概算</span>}
+                  </div>
+                  <div className="orch-vram-detail">
+                    重み {gb(m.weightsMB)} ＋ KVキャッシュ {gb(m.kvMB)} ＋ 予備 {gb(m.overheadMB)}
+                    <strong className="orch-vram-total">= {gb(m.totalMB)}GB</strong>
+                  </div>
+                </div>
+              ))}
+              <div className="orch-vram-sum">
+                合計 {gb(orch.requiredVramMB)}GB ＋ 安全余裕 {gb(orch.marginVramMB)}GB
+                {' '}{orch.shortageVramMB > 0 ? '＞' : '≦'} 空きVRAM {gb(orch.freeVramMB)}GB
+                {orch.shortageVramMB > 0 && (
+                  <span className="orch-vram-short">（{gb(orch.shortageVramMB)}GB 不足）</span>
+                )}
+              </div>
+              {orch.shortageVramMB > 0 && (
+                <div className="orch-vram-tips">
+                  VRAMを減らすには: モデルの <code>ctx</code> を小さくする（KVキャッシュが比例して減ります）／
+                  ワークフローで使うモデルを減らす／小さいモデルに置き換える
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+      {orch.degradedReason && (
+        <div className="orch-panel-degraded">⚠️ {orch.degradedReason}</div>
+      )}
+      <div className="orch-node-list">
+        {(orch.nodes || []).filter(n => n.type !== 'output').map(n => {
+          const meta = orchNodeMeta(n.type);
+          const isOpen = !!openNodes[n.id];
+          const statusIcon = n.status === 'done' ? '✅'
+            : n.status === 'error' ? '❌'
+            : n.status === 'skipped' ? '⏭️'
+            : n.status === 'running' ? '⏳' : '⚪';
+          return (
+            <div key={n.id} className={`orch-node ${n.status || 'pending'}`}>
+              <div className="orch-node-head" onClick={() => setOpenNodes(p => ({ ...p, [n.id]: !p[n.id] }))}>
+                <span className="orch-node-status">{statusIcon}</span>
+                <span className="orch-node-icon">{meta.icon}</span>
+                <span className="orch-node-label">{n.label}</span>
+                {n.model && <span className="orch-node-model">{n.model}</span>}
+                {n.speaker && n.status === 'running' && (
+                  <span className="orch-node-speaker">{n.speaker}（{n.round}巡目）</span>
+                )}
+                {n.ms > 0 && <span className="orch-node-ms">{(n.ms / 1000).toFixed(1)}s</span>}
+                {(n.text || n.error) && (
+                  <span className={`orch-node-caret ${isOpen ? 'open' : ''}`}>▶</span>
+                )}
+              </div>
+              {n.error && <div className="orch-node-error">{n.error}</div>}
+              {isOpen && n.text && (
+                <div className="orch-node-body">{n.text}</div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      {orch.error && <div className="orch-panel-error">⚠️ {orch.error}</div>}
+    </div>
+  );
+}
+
 function App() {
   // ─── 認証 ───
   const [authenticated, setAuthenticated] = useState(false);
@@ -854,6 +976,10 @@ function App() {
   const [fileList, setFileList] = useState([]);
   const [chatTitle, setChatTitle] = useState('');
   const [chatRole, setChatRole] = useState('');  // ユーザーがチャット開始時に設定したLLMの役割
+
+  // ─── マルチLLMオーケストレーション ───
+  const [orchInfo, setOrchInfo] = useState({ enabled: false, workflows: [], models: [] });
+  const [orchWorkflowId, setOrchWorkflowId] = useState('');   // '' = OFF（通常チャット）
   const [showRoleEditor, setShowRoleEditor] = useState(false);  // 役割エディタの表示状態
   const [chatLoading, setChatLoading] = useState(false);
   const saveTimerRef = useRef(null);
@@ -934,6 +1060,35 @@ function App() {
       clearInterval(slowIntervalId);
     };
   }, [authenticated, fetchModels, connected, modelStarting]);
+
+  // ─── オーケストレーション情報の取得 ───
+  const fetchOrchInfo = useCallback(async () => {
+    try {
+      const res = await fetch('/orchestra/info');
+      if (!res.ok) return;
+      const d = await res.json();
+      setOrchInfo(d);
+      setOrchWorkflowId(prev => {
+        // 機能が無効化された / editconfig でワークフローが消された場合は選択を解除し、
+        // 通常のモデル選択に戻す（存在しないIDのまま送信できてしまうのを防ぐ）
+        if (!d.enabled) return '';
+        if (prev) return (d.workflows || []).some(w => w.id === prev) ? prev : '';
+        // 既定ワークフローが設定されていれば初期選択する
+        if (d.defaultWorkflow && (d.workflows || []).some(w => w.id === d.defaultWorkflow)) {
+          return d.defaultWorkflow;
+        }
+        return prev;
+      });
+    } catch { /* 未対応サーバーでは無視 */ }
+  }, []);
+
+  // 起動時に加え、editconfig 側でワークフローを編集した場合に追従するため定期取得する
+  useEffect(() => {
+    if (!authenticated) return;
+    fetchOrchInfo();
+    const id = setInterval(fetchOrchInfo, 30000);
+    return () => clearInterval(id);
+  }, [authenticated, fetchOrchInfo]);
 
   // ─── GPU 監視 (SSE) ───
   useEffect(() => {
@@ -1096,10 +1251,187 @@ function App() {
     return null;
   }
 
+  // ─── マルチLLMオーケストレーション実行 ───
+  // 通常チャット（フロント側でツール判断→llama-serverへ）とは別経路で、
+  // サーバーの /orchestra/run にワークフロー実行を委譲し、SSEで進捗を受け取る。
+  async function runOrchestration(text) {
+    const wf = (orchInfo.workflows || []).find(w => w.id === orchWorkflowId);
+    if (!wf) {
+      setError('選択中のワークフローが見つかりません。設定を確認してください。');
+      return;
+    }
+
+    // 進捗はミュータブルに更新し、一定間隔でだけ state に反映する（描画負荷対策）
+    const orch = {
+      workflowName: wf.name, status: 'running', mode: null, reason: '',
+      nodes: [], freeVramMB: null, requiredVramMB: null, error: '',
+    };
+
+    setMessages(prev => [...prev,
+      { role: 'user', content: text },
+      { role: 'assistant', content: '', orchestra: orch },
+    ]);
+    messagesDirtyRef.current = true;
+    setInput('');
+    if (inputRef.current) inputRef.current.style.height = 'auto';
+    setIsLoading(true);
+    setError('');
+    autoScrollRef.current = true;
+    lastProgScrollRef.current = 0;
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    // 直近履歴（オーケストレーションは画像非対応のためテキストのみ送る）
+    const RECENT = appConfig.recentMessageCount || 6;
+    const history = messages.slice(-RECENT)
+      .filter(m => typeof m.content === 'string' && m.content)
+      .map(m => ({ role: m.role, content: m.content }));
+
+    let finalText = '';
+    let flushTimer = null;
+    const flush = () => {
+      flushTimer = null;
+      // <think> は ThinkingBlock に分離して表示する（通常チャットと揃える）
+      const thinkMatch = finalText.match(/<think>([\s\S]*?)(?:<\/think>|$)/i);
+      const thinking = thinkMatch ? thinkMatch[1].trim() : '';
+      const content = finalText.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').trim();
+      setMessages(prev => {
+        const next = [...prev];
+        const idx = next.length - 1;
+        if (idx >= 0 && next[idx].role === 'assistant') {
+          next[idx] = {
+            ...next[idx],
+            content,
+            thinking: thinking || undefined,
+            orchestra: { ...orch, nodes: orch.nodes.map(n => ({ ...n })) },
+          };
+        }
+        return next;
+      });
+    };
+    const scheduleFlush = () => { if (!flushTimer) flushTimer = setTimeout(flush, 80); };
+    const findNode = (id) => orch.nodes.find(n => n.id === id);
+
+    try {
+      const res = await fetch('/orchestra/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workflowId: wf.id, query: text, history, role: chatRole }),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { msg = (await res.json()).error || msg; } catch {}
+        throw new Error(msg);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let sep;
+        while ((sep = buf.indexOf('\n\n')) >= 0) {
+          const chunk = buf.slice(0, sep);
+          buf = buf.slice(sep + 2);
+          const line = chunk.split('\n').find(l => l.startsWith('data:'));
+          if (!line) continue;
+          let ev;
+          try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
+
+          if (ev.type === 'plan') {
+            orch.mode = ev.mode;
+            orch.reason = ev.reason;
+            orch.freeVramMB = ev.freeVramMB;
+            orch.requiredVramMB = ev.requiredVramMB;
+            orch.marginVramMB = ev.marginVramMB;
+            orch.shortageVramMB = ev.shortageVramMB;
+            orch.vramBreakdown = ev.vramBreakdown;
+            orch.nodes = (ev.nodes || []).map(n => ({
+              id: n.id, label: n.label, model: n.model, type: n.type,
+              status: 'pending', text: '', ms: 0,
+            }));
+          } else if (ev.type === 'degraded') {
+            // ワーカーが落ちて逐次スワップに切り替わった
+            orch.mode = ev.mode;
+            orch.degradedReason = ev.reason;
+          } else if (ev.type === 'node_start') {
+            const n = findNode(ev.id);
+            if (n) { n.status = 'running'; n.text = ''; n.error = null; }
+          } else if (ev.type === 'node_delta') {
+            const n = findNode(ev.id);
+            if (n) n.text += ev.delta;
+          } else if (ev.type === 'node_speaker') {
+            const n = findNode(ev.id);
+            if (n) {
+              n.speaker = ev.label;
+              n.round = ev.round;
+              n.text += `${n.text ? '\n\n' : ''}【${ev.label}・${ev.round}巡目】\n`;
+            }
+          } else if (ev.type === 'node_route') {
+            const n = findNode(ev.id);
+            if (n) { n.text = `→ ${ev.label}`; n.route = ev.label; }
+          } else if (ev.type === 'node_done') {
+            const n = findNode(ev.id);
+            if (n) { n.status = 'done'; n.ms = ev.ms; if (ev.text) n.text = ev.text; n.speaker = null; }
+          } else if (ev.type === 'node_skipped') {
+            const n = findNode(ev.id);
+            if (n) n.status = 'skipped';
+          } else if (ev.type === 'node_error') {
+            const n = findNode(ev.id);
+            if (n) { n.status = 'error'; n.error = ev.error; }
+          } else if (ev.type === 'final') {
+            finalText = ev.text || '';
+          } else if (ev.type === 'done') {
+            orch.status = 'done';
+          } else if (ev.type === 'error') {
+            orch.status = 'error';
+            orch.error = ev.error;
+          }
+          scheduleFlush();
+        }
+      }
+      if (!finalText && orch.status !== 'error') {
+        orch.error = '最終出力が得られませんでした。各ノードの結果を確認してください。';
+      }
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        orch.status = 'done';
+        orch.error = '生成を停止しました。';
+      } else {
+        orch.status = 'error';
+        orch.error = e.message;
+        setError(`オーケストレーション実行エラー: ${e.message}`);
+      }
+    } finally {
+      if (flushTimer) clearTimeout(flushTimer);
+      if (orch.status === 'running') orch.status = 'done';
+      flush();
+      setIsLoading(false);
+      abortRef.current = null;
+    }
+  }
+
   async function sendMessage() {
     const text = input.trim();
     const hasImages = chatImages.length > 0;
-    if ((!text && !hasImages) || isLoading || !chatModel) return;
+    if ((!text && !hasImages) || isLoading) return;
+
+    // モデル選択でマルチLLMワークフローが選ばれている場合は、
+    // 通常のツール判断・RAG経路ではなくサーバー側のオーケストレータに委譲する。
+    // ワークフローは自前でワーカーを起動するため chatModel のロード状態は問わない
+    if (orchInfo.enabled && orchWorkflowId) {
+      if (hasImages) {
+        setError('マルチLLMワークフローでは画像を送信できません。単一モデルに切り替えてください。');
+        return;
+      }
+      return runOrchestration(text);
+    }
+
+    if (!chatModel) return;
 
     // モデル未ロード時は送信できない（ただし firstLoadPending = 初回ロード待ち、または autoUnloadedName = アイドルアンロード状態 は送信時にロードするのでOK）
     if (!modelReady && !firstLoadPending && !autoUnloadedName) {
@@ -4285,6 +4617,9 @@ ${conversationText}
           const s = await setRes.json();
           if (s.chatModel) setChatModel(s.chatModel);
           else if (cfg?.defaultModel) setChatModel(cfg.defaultModel);
+          // 前回マルチLLMワークフローを選んでいたら復元する
+          // （存在しないIDだった場合は fetchOrchInfo 側で解除される）
+          if (s.orchWorkflow) setOrchWorkflowId(s.orchWorkflow);
         } else if (cfg?.defaultModel) {
           setChatModel(cfg.defaultModel);
         }
@@ -4332,12 +4667,12 @@ ${conversationText}
         await fetch('/settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chatModel }),
+          body: JSON.stringify({ chatModel, orchWorkflow: orchWorkflowId }),
         });
       } catch {}
     }, 500);
     return () => clearTimeout(t);
-  }, [chatModel]);
+  }, [chatModel, orchWorkflowId]);
 
   // chatModel変更時、llama-serverのチャットモデルをロード（リスタート）
   useEffect(() => {
@@ -4544,10 +4879,16 @@ ${conversationText}
                 チャットモデル
                 {isLoading && <span className="setting-locked-hint" title="生成中はモデルを切り替えられません">🔒</span>}
               </span>
+              {/* 単一モデルと、マルチLLMワークフロー(config.jsonで定義)を同じ場所から選ぶ。
+                  ワークフローは値を "wf:<id>" にして通常のモデル名と区別する */}
               <select
                 className="setting-input"
-                value={chatModel}
-                onChange={e => setChatModel(e.target.value)}
+                value={orchWorkflowId ? `wf:${orchWorkflowId}` : chatModel}
+                onChange={e => {
+                  const v = e.target.value;
+                  if (v.startsWith('wf:')) setOrchWorkflowId(v.slice(3));
+                  else { setOrchWorkflowId(''); setChatModel(v); }
+                }}
                 disabled={isLoading}
                 title={isLoading ? '生成中はモデルを切り替えられません。停止してからやり直してください。' : ''}
               >
@@ -4559,7 +4900,23 @@ ${conversationText}
                     : m;
                   return <option key={m} value={m}>{label}</option>;
                 })}
+                {orchInfo.enabled && (orchInfo.workflows || []).length > 0 && (
+                  <optgroup label="🎼 マルチLLM（ワークフロー）">
+                    {orchInfo.workflows.map(w => (
+                      <option key={w.id} value={`wf:${w.id}`} title={w.description || ''}>
+                        {w.name}（{(w.nodes || []).filter(n => n.type !== 'output').length}モデル）
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
               </select>
+              {orchWorkflowId && (
+                <div className="orch-selected-hint">
+                  {(orchInfo.workflows.find(w => w.id === orchWorkflowId) || {}).description
+                    || '複数モデルが連携して回答します'}
+                  <span className="orch-selected-note">ツール実行・画像添付は使えません</span>
+                </div>
+              )}
             </div>
             <div className="nav-link-row">
               <a className="tuning-link" href="/tuning.html" title="ファインチューニング管理画面を開く">
@@ -4757,7 +5114,10 @@ ${conversationText}
             <button className="menu-btn" onClick={() => setSidebarOpen(!sidebarOpen)}>☰</button>
             <div className={`status-dot ${connected ? 'connected' : ''}`} />
             <span className="chat-header-title">
-              {connected ? chatModel || 'モデル未選択' : 'llama.cpp未接続'}
+              {!connected ? 'llama.cpp未接続'
+                : orchWorkflowId
+                  ? `🎼 ${(orchInfo.workflows.find(w => w.id === orchWorkflowId) || {}).name || 'マルチLLM'}`
+                  : chatModel || 'モデル未選択'}
             </span>
             {messages.length > 0 && (
               <>
@@ -4923,6 +5283,7 @@ ${conversationText}
                       ))}
                     </div>
                   )}
+                  {msg.orchestra && <OrchestraPanel orch={msg.orchestra} />}
                   {msg.role === 'assistant' ? (
                     <div className="msg-bubble">
                       <MarkdownContent content={msg.content} />
@@ -5111,9 +5472,11 @@ ${conversationText}
                 <button
                   className="send-btn"
                   onClick={sendMessage}
-                  disabled={(!input.trim() && chatImages.length === 0) || !connected || embeddingJobs.length > 0 || (!modelReady && !firstLoadPending && !autoUnloadedName)}
+                  disabled={(!input.trim() && chatImages.length === 0) || !connected || embeddingJobs.length > 0
+                    || (!orchWorkflowId && !modelReady && !firstLoadPending && !autoUnloadedName)}
                   title={
-                    firstLoadPending ? '送信時にモデルをロードします'
+                    orchWorkflowId ? '送信時に必要なモデルを順次ロードします'
+                    : firstLoadPending ? '送信時にモデルをロードします'
                     : autoUnloadedName && !modelReady ? '送信時にモデルを再ロードします'
                     : !modelReady ? (modelStarting ? 'モデル起動中です' : 'モデルがロードされていません')
                     : embeddingJobs.length > 0 ? 'ドキュメントのEmbedding生成中です。完了までお待ちください'

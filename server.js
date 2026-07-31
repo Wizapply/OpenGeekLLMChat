@@ -8,6 +8,8 @@ const crypto = require('crypto');
 const os = require('os');
 const { WebSocketServer } = require('ws');
 const { startAgentServer } = require('./agent_proxy');
+const { createLlmPool } = require('./llm_pool');
+const { createOrchestrator, validateWorkflow } = require('./orchestrator');
 
 // systemd等で起動された際、カレントディレクトリをserver.jsと同じに固定する
 // これにより相対パスでアクセスされるリソース(モデルキャッシュ等)も安定動作する
@@ -109,6 +111,28 @@ const DEFAULT_CONFIG = {
     onlineIdleMs: 0,         // ワーカーのアイドル停止(ms)。0=常駐(学習途中のバッファ保護のため既定無効)
     onlineReadyTimeoutMs: 60000, // ワーカー起動待ちタイムアウト(ms)
   },
+  // ─── マルチLLMオーケストレーション設定 ───
+  // 複数の llama-server を別ポートで同時に立ち上げ、ユーザーが組んだワークフロー
+  // (ノードのつながり) に従って協調実行する。詳細は DESIGN.md 参照。
+  orchestration: {
+    enabled: false,           // 機能の有効化。workflows を1つ以上定義して使う
+    poolMode: 'auto',         // 'auto' | 'resident'(全同時常駐) | 'swap'(逐次載せ替え)
+    portRange: [8100, 8149],  // ワーカーllama-serverに割り当てるポート範囲
+    maxResident: 3,           // 同時常駐させるワーカー数の上限 (resident時)
+    workerParallel: 1,        // ワーカーの -np。2以上にすると同一モデルへ並列に投げられるが、
+                              // llama.cpp は ctx をスロット数で分割するため1回あたりの文脈が狭くなる
+    workerHost: '127.0.0.1',  // ワーカーのバインドアドレス (外部公開しないので localhost 推奨)
+    idleUnloadMs: 600000,     // ワーカーのアイドルアンロード(ms)。0で無効
+    vramSafetyMarginMB: 2048, // auto判定で確保しておく空きVRAMの余裕(MB)
+    reuseMainChat: true,      // メインチャットに同じモデルが載っていれば再利用する
+    swapUnloadsMainChat: true,// swap時にメインチャットモデルを一時アンロードして枠を空ける
+    relayMaxChars: 6000,      // 中間出力を下流ノードに渡すときの最大文字数
+    includeBaseSystemPrompt: true, // 各ノードに systemPrompts.base を含めるか
+    stopOnNodeError: false,   // ノード失敗時にワークフロー全体を中断するか
+    acquireTimeoutMs: 600000, // ワーカーの空き待ちタイムアウト(ms)
+    defaultWorkflow: '',      // チャット画面で初期選択するワークフローID (空=未選択)
+    workflows: [],            // ワークフロー定義。UIのエディタから編集・保存される
+  },
   ragTopK: 10,
   ragMode: 'agentic',
   systemPrompts: {
@@ -153,7 +177,7 @@ function loadConfig() {
     if (fs.existsSync(CONFIG_FILE)) {
       const userConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
       const merged = { ...DEFAULT_CONFIG, ...userConfig };
-      ['systemPrompts', 'agentContext', 'transcribe', 'llamaServer', 'embeddingModel', 'ml', 'irodoriTts'].forEach(key => {
+      ['systemPrompts', 'agentContext', 'transcribe', 'llamaServer', 'embeddingModel', 'ml', 'irodoriTts', 'orchestration'].forEach(key => {
         if (DEFAULT_CONFIG[key] && typeof DEFAULT_CONFIG[key] === 'object') {
           merged[key] = { ...DEFAULT_CONFIG[key], ...(userConfig[key] || {}) };
         }
@@ -263,20 +287,28 @@ function waitForTcpReady(host, port, timeoutMs) {
   });
 }
 
-function spawnLlamaServer(args, label) {
+// onOutput を渡すと、logLevel に関係なく出力を受け取れる（異常終了時の原因調査用）。
+// 画面へのエコーは従来どおり logLevel に従う。
+function spawnLlamaServer(args, label, onOutput) {
   const ls = appConfig.llamaServer;
   log('-', `[${label}] spawn: ${ls.binPath} ${args.join(' ')}`);
   const isQuiet = appConfig.logLevel === 'quiet';
   // 外部APIサーバー(label='ext:...')は強制的にログを出す（デバッグ用）
   const isExternal = label.startsWith('ext:');
-  const captureOutput = !isQuiet || isExternal;
+  const echo = !isQuiet || isExternal;
+  // onOutput が要求されていればパイプは必ず開く（quietでも中身は捨てない）
+  const capture = echo || !!onOutput;
   const proc = spawn(ls.binPath, args, {
-    stdio: captureOutput ? ['ignore', 'pipe', 'pipe'] : ['ignore', 'ignore', 'ignore'],
+    stdio: capture ? ['ignore', 'pipe', 'pipe'] : ['ignore', 'ignore', 'ignore'],
     env: { ...process.env },
   });
-  if (captureOutput) {
-    proc.stdout.on('data', (d) => process.stdout.write(`[${label}] ${d}`));
-    proc.stderr.on('data', (d) => process.stderr.write(`[${label}] ${d}`));
+  if (capture) {
+    const handle = (d) => {
+      if (onOutput) { try { onOutput(d.toString()); } catch {} }
+      if (echo) process.stdout.write(`[${label}] ${d}`);
+    };
+    proc.stdout.on('data', handle);
+    proc.stderr.on('data', handle);
   }
   proc.on('exit', (code) => log('-', `[${label}] exited with code ${code}`));
   return proc;
@@ -618,6 +650,70 @@ function stopAllExternalServers() {
   for (const [id] of externalServers) {
     stopExternalServer(id);
   }
+}
+
+// ════════════════════════════════════════════════
+// マルチLLMオーケストレーション (llm_pool + orchestrator)
+// ════════════════════════════════════════════════
+// メインチャット (chatProc) は1モデルしか持てないため、複数モデルの協調実行用に
+// 独立したワーカープールを用意する。ワーカーは llamaServer とは別ポート
+// (orchestration.portRange) で起動し、使い終わるとアイドルアンロードされる。
+
+const llmPool = createLlmPool({
+  getConfig: () => appConfig,
+  findModelByName,
+  spawnLlamaServer,
+  waitForReady,
+  log,
+  getGpuInfo: () => cachedGpuData,
+  // 外部APIサーバーが使用中のポートは避ける
+  isPortTaken: (port) => {
+    for (const [, s] of externalServers) {
+      if (s.port === port && ((s.proc && !s.proc.killed) || s.agentHandle)) return true;
+    }
+    return false;
+  },
+  mainChat: {
+    getModel: () => chatProcModel,
+    isStarting: () => chatProcStarting || !chatProc,
+    getEndpoint: () => ({ host: appConfig.llamaServer.chatHost, port: appConfig.llamaServer.chatPort }),
+    touch: () => { chatLastUsed = Date.now(); },
+    // 一時アンロード。chatProcAutoUnloaded に控えておくことで、
+    // 次のチャットリクエスト時に既存の自動再ロード機構が同じモデルを戻してくれる
+    unload: async () => {
+      if (!chatProc) return;
+      chatProcAutoUnloaded = chatProcModel;
+      await stopChatModel();
+      chatLastUsed = 0;
+    },
+  },
+});
+
+const orchestrator = createOrchestrator({
+  pool: llmPool,
+  getConfig: () => appConfig,
+  findModelByName,
+  log,
+});
+
+// ワークフロー定義は config.json の orchestration.workflows に永続化する
+function listWorkflows() {
+  const o = appConfig.orchestration || {};
+  return Array.isArray(o.workflows) ? o.workflows : [];
+}
+
+function saveWorkflows(workflows) {
+  patchConfigFile(cfg => {
+    if (!cfg.orchestration || typeof cfg.orchestration !== 'object') cfg.orchestration = {};
+    cfg.orchestration.workflows = workflows;
+  });
+  // 再起動なしで即反映（ワークフローは実行時に参照されるだけなので安全）
+  if (!appConfig.orchestration) appConfig.orchestration = {};
+  appConfig.orchestration.workflows = workflows;
+}
+
+function generateWorkflowId() {
+  return 'wf_' + crypto.randomBytes(6).toString('hex');
 }
 
 // ════════════════════════════════════════════════
@@ -1019,6 +1115,8 @@ function stopEmbeddingModel() {
 function cleanup() {
   if (chatProc) try { chatProc.kill('SIGTERM'); } catch {}
   if (embedProc) try { embedProc.kill('SIGTERM'); } catch {}
+  // オーケストレーション用ワーカー
+  try { llmPool.killAll(); } catch {}
   // オンラインRLワーカー (SIGTERM で dirty なエージェントを自動 checkpoint)
   if (rlOnlineWorker && rlOnlineWorker.proc) try { rlOnlineWorker.proc.kill('SIGTERM'); } catch {}
   // 外部APIサーバーも全停止
@@ -1798,6 +1896,169 @@ app.post('/external-servers/:id/start', requireAuth, async (req, res) => {
     res.json({ ok: true, id: newId });
   } catch (e) {
     res.status(400).json({ error: e.message });
+  }
+});
+
+// ════════════════════════════════════════════════
+// マルチLLMオーケストレーション API (/orchestra)
+// ════════════════════════════════════════════════
+// ワークフローの CRUD はすべて config.json (orchestration.workflows) に反映される。
+// 実行 (/orchestra/run) は SSE でノード単位の進捗をストリーミングする。
+
+// 機能情報とワークフロー一覧（フロントの初期化用）
+app.get('/orchestra/info', requireAuth, (req, res) => {
+  const o = appConfig.orchestration || {};
+  res.json({
+    enabled: !!o.enabled,
+    poolMode: o.poolMode || 'auto',
+    defaultWorkflow: o.defaultWorkflow || '',
+    maxResident: o.maxResident ?? 3,
+    workflows: listWorkflows(),
+    models: chatModels.map(m => ({
+      name: m.name,
+      ctx: m.ctx,
+      estimatedVramMB: llmPool.estimateModelVramMB(m),
+    })),
+  });
+});
+
+app.get('/orchestra/workflows', requireAuth, (req, res) => {
+  res.json({ workflows: listWorkflows() });
+});
+
+// ワークフローの新規作成 / 更新（id があれば更新、なければ新規）
+app.post('/orchestra/workflows', requireAuth, jsonParser, (req, res) => {
+  const ip = getIP(req);
+  const wf = req.body || {};
+  const modelNames = chatModels.map(m => m.name);
+
+  if (!wf.id) wf.id = generateWorkflowId();
+  const v = validateWorkflow(wf, modelNames);
+  if (!v.ok) return res.status(400).json({ error: v.errors.join(' / '), errors: v.errors });
+
+  try {
+    const workflows = [...listWorkflows()];
+    const idx = workflows.findIndex(w => w.id === wf.id);
+    if (idx >= 0) workflows[idx] = wf;
+    else workflows.push(wf);
+    saveWorkflows(workflows);
+    log(ip, `ORCHESTRA WORKFLOW SAVE: ${wf.name} (${wf.id}, ${(wf.nodes || []).length}ノード)`);
+    res.json({ ok: true, workflow: wf });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/orchestra/workflows/:id', requireAuth, (req, res) => {
+  const ip = getIP(req);
+  const id = req.params.id;
+  try {
+    const workflows = listWorkflows().filter(w => w.id !== id);
+    if (workflows.length === listWorkflows().length) return res.status(404).json({ error: 'Not found' });
+    saveWorkflows(workflows);
+    log(ip, `ORCHESTRA WORKFLOW DELETE: ${id}`);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ワークフローの検証のみ（保存せずエディタ上でチェックする用）
+app.post('/orchestra/validate', requireAuth, jsonParser, (req, res) => {
+  const v = validateWorkflow(req.body || {}, chatModels.map(m => m.name));
+  let plan = null;
+  if (v.ok) {
+    const models = [];
+    for (const n of (req.body.nodes || [])) {
+      if (n.model) models.push(n.model);
+      for (const p of (n.participants || [])) if (p.model) models.push(p.model);
+    }
+    plan = llmPool.planMode(models);
+  }
+  res.json({ ok: v.ok, errors: v.errors, plan });
+});
+
+// ワーカープールの状態
+app.get('/orchestra/pool', requireAuth, (req, res) => {
+  res.json(llmPool.status());
+});
+
+// 全ワーカーをアンロード（VRAMを空けたいとき）
+app.post('/orchestra/pool/unload', requireAuth, async (req, res) => {
+  const ip = getIP(req);
+  log(ip, 'ORCHESTRA POOL UNLOAD ALL');
+  try {
+    await llmPool.unloadAll();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ワークフロー実行（SSE ストリーミング）
+// EventSource は POST に対応しないため、fetch + ReadableStream で読む前提の
+// text/event-stream レスポンスを返す。
+app.post('/orchestra/run', requireAuth, jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  const { workflowId, workflow: inlineWorkflow, query, history, role } = req.body || {};
+
+  const o = appConfig.orchestration || {};
+  if (!o.enabled) return res.status(400).json({ error: 'オーケストレーション機能が無効です (config.orchestration.enabled)' });
+  if (!query || typeof query !== 'string') return res.status(400).json({ error: 'query が必要です' });
+
+  // 保存済みワークフロー、またはエディタからの一時実行(inline)
+  const wf = inlineWorkflow || listWorkflows().find(w => w.id === workflowId);
+  if (!wf) return res.status(404).json({ error: `ワークフローが見つかりません: ${workflowId}` });
+
+  const v = validateWorkflow(wf, chatModels.map(m => m.name));
+  if (!v.ok) return res.status(400).json({ error: v.errors.join(' / '), errors: v.errors });
+
+  // ベースのシステムプロンプト（フロントの組み立てと揃える）
+  const dateStr = new Date().toLocaleDateString('ja-JP', {
+    year: 'numeric', month: 'long', day: 'numeric', weekday: 'long',
+  });
+  let baseSystem = (appConfig.systemPrompts?.base || '').replace(/\{date\}/g, dateStr);
+  if (role && String(role).trim()) {
+    baseSystem = '【最優先指示: ユーザー指定の役割】\n'
+      + '以下の役割・指示に厳密に従って応答してください。これは以降のどの一般的なルールよりも優先されます。\n\n'
+      + String(role).trim()
+      + '\n\n────────────────────\n\n'
+      + baseSystem;
+  }
+
+  log(ip, `ORCHESTRA RUN: ${wf.name} (${(wf.nodes || []).length}ノード)`);
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',   // nginx等のリバースプロキシでのバッファリング抑止
+  });
+
+  let clientGone = false;
+  // 注意: req の 'close' は「ボディを読み終えた時」にも発火するため切断判定に使えない
+  // （POSTボディをパースした直後に true になり、以降のイベントが全て捨てられてしまう）。
+  // レスポンス側の 'close' なら、切断か res.end() のどちらかでしか発火しない。
+  res.on('close', () => { clientGone = true; });
+
+  const send = (ev) => {
+    if (clientGone || res.writableEnded) return;
+    res.write(`data: ${JSON.stringify(ev)}\n\n`);
+  };
+
+  try {
+    await orchestrator.runWorkflow({
+      workflow: wf,
+      query,
+      history: Array.isArray(history) ? history.filter(m => m && m.role && typeof m.content === 'string') : [],
+      baseSystem,
+      onEvent: (ev) => { if (!clientGone) send(ev); },
+    });
+  } catch (e) {
+    log(ip, `ORCHESTRA RUN ERROR: ${e.message}`);
+    send({ type: 'error', error: e.message });
+  } finally {
+    if (!res.writableEnded) res.end();
   }
 });
 
