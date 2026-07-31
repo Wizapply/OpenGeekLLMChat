@@ -790,11 +790,21 @@ function OrchestraPanel({ orch }) {
                     {m.name}
                     <span className="orch-vram-ctx">ctx {Math.round(m.ctx / 1024)}k</span>
                     {m.alreadyLoaded && <span className="orch-vram-tag">ロード済み・追加消費なし</span>}
+                    {m.source === 'measured' && <span className="orch-vram-tag measured">実測値</span>}
                     {!m.exact && <span className="orch-vram-tag approx">概算</span>}
                   </div>
                   <div className="orch-vram-detail">
                     重み {gb(m.weightsMB)} ＋ KVキャッシュ {gb(m.kvMB)} ＋ 予備 {gb(m.overheadMB)}
                     <strong className="orch-vram-total">= {gb(m.totalMB)}GB</strong>
+                  </div>
+                  {/* KVの算出根拠。数値がおかしいときに何を読んだか分かるように出す */}
+                  <div className="orch-vram-meta">
+                    {m.source === 'measured'
+                      ? 'KV算出: llama-server が報告した実測値'
+                      : m.layers
+                        ? `KV算出: ${m.arch || 'unknown'} / ${m.layers}層 × KV${m.kvHeads}ヘッド × ${m.headDim}次元`
+                          + (m.swa > 0 ? ` / 窓${m.swa}` : '')
+                        : 'KV算出: GGUFを読めず概算（初回ロード後に実測値へ置き換わります）'}
                   </div>
                 </div>
               ))}

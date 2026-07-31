@@ -364,13 +364,26 @@ function OrchestraEditor({ hasUnsavedText, onSaved }) {
                   <table className="orch-vram-table">
                     <tbody>
                       {plan.breakdown.map(m => (
-                        <tr key={m.name}>
-                          <td>{m.name}</td>
-                          <td className="num">ctx {Math.round(m.ctx / 1024)}k</td>
-                          <td className="num">重み {(m.weightsMB / 1024).toFixed(1)}</td>
-                          <td className="num">KV {(m.kvMB / 1024).toFixed(1)}</td>
-                          <td className="num total">計 {(m.totalMB / 1024).toFixed(1)}GB</td>
-                        </tr>
+                        <React.Fragment key={m.name}>
+                          <tr>
+                            <td>{m.name}</td>
+                            <td className="num">ctx {Math.round(m.ctx / 1024)}k</td>
+                            <td className="num">重み {(m.weightsMB / 1024).toFixed(1)}</td>
+                            <td className="num">KV {(m.kvMB / 1024).toFixed(1)}</td>
+                            <td className="num total">計 {(m.totalMB / 1024).toFixed(1)}GB</td>
+                          </tr>
+                          {/* KVの算出根拠。値がおかしいときに何を読んだか分かるように出す */}
+                          <tr className="meta">
+                            <td colSpan={5}>
+                              {m.source === 'measured'
+                                ? 'KV算出: llama-server が報告した実測値'
+                                : m.layers
+                                  ? `KV算出: ${m.arch || 'unknown'} / ${m.layers}層 × KV${m.kvHeads}ヘッド × ${m.headDim}次元`
+                                    + (m.swa > 0 ? ` / 窓${m.swa}` : '')
+                                  : 'KV算出: GGUFを読めず概算（初回ロード後に実測値へ置き換わります）'}
+                            </td>
+                          </tr>
+                        </React.Fragment>
                       ))}
                       <tr className="sum">
                         <td colSpan={4}>

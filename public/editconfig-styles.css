@@ -777,3 +777,11 @@ body {
   padding: 0 4px;
   border-radius: 3px;
 }
+.orch-vram-table tr.meta td {
+  border-top: none;
+  padding-top: 0;
+  padding-left: 14px;
+  font-size: 10px;
+  color: var(--text-muted);
+  opacity: 0.8;
+}

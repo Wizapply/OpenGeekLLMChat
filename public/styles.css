@@ -3344,3 +3344,11 @@
     padding: 0 4px;
     border-radius: 3px;
   }
+  .orch-vram-meta {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    opacity: 0.75;
+    margin-top: 1px;
+  }
+  .orch-vram-tag.measured { color: var(--green); border: 1px solid var(--green); }

@@ -821,6 +821,7 @@ opengeek-llm-chat/
 ├── rl_common.py                # 強化学習の共通ロジック (Qネット構築・状態エンコード・損失計算)
 ├── agent_proxy.js              # 外部API用ツール対応モード (OpenAI互換 + エージェントループ)
 ├── llm_pool.js                 # マルチLLMワーカープール (複数llama-server同時起動・VRAM自動判定)
+├── gguf_info.js                # GGUFのVRAM見積り診断ツール (node gguf_info.js で全モデル診断)
 ├── orchestrator.js             # マルチLLMオーケストレーション実行エンジン (ワークフローDAG実行)
 ├── public/
 │   ├── index.html              # React SPA（チャットUI）
@@ -2659,8 +2660,51 @@ Qwen3.6 35B-A3B     ctx 32k
 合計 46.1GB ＋ 安全余裕 2.0GB ≦ 空きVRAM 59.6GB
 ```
 
-KVキャッシュのサイズは GGUF のヘッダ（層数・KVヘッド数・ヘッド次元）から実際に計算しています。
-Gemma3系のスライディングウィンドウ注意も考慮されます。
+各行の下には、その数字がどこから来たかが出ます。
+
+| 表示 | 意味 |
+|---|---|
+| `実測値` | 一度ロードした際に **llama-server 自身が報告した確保サイズ**。最も正確 |
+| `GGUF算出` | GGUFヘッダの層数・KVヘッド数・ヘッド次元から計算（`gemma3 / 62層 × KV16ヘッド × 128次元`） |
+| `概算` | GGUFを読めなかった場合の保守的な推定 |
+
+**一度でもそのモデルをロードすれば、以降は実測値に置き換わります。** 実測値は
+`vram-measured.json` に `(モデル名, ctx)` 単位で保存されます。Gemma系の
+unified KV のようにアーキテクチャ固有の事情で推定がずれる場合も、実測なら正確です。
+
+数値がおかしいと感じたら、付属の診断ツールで確認できます（llama-serverの起動は不要）:
+
+```bash
+cd ~/opengeek-llm-chat
+node gguf_info.js                       # config.json の全モデルを診断
+node gguf_info.js /path/to/model.gguf 32768   # 単体で診断
+```
+
+GGUFから読み取った値を接頭辞ごとに全部表示し、どの値を採用したか、
+妥当性チェックのどれで落ちたかまで出します。
+
+```
+  general.architecture = gemma3
+  ── 接頭辞ごとの読み取り結果 ──
+    ★採用 gemma3.*
+             block_count = 62
+             attention.head_count_kv = 16
+             ...
+          clip.*                      ← ビジョンタワー側（採用しない）
+             block_count = 27
+  ── 妥当性チェック ──
+    範囲チェック   : OK
+    GQA制約        : OK
+    次元の整合     : OK
+    → GGUFの値を採用
+```
+
+「概算」と出る場合は GGUF を読めていない（または妥当性チェックで弾かれた）ので、
+保守的な概算値が使われます。
+
+> ⚠️ `llm_pool.js` は起動時に読み込まれるため、ファイルを差し替えたら
+> **本体の再起動が必要**です（`sudo systemctl restart opengeek-llm-chat`）。
+> 画面側はブラウザキャッシュのため Ctrl+Shift+R で再読み込みしてください。
 
 **足りないときは `ctx` を下げるのが一番効きます。** KVキャッシュは ctx に正比例するので、
 32768 → 8192 にすれば KV は 1/4 になります。同じ内訳が editconfig のワークフローエディタにも

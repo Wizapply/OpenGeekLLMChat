@@ -21,6 +21,7 @@
  */
 
 const fs = require('fs');
+const path = require('path');
 
 // GGUF 以外の追加モデル(mmproj 等)も VRAM を食うので、extraArgs 中の
 // ファイルパスらしき引数はサイズを加算する
@@ -76,12 +77,15 @@ const ggufCache = new Map();   // path → { mtimeMs, meta }
 /**
  * GGUF のメタデータから、VRAM見積りに必要な数値だけ抜き出す。
  * 読めなければ null（呼び出し側は従来の概算にフォールバックする）。
+ *
+ * @param {boolean} raw true にすると、採用値だけでなく接頭辞ごとの生の読み取り結果と
+ *                      妥当性チェックの判定内訳も返す（診断用・キャッシュしない）
  */
-function readGgufMeta(filePath) {
+function readGgufMeta(filePath, raw = false) {
   try {
     const st = fs.statSync(filePath);
     const hit = ggufCache.get(filePath);
-    if (hit && hit.mtimeMs === st.mtimeMs) return hit.meta;
+    if (!raw && hit && hit.mtimeMs === st.mtimeMs) return hit.meta;
 
     const r = createFileReader(filePath);
     try {
@@ -90,8 +94,8 @@ function readGgufMeta(filePath) {
       r.u64();                       // tensor_count
       const kvCount = r.u64();
 
+      // general.architecture はループ内で個別に扱うのでここには入れない
       const want = new Set([
-        'general.architecture',
         'block_count', 'attention.head_count', 'attention.head_count_kv',
         'attention.key_length', 'attention.value_length', 'embedding_length',
         'expert_count',
@@ -99,7 +103,6 @@ function readGgufMeta(filePath) {
         // その層のKVは ctx 全体ではなく窓幅ぶんしか要らない
         'attention.sliding_window', 'attention.sliding_window_pattern',
       ]);
-      const found = {};
 
       const skipValue = (type) => {
         if (type === GGUF_TYPE.STRING) { r.skipStr(); return; }
@@ -120,19 +123,48 @@ function readGgufMeta(filePath) {
         skipValue(type); return null;
       };
 
+      // 重要: マルチモーダルGGUFには言語モデル(gemma3.*)とビジョンタワー(clip.*)の
+      // 両方のメタデータが入っている。接頭辞を無視して suffix だけで拾うと、
+      // 層数は言語モデル・ヘッド数はビジョンタワー…と値が混ざって桁違いの
+      // KVサイズを算出してしまう。接頭辞ごとに保持し、最後に general.architecture の
+      // 接頭辞を持つものだけを採用する。
+      let arch = '';
+      const byPrefix = new Map();   // 接頭辞 → { suffix: 値 }
+      const put = (prefix, suffix, value) => {
+        if (!byPrefix.has(prefix)) byPrefix.set(prefix, {});
+        byPrefix.get(prefix)[suffix] = value;
+      };
+
       for (let i = 0; i < kvCount; i++) {
         const key = r.str();
         const type = r.u32();
-        // "<arch>.block_count" のようにアーキ名が前置されるので、後半で判定する
-        const suffix = key.includes('.') ? key.slice(key.indexOf('.') + 1) : key;
-        if (want.has(key) || want.has(suffix)) {
-          found[want.has(key) ? key : suffix] = readScalar(type);
+        if (key === 'general.architecture') {
+          arch = readScalar(type) || '';
+          continue;
+        }
+        const dot = key.indexOf('.');
+        const prefix = dot > 0 ? key.slice(0, dot) : '';
+        const suffix = dot > 0 ? key.slice(dot + 1) : key;
+        if (prefix && want.has(suffix)) {
+          put(prefix, suffix, readScalar(type));
         } else {
           skipValue(type);
         }
         // 早期に打ち切ると sliding_window 等の後方のキーを取りこぼすので、
         // 最後まで読む。文字列は skipStr で読み飛ばすだけなので実測でも十分速い。
       }
+
+      // 言語モデル側の接頭辞を選ぶ。general.architecture が取れなければ、
+      // block_count と attention.head_count_kv が揃っている接頭辞を使う
+      let found = byPrefix.get(arch);
+      if (!found) {
+        for (const [, vals] of byPrefix) {
+          if (vals.block_count && (vals['attention.head_count_kv'] || vals['attention.head_count'])) {
+            found = vals; break;
+          }
+        }
+      }
+      found = found || {};
 
       const nLayer = found.block_count || 0;
       const nHead = found['attention.head_count'] || 0;
@@ -141,13 +173,37 @@ function readGgufMeta(filePath) {
       const kLen = found['attention.key_length'] || (nHead ? Math.round(nEmbd / nHead) : 0);
       const vLen = found['attention.value_length'] || kLen;
 
-      const meta = (nLayer && nHeadKv && kLen)
+      // 値の妥当性チェック。パースがずれたり別コンポーネントの値が混ざると
+      // ありえない数値になり、そのまま計算すると桁違いのKVサイズを出してしまう。
+      // 範囲だけでなく、GQAの構造的な制約でも検証する。
+      const sane = (v, lo, hi) => Number.isFinite(v) && v >= lo && v <= hi;
+      const inRange = sane(nLayer, 1, 256) && sane(nHeadKv, 1, 256)
+        && sane(kLen, 16, 1024) && sane(vLen, 16, 1024);
+      // GQA: KVヘッド数はヘッド数以下で、かつヘッド数を割り切れる
+      // （head_count=32 に対し head_count_kv=124 のような値はここで弾かれる）
+      const gqaOk = !nHead || (nHeadKv <= nHead && nHead % nHeadKv === 0);
+      // ヘッド次元 × ヘッド数 は埋め込み次元と同程度になる（通常はほぼ一致）。
+      // 2倍を超えるならヘッド次元の読み違い（sliding_window の値を拾う等）を疑う
+      const dimOk = !nEmbd || !nHead || (kLen * nHead <= nEmbd * 2);
+      const plausible = inRange && gqaOk && dimOk;
+
+      const meta = (nLayer && nHeadKv && kLen && plausible)
         ? {
-            arch: found['general.architecture'] || '', nLayer, nHead, nHeadKv, nEmbd, kLen, vLen,
+            arch, nLayer, nHead, nHeadKv, nEmbd, kLen, vLen,
             swa: found['attention.sliding_window'] || 0,
             swaPattern: found['attention.sliding_window_pattern'] || 0,
           }
         : null;
+      if (raw) {
+        // 診断用: 何を読んで、どの判定で落ちたのかを全部返す
+        return {
+          meta, arch,
+          byPrefix: Object.fromEntries([...byPrefix].map(([k, v]) => [k, v])),
+          picked: found,
+          derived: { nLayer, nHead, nHeadKv, nEmbd, kLen, vLen },
+          checks: { inRange, gqaOk, dimOk, plausible },
+        };
+      }
       ggufCache.set(filePath, { mtimeMs: st.mtimeMs, meta });
       return meta;
     } finally { r.close(); }
@@ -185,6 +241,21 @@ function kvCacheMB(meta, ctx) {
  * 過小評価すると OOM して原因も分かりにくいので、迷ったら多めに出す。
  */
 function estimateModelVram(model) {
+  const ctx0 = model.ctx || 4096;
+
+  // 実測値があれば推定を一切使わない（一度でもロードできたモデル）
+  const measured = model.name ? getMeasured(model.name, ctx0) : null;
+  if (measured) {
+    const w = Math.round(measured.weightsMB || 0);
+    const k = Math.round(measured.kvMB || 0);
+    const o = Math.round(measured.overheadMB || 0);
+    return {
+      weightsMB: w, kvMB: k, overheadMB: o, totalMB: w + k + o,
+      exact: true, source: 'measured',
+      arch: null, layers: null, kvHeads: null, headDim: null, swa: 0,
+    };
+  }
+
   let weightsMB = 0;
   const addFile = (p) => {
     try {
@@ -197,7 +268,7 @@ function estimateModelVram(model) {
     if (typeof a === 'string' && MODEL_FILE_RE.test(a)) addFile(a);
   }
 
-  const ctx = model.ctx || 4096;
+  const ctx = ctx0;
   const meta = model.path ? readGgufMeta(model.path) : null;
   let kvMB = kvCacheMB(meta, ctx);
   const exact = kvMB != null;
@@ -216,12 +287,90 @@ function estimateModelVram(model) {
     overheadMB: Math.round(overheadMB),
     totalMB: Math.round(weightsMB + kvMB + overheadMB),
     exact,
+    source: exact ? 'gguf' : 'approx',
+    // 見積りの根拠。数値がおかしいときに何を読み違えたか分かるようUIにも出す
+    arch: meta ? meta.arch : null,
+    layers: meta ? meta.nLayer : null,
+    kvHeads: meta ? meta.nHeadKv : null,
+    headDim: meta ? meta.kLen : null,
+    swa: meta ? meta.swa : 0,
   };
 }
 
 /** 後方互換: 合計値だけ返す */
 function estimateModelVramMB(model) {
   return estimateModelVram(model).totalMB;
+}
+
+// ─── llama-server が報告する実測値の取り込み ───
+// GGUFヘッダからの計算はアーキテクチャ固有の事情（unified KV、層ごとの
+// 注意方式の違い等）を拾いきれず、どうしても誤差が残る。
+// llama-server は起動時に確保したバッファサイズをログに出すので、
+// 一度ロードできたモデルについてはその実測値を使う（推定より常に正確）。
+
+const MEASURED_FILE = path.join(__dirname, 'vram-measured.json');
+
+/** llama-server の出力から確保サイズ(MiB)を拾う正規表現 */
+const MEASURE_PATTERNS = [
+  // llama_kv_cache_unified: ROCm0 KV buffer size =  1344.00 MiB
+  // llama_kv_cache_init:    CUDA0 KV buffer size =  1344.00 MiB
+  { key: 'kvMB', re: /KV buffer size\s*=\s*([\d.]+)\s*MiB/i, sum: true },
+  // llama_new_context_with_model: KV self size  = 1344.00 MiB, K (f16): 672.00 MiB, ...
+  { key: 'kvMB', re: /KV self size\s*=\s*([\d.]+)\s*MiB/i, sum: false },
+  // llm_load_tensors: ROCm0 buffer size = 17000.00 MiB   （重み）
+  { key: 'weightsMB', re: /^\s*(?:llm_load_tensors|load_tensors):.*?buffer size\s*=\s*([\d.]+)\s*MiB/i, sum: true },
+  // llama_new_context_with_model: ROCm0 compute buffer size = 1234.00 MiB
+  { key: 'overheadMB', re: /compute buffer size\s*=\s*([\d.]+)\s*MiB/i, sum: true },
+];
+
+function loadMeasured() {
+  try {
+    if (fs.existsSync(MEASURED_FILE)) return JSON.parse(fs.readFileSync(MEASURED_FILE, 'utf-8'));
+  } catch { /* 壊れていたら捨てて作り直す */ }
+  return {};
+}
+
+let measuredCache = null;
+function measuredStore() {
+  if (!measuredCache) measuredCache = loadMeasured();
+  return measuredCache;
+}
+
+function measuredKey(modelName, ctx) {
+  return `${modelName}@${ctx}`;
+}
+
+/** 実測値があれば返す（{weightsMB, kvMB, overheadMB, at}） */
+function getMeasured(modelName, ctx) {
+  const m = measuredStore()[measuredKey(modelName, ctx)];
+  return (m && m.kvMB > 0) ? m : null;
+}
+
+function saveMeasured(modelName, ctx, values) {
+  const store = measuredStore();
+  store[measuredKey(modelName, ctx)] = { ...values, at: Date.now() };
+  try {
+    fs.writeFileSync(MEASURED_FILE, JSON.stringify(store, null, 2));
+  } catch { /* 書けなくても動作に影響はない */ }
+}
+
+/**
+ * llama-server の出力行から確保サイズを抽出する。
+ * 複数デバイス（マルチGPU）に分かれて報告されるものは合算する。
+ */
+function parseMeasurements(lines) {
+  const out = {};
+  for (const line of lines) {
+    for (const p of MEASURE_PATTERNS) {
+      const m = line.match(p.re);
+      if (!m) continue;
+      const v = parseFloat(m[1]);
+      if (!Number.isFinite(v) || v <= 0) continue;
+      if (p.sum) out[p.key] = (out[p.key] || 0) + v;
+      else if (out[p.key] == null) out[p.key] = v;
+    }
+  }
+  return out;
 }
 
 /**
@@ -335,7 +484,8 @@ function createLlmPool(deps) {
       breakdown.push({
         name, alreadyLoaded, ctx: m.ctx || 4096,
         weightsMB: est.weightsMB, kvMB: est.kvMB, overheadMB: est.overheadMB,
-        totalMB: est.totalMB, exact: est.exact,
+        totalMB: est.totalMB, exact: est.exact, source: est.source,
+        arch: est.arch, layers: est.layers, kvHeads: est.kvHeads, headDim: est.headDim, swa: est.swa,
       });
     }
     const freeMB = freeVramMB();
@@ -500,6 +650,16 @@ function createLlmPool(deps) {
       }
       // 起動できたので過去の異常終了記録は消す
       crashes.delete(modelName);
+
+      // llama-server が報告した実際の確保サイズを取り込む。
+      // 以降この (モデル, ctx) の見積りは推定ではなく実測値を使う。
+      const measured = parseMeasurements(worker.logTail);
+      if (measured.kvMB > 0) {
+        saveMeasured(modelName, model.ctx || 4096, measured);
+        log('-', `[LLMプール] ${modelName} の実測VRAM: 重み ${(measured.weightsMB / 1024 || 0).toFixed(1)}GB`
+          + ` / KV ${(measured.kvMB / 1024).toFixed(2)}GB`
+          + ` / 計算バッファ ${((measured.overheadMB || 0) / 1024).toFixed(2)}GB`);
+      }
       worker.ready = true;
       worker.lastUsed = Date.now();
       log('-', `[LLMプール] ワーカー準備完了: ${modelName} @ ${host}:${port}`);
@@ -728,8 +888,11 @@ function createLlmPool(deps) {
 
   return {
     acquire, planMode, status, unloadAll, killAll, getCrash, awaitCrash,
-    estimateModelVram, estimateModelVramMB, freeVramMB,
+    estimateModelVram, estimateModelVramMB, freeVramMB, getMeasured,
   };
 }
 
-module.exports = { createLlmPool, estimateModelVram, estimateModelVramMB, readGgufMeta };
+module.exports = {
+  createLlmPool, estimateModelVram, estimateModelVramMB, readGgufMeta,
+  parseMeasurements, getMeasured,
+};
