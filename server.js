@@ -1945,7 +1945,11 @@ app.get('/orchestra/info', requireAuth, (req, res) => {
       name: m.name,
       ctx: m.ctx,
       estimatedVramMB: llmPool.estimateModelVramMB(m),
+      // --mmproj が指定されているモデルだけが画像を受け取れる
+      vision: (m.extraArgs || []).includes('--mmproj'),
     })),
+    // RAG(参照ドキュメント)が使えるか。embedding が無いと検索できない
+    rag: isEmbeddingAvailable(),
   });
 });
 
@@ -2027,7 +2031,11 @@ app.post('/orchestra/pool/unload', requireAuth, async (req, res) => {
 // text/event-stream レスポンスを返す。
 app.post('/orchestra/run', requireAuth, jsonParser, async (req, res) => {
   const ip = getIP(req);
-  const { workflowId, workflow: inlineWorkflow, query, history, role } = req.body || {};
+  const {
+    workflowId, workflow: inlineWorkflow, query, history, role,
+    images,        // [{ name, base64 }] Vision対応ノードに渡す
+    docChunks,     // フロント側でチャット添付ドキュメントを検索した結果
+  } = req.body || {};
 
   const o = appConfig.orchestration || {};
   if (!o.enabled) return res.status(400).json({ error: 'オーケストレーション機能が無効です (config.orchestration.enabled)' });
@@ -2053,7 +2061,41 @@ app.post('/orchestra/run', requireAuth, jsonParser, async (req, res) => {
       + baseSystem;
   }
 
-  log(ip, `ORCHESTRA RUN: ${wf.name} (${(wf.nodes || []).length}ノード)`);
+  // ─── 参照ドキュメント(RAG)の収集 ───
+  // useRag のノードが1つでもあれば集める。2系統あるので統合する:
+  //   1. チャット添付ドキュメント … 埋め込みがブラウザ側にあるためフロントで検索済み
+  //   2. 永続RAGドキュメント (ml/rag) … サーバー側で検索する
+  const wantsRag = (wf.nodes || []).some(n => n.useRag);
+  const ragChunks = [];
+  if (wantsRag) {
+    for (const c of (Array.isArray(docChunks) ? docChunks : [])) {
+      if (c && typeof c.text === 'string' && c.text.trim()) {
+        ragChunks.push({ text: c.text, source: c.source || 'チャット添付', score: c.score });
+      }
+    }
+    const emb = isEmbeddingAvailable();
+    if (emb.available) {
+      try {
+        const r = await ragSearch(query, appConfig.ragTopK || 10);
+        for (const hit of (r.results || [])) {
+          ragChunks.push({ text: hit.text, source: hit.filename, score: hit.score });
+        }
+      } catch (e) {
+        log(ip, `ORCHESTRA RAG検索エラー: ${e.message}`);
+      }
+    }
+    // スコア順に整えて上位だけ渡す（多すぎるとコンテキストを圧迫する）
+    ragChunks.sort((a, b) => (b.score || 0) - (a.score || 0));
+    ragChunks.splice(appConfig.ragTopK || 10);
+  }
+
+  const validImages = (Array.isArray(images) ? images : [])
+    .filter(im => im && typeof im.base64 === 'string' && im.base64)
+    .map(im => ({ name: im.name || '', base64: im.base64 }));
+
+  log(ip, `ORCHESTRA RUN: ${wf.name} (${(wf.nodes || []).length}ノード`
+    + `${ragChunks.length ? `, 参照資料${ragChunks.length}件` : ''}`
+    + `${validImages.length ? `, 画像${validImages.length}枚` : ''})`);
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -2079,6 +2121,8 @@ app.post('/orchestra/run', requireAuth, jsonParser, async (req, res) => {
       query,
       history: Array.isArray(history) ? history.filter(m => m && m.role && typeof m.content === 'string') : [],
       baseSystem,
+      images: validImages,
+      ragChunks,
       onEvent: (ev) => { if (!clientGone) send(ev); },
     });
   } catch (e) {

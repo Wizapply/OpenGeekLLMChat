@@ -254,6 +254,35 @@ function createOrchestrator(deps) {
     return parts.join('\n\n');
   }
 
+  /** 参照ドキュメント（RAG）の抜粋をプロンプトに差し込む形に整える */
+  function buildRagSection(ctx) {
+    if (!ctx.ragChunks || ctx.ragChunks.length === 0) return '';
+    const body = ctx.ragChunks.map((c, i) => {
+      const src = c.source ? `（出典: ${c.source}）` : '';
+      return `[資料${i + 1}]${src}\n${truncate(c.text, relayMaxChars())}`;
+    }).join('\n\n');
+    return `【参考資料】\n以下はユーザーの質問に関連する資料の抜粋です。`
+      + `回答に使えるものだけを使い、資料に無いことは推測で補わないでください。\n\n${body}`;
+  }
+
+  /**
+   * ユーザーメッセージを組み立てる。
+   * 画像を渡すノードでは OpenAI互換の content 配列にする。
+   */
+  function buildUserMessage(node, ctx, text) {
+    const useImages = node.useImages && ctx.images && ctx.images.length > 0;
+    if (!useImages) return { role: 'user', content: text };
+    const content = [];
+    if (text) content.push({ type: 'text', text });
+    for (const img of ctx.images) {
+      const url = String(img.base64 || '').startsWith('data:')
+        ? img.base64
+        : `data:image/png;base64,${img.base64}`;
+      content.push({ type: 'image_url', image_url: { url } });
+    }
+    return { role: 'user', content };
+  }
+
   /**
    * ノードに渡す messages を組み立てる。
    * 上流の出力がある場合は「元の質問 + 各担当の回答」を1つのユーザーメッセージにまとめる。
@@ -263,6 +292,10 @@ function createOrchestrator(deps) {
     const msgs = [];
     if (system) msgs.push({ role: 'system', content: system });
 
+    // 参照ドキュメントは system の直後に置く（上流出力より前に読ませる）
+    const ragSection = node.useRag ? buildRagSection(ctx) : '';
+    if (ragSection) msgs.push({ role: 'system', content: ragSection });
+
     const inputs = (node.inputs || [])
       .map(id => ctx.results.get(id))
       .filter(r => r && r.status === 'done');
@@ -270,7 +303,7 @@ function createOrchestrator(deps) {
     if (inputs.length === 0) {
       // 上流なし: 通常のチャットとして履歴＋質問を渡す
       for (const m of ctx.history) msgs.push(m);
-      msgs.push({ role: 'user', content: ctx.query });
+      msgs.push(buildUserMessage(node, ctx, ctx.query));
       return msgs;
     }
 
@@ -286,11 +319,8 @@ function createOrchestrator(deps) {
       ? (node.instruction || '上記の各回答を突き合わせ、矛盾があれば取捨選択したうえで、ユーザーへの最終回答を1つにまとめてください。どの担当が何を言ったかの説明は不要で、完成した回答本文だけを書いてください。')
       : (node.instruction || '上記を踏まえて回答してください。');
 
-    msgs.push({
-      role: 'user',
-      content: `【ユーザーの質問】\n${ctx.query}\n\n【担当モデルからの入力】\n${sections}\n\n【あなたへの指示】\n${instruction}`,
-    });
-    return msgs;
+    return msgs.concat(buildUserMessage(node, ctx,
+      `【ユーザーの質問】\n${ctx.query}\n\n【担当モデルからの入力】\n${sections}\n\n【あなたへの指示】\n${instruction}`));
   }
 
   /** サンプラー設定をノード＞configの順で解決 */
@@ -437,17 +467,18 @@ function createOrchestrator(deps) {
           { role: [p.role, node.role].filter(Boolean).join('\n\n') },
           ctx.baseSystem,
         );
+        const ragSection = node.useRag ? buildRagSection(ctx) : '';
+        const body = `以下のテーマについて議論しています。あなたは「${p.label}」です。\n\n`
+          + `【テーマ】\n${ctx.query}\n\n【これまでの発言】\n${prior}\n\n`
+          + `【指示】\n${r === 0
+            ? 'あなたの立場から意見を述べてください。'
+            : '他の参加者の発言を踏まえ、同意できる点・異論がある点を明示しつつ、あなたの意見を更新してください。'}\n`
+          + `簡潔に、要点を絞って書いてください。`;
         const messages = [
           ...(system ? [{ role: 'system', content: system }] : []),
-          {
-            role: 'user',
-            content: `以下のテーマについて議論しています。あなたは「${p.label}」です。\n\n`
-              + `【テーマ】\n${ctx.query}\n\n【これまでの発言】\n${prior}\n\n`
-              + `【指示】\n${r === 0
-                ? 'あなたの立場から意見を述べてください。'
-                : '他の参加者の発言を踏まえ、同意できる点・異論がある点を明示しつつ、あなたの意見を更新してください。'}\n`
-              + `簡潔に、要点を絞って書いてください。`,
-          },
+          ...(ragSection ? [{ role: 'system', content: ragSection }] : []),
+          // 画像は1巡目だけ渡す（毎巡渡すとコンテキストを圧迫するため）
+          buildUserMessage(r === 0 ? node : { ...node, useImages: false }, ctx, body),
         ];
 
         ctx.emit({ type: 'node_speaker', id: node.id, label: p.label, model: p.model, round: r + 1 });
@@ -475,7 +506,10 @@ function createOrchestrator(deps) {
    *   onEvent   進捗コールバック
    * @returns {Promise<{finalText: string, results: object[]}>}
    */
-  async function runWorkflow({ workflow, query, history = [], baseSystem = '', onEvent }) {
+  async function runWorkflow({
+    workflow, query, history = [], baseSystem = '',
+    images = [], ragChunks = [], onEvent,
+  }) {
     const nodes = (workflow.nodes || []).filter(n => n && n.id);
     const emit = (ev) => { try { onEvent && onEvent(ev); } catch { /* 送信失敗は無視 */ } };
     const run = { activeReqs: new Set(), cancelled: false };
@@ -500,6 +534,7 @@ function createOrchestrator(deps) {
       marginVramMB: plan.marginMB, shortageVramMB: plan.shortageMB,
       footprintVramMB: plan.footprintMB, loadedVramMB: plan.loadedMB,
       vramBreakdown: plan.breakdown, vramApprox: plan.approx,
+      ragChunkCount: ragChunks.length, imageCount: images.length,
       finalNodeId,
       nodes: nodes.map(n => ({
         id: n.id, type: n.type, label: n.label || n.id, model: n.model || null,
@@ -510,7 +545,7 @@ function createOrchestrator(deps) {
     });
 
     const ctx = {
-      query, history, baseSystem, emit,
+      query, history, baseSystem, emit, images, ragChunks,
       mode: plan.mode,
       results: new Map(),        // nodeId → { status, text, label, model, ms }
       routerChoice: new Map(),   // routerNodeId → 選ばれた target

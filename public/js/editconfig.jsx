@@ -299,6 +299,20 @@ function OrchestraEditor({ hasUnsavedText, onSaved }) {
     return <div className="orch-editor-empty">ワークフロー情報を取得できませんでした: {loadError}</div>;
   }
 
+  // 画像を渡す設定なのに Vision 非対応(--mmproj 未指定)のモデルを使っている場合に知らせる
+  function visionWarning(node) {
+    const check = (name) => {
+      const m = models.find(x => x.name === name);
+      return m && m.vision === false ? name : null;
+    };
+    const bad = node.type === 'debate'
+      ? (node.participants || []).map(p => check(p.model)).filter(Boolean)
+      : [check(node.model)].filter(Boolean);
+    if (bad.length === 0) return '';
+    return `${[...new Set(bad)].join(', ')} は画像に対応していません`
+      + `（config.json の extraArgs に --mmproj の指定が必要です）`;
+  }
+
   const otherNodes = draft ? draft.nodes : [];
 
   return (
@@ -478,6 +492,33 @@ function OrchestraEditor({ hasUnsavedText, onSaved }) {
                               </label>
                             ))}
                           </div>
+                        </div>
+                      )}
+
+                      {/* 参照ドキュメント(RAG)と画像。ノード単位で有効化する */}
+                      {node.type !== 'output' && node.type !== 'router' && (
+                        <div className="orch-field">
+                          <span className="orch-field-label">このノードに渡すもの</span>
+                          <div className="orch-input-picker">
+                            <label className="orch-chip" title="チャット添付ドキュメントと永続RAGを検索し、抜粋をこのノードに渡します">
+                              <input type="checkbox" checked={!!node.useRag}
+                                onChange={e => updateNode(node.id, n => { n.useRag = e.target.checked; })} />
+                              📚 参照ドキュメント(RAG)
+                            </label>
+                            <label className="orch-chip" title="チャットに添付された画像をこのノードに渡します（モデルがVision対応である必要があります）">
+                              <input type="checkbox" checked={!!node.useImages}
+                                onChange={e => updateNode(node.id, n => { n.useImages = e.target.checked; })} />
+                              🖼️ 画像
+                            </label>
+                          </div>
+                          {node.useRag && info.rag && info.rag.available === false && (
+                            <div className="orch-node-warn">
+                              ⚠️ embedding が利用できないため検索できません: {info.rag.reason}
+                            </div>
+                          )}
+                          {node.useImages && visionWarning(node) && (
+                            <div className="orch-node-warn">⚠️ {visionWarning(node)}</div>
+                          )}
                         </div>
                       )}
 

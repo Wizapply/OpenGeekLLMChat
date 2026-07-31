@@ -767,6 +767,12 @@ function OrchestraPanel({ orch }) {
         <span className={`orch-panel-dot ${orch.status === 'running' ? '' : 'done'}`} />
         <span className="orch-panel-title">🎼 {orch.workflowName || 'オーケストレーション'}</span>
         <span className={`orch-mode-badge ${orch.mode || ''}`} title={orch.reason || ''}>{modeLabel}</span>
+        {orch.ragChunkCount > 0 && (
+          <span className="orch-mode-badge" title="参照ドキュメント(RAG)を渡しています">📚 {orch.ragChunkCount}件</span>
+        )}
+        {orch.imageCount > 0 && (
+          <span className="orch-mode-badge" title="画像を渡しています">🖼️ {orch.imageCount}枚</span>
+        )}
         <span className="orch-panel-count">{doneCount}/{total}</span>
       </div>
       {orch.reason && (
@@ -1280,12 +1286,19 @@ function App() {
       nodes: [], freeVramMB: null, requiredVramMB: null, error: '',
     };
 
+    const pendingImages = [...chatImages];
     setMessages(prev => [...prev,
-      { role: 'user', content: text },
+      {
+        role: 'user', content: text,
+        images: pendingImages.length
+          ? pendingImages.map(img => ({ name: img.name, base64: img.base64, preview: img.preview }))
+          : undefined,
+      },
       { role: 'assistant', content: '', orchestra: orch },
     ]);
     messagesDirtyRef.current = true;
     setInput('');
+    setChatImages([]);
     if (inputRef.current) inputRef.current.style.height = 'auto';
     setIsLoading(true);
     setError('');
@@ -1295,11 +1308,23 @@ function App() {
     const controller = new AbortController();
     abortRef.current = controller;
 
-    // 直近履歴（オーケストレーションは画像非対応のためテキストのみ送る）
+    // 直近履歴（履歴中の画像までは送らない。テキストのみ）
     const RECENT = appConfig.recentMessageCount || 6;
     const history = messages.slice(-RECENT)
       .filter(m => typeof m.content === 'string' && m.content)
       .map(m => ({ role: m.role, content: m.content }));
+
+    // 参照ドキュメント: チャット添付分はブラウザ側に埋め込みがあるのでここで検索する。
+    // サーバー側の永続RAGは /orchestra/run 内で検索され、両者が統合される。
+    let docChunks = [];
+    if ((wf.nodes || []).some(n => n.useRag) && documents.length > 0) {
+      setLoadingMessage('ドキュメントを検索中');
+      try {
+        const hits = await retrieveContext(text);
+        docChunks = hits.map(h => ({ text: h.chunk, source: h.docName, score: h.score }));
+      } catch { /* 検索できなくても実行は続ける */ }
+      setLoadingMessage('');
+    }
 
     let finalText = '';
     let flushTimer = null;
@@ -1330,7 +1355,11 @@ function App() {
       const res = await fetch('/orchestra/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ workflowId: wf.id, query: text, history, role: chatRole }),
+        body: JSON.stringify({
+          workflowId: wf.id, query: text, history, role: chatRole,
+          docChunks,
+          images: pendingImages.map(img => ({ name: img.name, base64: img.base64 })),
+        }),
         signal: controller.signal,
       });
       if (!res.ok) {
@@ -1364,6 +1393,8 @@ function App() {
             orch.shortageVramMB = ev.shortageVramMB;
             orch.footprintVramMB = ev.footprintVramMB;
             orch.loadedVramMB = ev.loadedVramMB;
+            orch.ragChunkCount = ev.ragChunkCount;
+            orch.imageCount = ev.imageCount;
             orch.vramBreakdown = ev.vramBreakdown;
             orch.nodes = (ev.nodes || []).map(n => ({
               id: n.id, label: n.label, model: n.model, type: n.type,
@@ -1439,8 +1470,11 @@ function App() {
     // 通常のツール判断・RAG経路ではなくサーバー側のオーケストレータに委譲する。
     // ワークフローは自前でワーカーを起動するため chatModel のロード状態は問わない
     if (orchInfo.enabled && orchWorkflowId) {
-      if (hasImages) {
-        setError('マルチLLMワークフローでは画像を送信できません。単一モデルに切り替えてください。');
+      const wf = (orchInfo.workflows || []).find(w => w.id === orchWorkflowId);
+      // 画像を受け取るノードが1つも無いワークフローに画像を送っても無視されるだけなので知らせる
+      if (hasImages && !(wf?.nodes || []).some(n => n.useImages)) {
+        setError('このワークフローには画像を受け取るノードがありません。'
+          + '設定 → 🎼 マルチLLM でノードの「画像を渡す」を有効にしてください。');
         return;
       }
       return runOrchestration(text);
