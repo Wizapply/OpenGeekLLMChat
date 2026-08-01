@@ -1002,6 +1002,10 @@ function App() {
   // ─── マルチLLMオーケストレーション ───
   const [orchInfo, setOrchInfo] = useState({ enabled: false, workflows: [], models: [] });
   const [orchWorkflowId, setOrchWorkflowId] = useState('');   // '' = OFF（通常チャット）
+  // ─── VRAM強制解放（GPUモニター） ───
+  const [releaseTargets, setReleaseTargets] = useState(null);  // 解放できる対象
+  const [releasing, setReleasing] = useState(false);
+  const [releaseResult, setReleaseResult] = useState(null);
   const [showRoleEditor, setShowRoleEditor] = useState(false);  // 役割エディタの表示状態
   const [chatLoading, setChatLoading] = useState(false);
   const saveTimerRef = useRef(null);
@@ -1111,6 +1115,59 @@ function App() {
     const id = setInterval(fetchOrchInfo, 30000);
     return () => clearInterval(id);
   }, [authenticated, fetchOrchInfo]);
+
+  // ─── VRAM強制解放 ───
+  // GPUパネルを開いている間だけ、解放できる対象を定期取得する
+  const fetchReleaseTargets = useCallback(async () => {
+    try {
+      const r = await fetch('/gpu/release/targets');
+      if (r.ok) setReleaseTargets(await r.json());
+    } catch { /* 取得できなくてもボタンは押せる */ }
+  }, []);
+
+  useEffect(() => {
+    if (!authenticated || !gpuPanelOpen || rightPanelTab !== 'gpu') return;
+    fetchReleaseTargets();
+    const id = setInterval(fetchReleaseTargets, 5000);
+    return () => clearInterval(id);
+  }, [authenticated, gpuPanelOpen, rightPanelTab, fetchReleaseTargets]);
+
+  async function releaseVram() {
+    const t = releaseTargets || {};
+    const items = [];
+    if (t.chat) items.push(`チャットモデル「${t.chat}」`);
+    if (t.embedding) items.push('Embedding');
+    if ((t.pool || []).length) items.push(`マルチLLMワーカー ${t.pool.length}台（${t.pool.join(', ')}）`);
+    if (t.image) items.push(`画像生成${typeof t.image === 'string' ? `「${t.image}」` : ''}`);
+    if (t.tts) items.push('音声合成(TTS)');
+    if (items.length === 0) {
+      setError('解放できるモデルがありません（すでに全てアンロード済みです）');
+      return;
+    }
+    const extNote = t.external > 0
+      ? `\n\n※ 外部APIサーバー ${t.external}台は停止しません（意図して公開しているため）`
+      : '';
+    if (!confirm(`以下をアンロードしてVRAMを解放します。\n\n・${items.join('\n・')}\n\n`
+      + `- 進行中の生成があれば中断されます\n`
+      + `- チャットモデルは次回の送信時に自動で再ロードされます${extNote}\n\n続行しますか？`)) return;
+
+    setReleasing(true); setError(''); setReleaseResult(null);
+    try {
+      const r = await fetch('/gpu/release', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),   // 既定: 外部APIサーバー以外を全て解放
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      setReleaseResult(d);
+      await fetchReleaseTargets();
+      fetchModels();   // モデルのロード状態表示を更新する
+    } catch (e) {
+      setError(`VRAM解放に失敗しました: ${e.message}`);
+    } finally {
+      setReleasing(false);
+    }
+  }
 
   // ─── GPU 監視 (SSE) ───
   useEffect(() => {
@@ -5608,6 +5665,66 @@ ${conversationText}
                   </div>
                 </div>
               )}
+              {/* VRAM強制解放: 学習を回したい・他アプリにGPUを譲りたいときに使う */}
+              {(() => {
+                const t = releaseTargets;
+                const loaded = [];
+                if (t?.chat) loaded.push({ icon: '💬', text: t.chat });
+                if (t?.embedding) loaded.push({ icon: '📐', text: 'Embedding' });
+                for (const w of (t?.pool || [])) loaded.push({ icon: '🎼', text: w });
+                if (t?.image) loaded.push({ icon: '🖼️', text: typeof t.image === 'string' ? t.image : '画像生成' });
+                if (t?.tts) loaded.push({ icon: '🔊', text: '音声合成' });
+                return (
+                  <div className="vram-release-card">
+                    <div className="vram-release-head">
+                      <span className="vram-release-title">VRAM使用中のモデル</span>
+                      <span className="vram-release-count">{loaded.length}</span>
+                    </div>
+                    {loaded.length === 0 ? (
+                      <div className="vram-release-empty">なし（すべてアンロード済み）</div>
+                    ) : (
+                      <div className="vram-release-list">
+                        {loaded.map((x, i) => (
+                          <div key={i} className="vram-release-item">
+                            <span>{x.icon}</span>
+                            <span className="vram-release-name">{x.text}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {t?.external > 0 && (
+                      <div className="vram-release-note">
+                        外部APIサーバー {t.external}台は対象外（🌐 API タブから個別に停止できます）
+                      </div>
+                    )}
+                    <button className="vram-release-btn"
+                      onClick={releaseVram}
+                      disabled={releasing || loaded.length === 0}
+                      title={loaded.length === 0
+                        ? '解放できるモデルがありません'
+                        : 'ロード中のモデルを全てアンロードしてVRAMを空けます'}>
+                      {releasing ? '解放中...' : '🧹 強制的にVRAMを解放'}
+                    </button>
+                    {releaseResult && (
+                      <div className="vram-release-result">
+                        ✓ {releaseResult.released.length > 0
+                          ? releaseResult.released.join(' / ')
+                          : '対象なし'}
+                        {releaseResult.freedMB > 0 && (
+                          <div className="vram-release-freed">
+                            {(releaseResult.vramBeforeMB / 1024).toFixed(1)}GB →
+                            {' '}{(releaseResult.vramAfterMB / 1024).toFixed(1)}GB
+                            （{(releaseResult.freedMB / 1024).toFixed(1)}GB 解放）
+                          </div>
+                        )}
+                        {releaseResult.errors.length > 0 && (
+                          <div className="vram-release-err">⚠️ {releaseResult.errors.join(' / ')}</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
               {(() => {
                 const allGpus = gpuData.reduce((s, g) => s + (g.gpus?.length || 0), 0);
                 if (allGpus === 0) return <div className="gpu-offline">GPU 未検出</div>;

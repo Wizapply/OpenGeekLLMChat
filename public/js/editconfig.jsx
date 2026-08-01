@@ -828,19 +828,31 @@ function App() {
     }
     setRestarting(true); setError(''); setSuccess(''); setRestartDone(false);
     try {
+      // 再起動前のプロセス起動時刻を控える。これが変わったら復帰したと判定する
+      const before = await fetchStartedAt();
       const r = await fetch('/restart', { method: 'POST' });
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || '再起動失敗');
       setSuccess('再起動中... サーバーが復帰するまでお待ちください');
       // 再起動完了をポーリングで待つ
-      pollUntilBack();
+      pollUntilBack(before);
     } catch (e) {
       setError(`再起動失敗: ${e.message}`);
       setRestarting(false);
     }
   }
 
-  async function pollUntilBack() {
+  /** サーバーの起動時刻を取得（/config は認証不要なので再起動後でも取れる） */
+  async function fetchStartedAt() {
+    try {
+      const r = await fetch('/config', { cache: 'no-cache' });
+      if (!r.ok) return null;
+      const d = await r.json();
+      return d.startedAt ?? null;
+    } catch { return null; }
+  }
+
+  async function pollUntilBack(beforeStartedAt) {
     const startTime = Date.now();
     const maxWaitMs = 60000;  // 1分でタイムアウト
     let consecutiveOk = 0;
@@ -848,15 +860,33 @@ function App() {
     await new Promise(r => setTimeout(r, 2000));
     while (Date.now() - startTime < maxWaitMs) {
       try {
-        const r = await fetch('/restart/info', { cache: 'no-cache' });
+        // 注意: 認証が要るエンドポイントは使えない。
+        // セッションはメモリ上にしかなく再起動で消えるため、復帰後は401になり
+        // 「サーバーは生きているのに永遠に待つ」ことになる。/config は認証不要。
+        const r = await fetch('/config', { cache: 'no-cache' });
         if (r.ok) {
           const data = await r.json();
-          // 新プロセスのアップタイムが短い = 確実に再起動した
-          if (data.uptime != null && data.uptime < 30) {
+          // 起動時刻が変わっている = 新しいプロセスに入れ替わった
+          const restarted = data.startedAt != null && beforeStartedAt != null
+            ? data.startedAt !== beforeStartedAt
+            : true;   // startedAt を返さない旧サーバー相手なら応答できた時点で復帰とみなす
+          if (restarted) {
             consecutiveOk++;
             if (consecutiveOk >= 2) {
-              setSuccess(`✓ 再起動完了（PID: ${data.pid}）。最新の状態に更新するため3秒後にページを再読み込みします…`);
-              setRestartInfo(data);
+              // PID等の詳細は認証が要るので、取れたら表示する程度に留める
+              let detail = '';
+              try {
+                const ir = await fetch('/restart/info', { cache: 'no-cache' });
+                if (ir.ok) {
+                  const info = await ir.json();
+                  setRestartInfo(info);
+                  detail = `（PID: ${info.pid}）`;
+                }
+              } catch {}
+              const needLogin = data.hasPassword && !data.authenticated;
+              setSuccess(`✓ 再起動完了${detail}。`
+                + (needLogin ? 'セッションが切れたため再ログインが必要です。' : '')
+                + '最新の状態に更新するため3秒後にページを再読み込みします…');
               setRestarting(false);
               setRestartDone(true);  // 手動リロードボタンを表示
               // 自動リロード (新しいJS/HTMLを確実に読み込むため)

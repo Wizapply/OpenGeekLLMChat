@@ -18,6 +18,9 @@ process.chdir(__dirname);
 // ─── 設定 ───
 const PORT = process.env.PORT || 3000;
 const PYTHON_TIMEOUT = parseInt(process.env.PYTHON_TIMEOUT) || 60000;
+// このプロセスの起動時刻。再起動を検知するための識別子として公開する。
+// セッションは再起動で消えるため、認証が要る /restart/info では復帰を判定できない。
+const SERVER_STARTED_AT = Date.now();
 
 // ─── アプリ設定 (config.json) ───
 const CONFIG_FILE = path.join(__dirname, 'config.json');
@@ -3509,6 +3512,84 @@ async function queryGpu() {
   return [];
 }
 
+// ─── VRAM強制解放 ───
+// GPUモニターから、VRAMを掴んでいるプロセスをまとめて落とす。
+// 学習を回したい・別のアプリにGPUを譲りたい、といった場面で使う。
+// 何をどれだけ解放できたかを返す（押した結果が見えないと不安なため）。
+app.post('/gpu/release', requireAuth, jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  const opts = req.body || {};
+  // 明示的に false を指定したものだけ除外する（既定は全部解放）
+  const want = (key) => opts[key] !== false;
+
+  await updateGpuData();
+  const usedBefore = (cachedGpuData || []).reduce((s, g) => s + (g.vramUsedMB || 0), 0);
+
+  const released = [];
+  const errors = [];
+  const tryRelease = async (label, condition, fn) => {
+    if (!condition) return;
+    try { await fn(); released.push(label); }
+    catch (e) { errors.push(`${label}: ${e.message}`); }
+  };
+
+  // チャットモデル: 次のチャットで自動再ロードされるよう控えておく
+  await tryRelease(`チャットモデル(${chatProcModel})`, want('chat') && chatProc, async () => {
+    chatProcAutoUnloaded = chatProcModel;
+    await stopChatModel();
+    chatLastUsed = 0;
+  });
+  await tryRelease('Embedding', want('embedding') && embedProc, async () => {
+    await stopEmbeddingModel();
+    embedLastUsed = 0;
+  });
+  // マルチLLMワーカー
+  const workerCount = (() => { try { return llmPool.status().workers.length; } catch { return 0; } })();
+  await tryRelease(`マルチLLMワーカー(${workerCount}台)`, want('pool') && workerCount > 0,
+    () => llmPool.unloadAll());
+  await tryRelease(`画像生成(${sdCurrentModel})`, want('image') && sdProc, () => stopImageModel());
+  await tryRelease('音声合成(TTS)', want('tts') && ttsProc, () => stopTtsServer());
+
+  // 外部APIサーバーは意図して公開しているものなので、明示指定がある場合だけ止める
+  if (opts.external === true) {
+    const running = listExternalServers().filter(s => s.running);
+    for (const s of running) {
+      try { stopExternalServerProcess(s.id); } catch (e) { errors.push(`外部API ${s.id}: ${e.message}`); }
+    }
+    if (running.length > 0) released.push(`外部APIサーバー(${running.length}台)`);
+  }
+
+  // プロセスの終了とドライバのVRAM解放にはわずかに時間がかかる
+  await new Promise(r => setTimeout(r, 1500));
+  await updateGpuData();
+  const usedAfter = (cachedGpuData || []).reduce((s, g) => s + (g.vramUsedMB || 0), 0);
+
+  log(ip, `GPU RELEASE: ${released.length ? released.join(', ') : '対象なし'}`
+    + ` (VRAM ${usedBefore}MB → ${usedAfter}MB)`);
+
+  res.json({
+    ok: true,
+    released,
+    errors,
+    vramBeforeMB: usedBefore,
+    vramAfterMB: usedAfter,
+    freedMB: Math.max(0, usedBefore - usedAfter),
+  });
+});
+
+// 解放できる対象の一覧（ボタンの有効/無効とラベル表示用）
+app.get('/gpu/release/targets', requireAuth, (req, res) => {
+  const workers = (() => { try { return llmPool.status().workers; } catch { return []; } })();
+  res.json({
+    chat: chatProc ? chatProcModel : null,
+    embedding: !!embedProc,
+    pool: workers.map(w => w.modelName),
+    image: sdProc ? (sdCurrentModel || true) : null,
+    tts: !!ttsProc,
+    external: listExternalServers().filter(s => s.running).length,
+  });
+});
+
 app.get('/sse/gpu', requireAuth, (req, res) => {
   const ip = getIP(req);
   log(ip, 'SSE GPU connected');
@@ -3659,6 +3740,9 @@ app.get('/config', (req, res) => {
     };
   }
   safeConfig.hasPassword = !!password;
+  // 再起動の検知用。認証前でも取れる必要があるためここに載せる
+  // （再起動でセッションが消えるので、認証が要るエンドポイントでは判定できない）
+  safeConfig.startedAt = SERVER_STARTED_AT;
 
   // 既存セッションCookieが有効かどうかを判定
   if (password) {

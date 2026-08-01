@@ -3359,3 +3359,79 @@
     font-size: 10.5px;
     line-height: 1.5;
   }
+
+  /* ── VRAM強制解放カード（GPUモニター） ── */
+  .vram-release-card {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    margin-bottom: 10px;
+  }
+  .vram-release-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+  }
+  .vram-release-title { font-size: 11px; color: var(--text-secondary); }
+  .vram-release-count {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+    background: var(--bg-secondary);
+    padding: 1px 7px;
+    border-radius: 8px;
+  }
+  .vram-release-empty { font-size: 11px; color: var(--text-muted); padding: 2px 0 6px; }
+  .vram-release-list { display: flex; flex-direction: column; gap: 3px; margin-bottom: 8px; }
+  .vram-release-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--text-primary);
+    min-width: 0;
+  }
+  .vram-release-name {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .vram-release-note {
+    font-size: 10px;
+    color: var(--text-muted);
+    line-height: 1.5;
+    margin-bottom: 8px;
+  }
+  .vram-release-btn {
+    width: 100%;
+    padding: 7px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-family: inherit;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .vram-release-btn:hover:not(:disabled) {
+    background: var(--orange-dim);
+    border-color: var(--orange);
+    color: var(--orange);
+  }
+  .vram-release-btn:disabled { opacity: 0.4; cursor: default; }
+  .vram-release-result {
+    margin-top: 8px;
+    padding: 6px 8px;
+    background: var(--green-dim);
+    border: 1px solid var(--green);
+    border-radius: 6px;
+    font-size: 10.5px;
+    color: var(--green);
+    line-height: 1.6;
+    word-break: break-word;
+  }
+  .vram-release-freed { font-family: var(--font-mono); margin-top: 2px; }
+  .vram-release-err { color: var(--orange); margin-top: 3px; }
