@@ -412,27 +412,361 @@ body {
 .editor-textarea:focus { outline: none; }
 
 /* ── ツリービュー ── */
+/* ═══════════════════════════════════
+   JSON ツリーエディタ
+   ═══════════════════════════════════ */
+.tree-editor {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── ツールバー（検索・展開） ── */
+.tree-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-secondary);
+  flex-wrap: wrap;
+}
+.tree-search-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 200px;
+  display: flex;
+  align-items: center;
+}
+.tree-search-icon {
+  position: absolute;
+  left: 10px;
+  font-size: 12px;
+  opacity: 0.6;
+  pointer-events: none;
+}
+.tree-search {
+  width: 100%;
+  padding: 7px 30px 7px 30px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 13px;
+  outline: none;
+}
+.tree-search:focus { border-color: var(--accent); }
+.tree-search-clear {
+  position: absolute;
+  right: 8px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+.tree-search-clear:hover { color: var(--text-primary); background: var(--bg-hover); }
+
+.tree-tool-btn {
+  padding: 6px 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s;
+}
+.tree-tool-btn:hover:not(:disabled) { background: var(--bg-hover); border-color: var(--border-active); color: var(--text-primary); }
+.tree-tool-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 500; }
+.tree-tool-btn.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+
+.tree-usage-hint {
+  padding: 7px 20px;
+  font-size: 11px;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-primary);
+  line-height: 1.7;
+}
+.tree-usage-hint code {
+  font-family: var(--font-mono);
+  background: var(--surface);
+  padding: 1px 4px;
+  border-radius: 3px;
+  color: var(--text-secondary);
+}
+
+/* ── ツリー本体 ── */
 .tree-container {
   flex: 1;
   overflow: auto;
-  padding: 16px 20px;
+  padding: 10px 20px 60px;
   font-family: var(--font-mono);
   font-size: 13px;
   line-height: 1.7;
 }
-.tree-row { padding: 1px 0; }
+
+.tree-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  padding: 2px 4px;
+  border-radius: 5px;
+  min-height: 26px;
+}
+.tree-row:hover { background: var(--bg-secondary); }
+.tree-row.container { font-weight: 500; }
+
 .tree-toggle {
   display: inline-block;
+  flex-shrink: 0;
   width: 14px;
   color: var(--text-muted);
   font-size: 10px;
+  cursor: pointer;
+  user-select: none;
+  line-height: 22px;
 }
-.tree-key { color: var(--blue); }
+.tree-row.container .tree-toggle:hover { color: var(--accent); }
+
+.tree-key {
+  color: var(--blue);
+  flex-shrink: 0;
+  line-height: 22px;
+  white-space: nowrap;
+}
+.tree-key.renamable { cursor: text; border-radius: 3px; }
+.tree-key.renamable:hover { background: var(--blue-dim); }
+.tree-key.idx { color: var(--text-muted); }
+.tree-colon { color: var(--text-muted); flex-shrink: 0; line-height: 22px; }
+
+.tree-rename-input {
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  color: var(--blue);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  padding: 1px 5px;
+  outline: none;
+  width: 160px;
+}
+
+.tree-bracket { color: var(--text-secondary); cursor: pointer; line-height: 22px; white-space: nowrap; }
+
+.tree-hint {
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  line-height: 22px;
+  opacity: 0.75;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 1;
+  min-width: 0;
+}
+
+/* ── 値の入力 ── */
+.tree-input {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--green);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  padding: 2px 6px;
+  outline: none;
+  min-width: 0;
+}
+.tree-input:hover { border-color: var(--border-active); }
+.tree-input:focus { border-color: var(--accent); background: var(--bg-tertiary); }
+.tree-input.str { flex: 1; max-width: 660px; }
+.tree-input.num { color: var(--orange); width: 110px; flex-shrink: 0; }
+.tree-input.num.invalid { border-color: var(--red); color: var(--red); }
+.tree-input.multiline {
+  flex: 1;
+  max-width: 720px;
+  resize: vertical;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.tree-bool-toggle {
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 2px 10px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all 0.15s;
+}
+.tree-bool-toggle.on {
+  background: var(--accent-dim);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+.tree-bool-toggle.off {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+.tree-bool-toggle:hover { border-color: var(--accent-hover); }
+
+.tree-null {
+  color: var(--text-muted);
+  font-style: italic;
+  line-height: 22px;
+  flex-shrink: 0;
+}
+
+/* ── 行アクション（普段は薄く、ホバーで出す） ── */
+.tree-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.tree-row:hover .tree-actions,
+.tree-actions:focus-within { opacity: 1; }
+
+.tree-type-select {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  padding: 2px 4px;
+  outline: none;
+  cursor: pointer;
+}
+.tree-type-select:focus { border-color: var(--accent); }
+
+.tree-act {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 6px;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+.tree-act:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-primary); border-color: var(--border); }
+.tree-act:disabled { opacity: 0.25; cursor: not-allowed; }
+.tree-act.danger:hover { background: var(--red-dim); color: var(--red); border-color: var(--red); }
+
+/* ── 追加フォーム ── */
+.tree-add-row { padding: 2px 4px; display: flex; gap: 6px; }
+.tree-add-btn {
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: 5px;
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  padding: 3px 10px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.tree-add-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+
+.tree-add-form {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px;
+  flex-wrap: wrap;
+}
+.tree-add-key {
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  color: var(--blue);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  padding: 3px 8px;
+  outline: none;
+  width: 180px;
+}
+
+/* ── 部分ツリーのJSON直接編集 ── */
+.tree-json-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  margin: 4px 0 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-active);
+  border-radius: var(--radius-sm);
+}
+.tree-json-area {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 8px 10px;
+  outline: none;
+  resize: vertical;
+  white-space: pre;
+  overflow-x: auto;
+}
+.tree-json-area:focus { border-color: var(--accent); }
+.tree-json-err { color: var(--red); font-size: 11px; font-family: var(--font-sans); }
+.tree-json-actions { display: flex; gap: 6px; }
+
+/* ── 構文エラーでツリーが出せない時 ── */
+.tree-broken {
+  max-width: 620px;
+  margin: 40px auto;
+  padding: 28px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  text-align: center;
+  font-family: var(--font-sans);
+}
+.tree-broken-icon { font-size: 34px; margin-bottom: 10px; }
+.tree-broken-title { font-size: 14px; font-weight: 600; margin-bottom: 10px; }
+.tree-broken-msg {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--red);
+  background: var(--red-dim);
+  border-radius: 5px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  word-break: break-word;
+}
+.tree-broken-hint { font-size: 12px; color: var(--text-muted); margin-bottom: 16px; line-height: 1.7; }
+.tree-broken-actions { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+
+/* タッチ端末はホバーが無いので、行アクションを常に見せる */
+@media (hover: none) {
+  .tree-actions { opacity: 1; }
+}
+
+/* 旧ツリービュー互換（値の色分け） */
 .tree-str { color: var(--green); }
 .tree-num { color: var(--orange); }
 .tree-bool { color: var(--purple); }
-.tree-null { color: var(--text-muted); font-style: italic; }
-.tree-bracket { color: var(--text-secondary); }
 
 /* ─ ログイン ─ */
 .login-container {
@@ -494,6 +828,24 @@ body {
     flex-direction: column;
     align-items: flex-start;
   }
+
+  /* ── ツリーエディタのモバイル調整 ── */
+  /* 説明文は横幅を食うので隠し、入力欄に幅を回す。行は折り返して縦に伸ばす */
+  .tree-container {
+    --tree-indent: 9px;
+    padding: 8px 10px 60px;
+    font-size: 12px;
+  }
+  .tree-hint { display: none; }
+  .tree-row { flex-wrap: wrap; }
+  .tree-input.str,
+  .tree-input.multiline { max-width: none; min-width: 120px; }
+  .tree-input.num { width: 90px; }
+  .tree-actions { opacity: 1; }          /* タップで届くよう常時表示 */
+  .tree-toolbar { padding: 8px 10px; }
+  .tree-usage-hint { padding: 6px 10px; font-size: 10px; }
+  .tree-add-key { width: 130px; }
+  .tree-rename-input { width: 120px; }
 }
 
 /* ════════════════════════════════════════════════

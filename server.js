@@ -10,6 +10,7 @@ const { WebSocketServer } = require('ws');
 const { startAgentServer } = require('./agent_proxy');
 const { createLlmPool } = require('./llm_pool');
 const { createOrchestrator, validateWorkflow } = require('./orchestrator');
+const { createGoogleDrive } = require('./google_drive');
 
 // systemd等で起動された際、カレントディレクトリをserver.jsと同じに固定する
 // これにより相対パスでアクセスされるリソース(モデルキャッシュ等)も安定動作する
@@ -136,6 +137,37 @@ const DEFAULT_CONFIG = {
     defaultWorkflow: '',      // チャット画面で初期選択するワークフローID (空=未選択)
     workflows: [],            // ワークフロー定義。UIのエディタから編集・保存される
   },
+  // ─── Google Drive 連携 ───
+  // LLM が Drive のファイルを検索・閲覧し、必要なら書き込み・サーバー取り込みまで行う。
+  // 認証は2方式:
+  //   'oauth'          … 個人アカウントをブラウザで一度だけ認可 (推奨・手軽)
+  //   'serviceAccount' … サービスアカウントJSONキー (ヘッドレス/共有ドライブ向け)
+  // 秘密情報の扱い: clientSecret は /config で公開されない。リフレッシュトークンは
+  // config.json ではなく tokenFile (既定 gdrive_token.json、chmod 600) に保存される。
+  googleDrive: {
+    enabled: false,                 // 機能の有効化
+    authMode: 'oauth',              // 'oauth' | 'serviceAccount'
+    // ── OAuth (Google Cloud Console → 認証情報 → OAuth クライアントID → ウェブアプリケーション) ──
+    clientId: '',
+    clientSecret: '',
+    // 承認済みリダイレクトURIに、この値をそのまま登録すること
+    redirectUri: 'http://localhost:3000/gdrive/auth/callback',
+    // ── サービスアカウント ──
+    serviceAccountKeyFile: '',      // JSONキーのパス (相対ならサーバーのディレクトリ基準)
+    impersonateUser: '',            // Workspace のドメイン全体の委任で代理するユーザー
+    // ── アクセス制御 ──
+    rootFolderId: '',               // 指定するとこのフォルダ配下だけに限定 (サンドボックス)
+    readOnly: true,                 // true = 読み取り専用 (書き込みツールを出さない)
+    allowWrite: false,              // readOnly:false と両方 true で書き込み許可
+    allowDelete: false,             // ゴミ箱への移動/削除を許可
+    // ── 上限 ──
+    maxDownloadMB: 20,              // 1ファイルのダウンロード上限
+    maxUploadMB: 20,                // 1ファイルのアップロード上限
+    maxTextChars: 20000,            // LLM に渡すテキストの最大文字数
+    defaultPageSize: 30,            // 一覧・検索の既定件数
+    sharedDrives: true,             // 共有ドライブ(旧チームドライブ)も対象に含める
+    tokenFile: 'gdrive_token.json', // リフレッシュトークンの保存先
+  },
   ragTopK: 10,
   ragMode: 'agentic',
   systemPrompts: {
@@ -144,6 +176,7 @@ const DEFAULT_CONFIG = {
     webSearch: '最新の情報や知らないことについては web_search ツールでインターネット検索できます。',
     fileAccess: '【サーバーファイル操作】(uploads配下、ドキュメントとは別物)\n- list_files: uploadsフォルダの一覧を取得\n- read_file(path): uploadsフォルダのファイル読み込み\n- write_file(path, content): uploadsフォルダにファイル書き込み\n重要: pathには"uploads/"プレフィックスを付けずにファイル名のみを指定してください（例: "hello.py"、"data/config.json"）。\nユーザーが明確に「サーバーファイル」「uploadsフォルダ」「ファイルを保存して」など、サーバー側のファイルシステム操作を依頼した場合のみ使用してください。\nチャットに添付されたドキュメントについての質問では list_files/read_file/write_file は使わず、search_documents を使ってください。',
     python: 'Pythonコード実行について:\n- 応答に ```python ... ``` のコードブロックを含めると、ユーザー側で実行ボタンが表示されます。\n- グラフ・図の作成依頼には matplotlib を使ったPythonコードを提示してください（matplotlib.use(\'Agg\')の指定は不要、plt.show()で自動的にチャットに画像表示されます）。\n- データ処理・計算・可視化の依頼では、迷わずPythonコードブロックを返してください。それだけで完結します。ツール呼び出しは不要です。\n- 大量データ・CSV/Parquet/JSON処理・複雑な集計には DuckDB を使ってください。SQLでpandasより高速かつメモリ効率良く処理できます。\n  使い方: import duckdb; con = duckdb.connect(); df = con.execute("SELECT ... FROM \'data.csv\'").df()\n  CSVやParquetを直接 FROM で参照可能。pandasのDataFrameもテーブルとして使えます（con.execute("SELECT ... FROM df")）。',
+    googleDrive: '【Google Drive】(サーバーのuploadsフォルダとも、チャット添付ドキュメントとも別物)\n- gdrive_search_files(query): Drive 全体からファイル名・本文で検索\n- gdrive_list_files(folderId): フォルダの中身を一覧 (folderId は省略可、フォルダ名やパスでも指定できる)\n- gdrive_read_file(fileId): ファイルの中身をテキストで読む (Google ドキュメント/スプレッドシートは自動でテキスト/CSVに変換される)\n- gdrive_import_to_server(fileId): Drive のファイルをサーバーの uploads に取り込む (Pythonで処理したい時やバイナリの時)\n- gdrive_write_file(name, content): Drive にファイルを作成/更新\n- gdrive_upload_from_server(path): uploads のファイルを Drive にアップロード\n- gdrive_create_folder(name): フォルダ作成\n- gdrive_delete_file(fileId): ゴミ箱に移動\n使い方の指針: まず gdrive_search_files か gdrive_list_files で目的のファイルを特定し、返ってきた id を gdrive_read_file に渡すこと。IDが分からないうちに読もうとしないこと。\nIDは長くて写し間違えやすいので、自信が無ければ一覧の【通し番号 (1, 2, 3...)】か【ファイル名】を fileId に渡してもよい。読み込みに失敗しても、同じIDで何度も試さず、候補の番号か名前で指定し直すこと。\nユーザーが「ドライブ」「Google Drive」「グーグルドライブ」「クラウドのファイル」等に言及した場合に使ってください。',
     meta: '重要な指示:\n- 内部的な推論・検索戦略・計画・メタ的な説明は一切出力しないでください。\n- "I need to...", "The user wants...", "I should..." のような独り言を書かないでください。\n- ツールを呼び出すと決めたら、即座にツールを呼び出してください。テキスト応答と併用しないでください。\n- 検索結果が得られなかった場合は、その旨を簡潔に伝え、自分の知識で回答してください。',
     judge: '以下の中から必要なツールを呼び出してください。通常の質問に答えられる場合はツールを使わずそのまま応答してください。\n{toolList}\n注意: チャット添付ドキュメントとサーバーuploadsファイルは別物。ドキュメント関連は search_documents、サーバーファイル関連は list_files/read_file/write_file。\nグラフ・計算・データ処理はツール不要。```python ... ``` コードブロックを応答に含めれば自動実行されます（matplotlibで画像表示、DuckDBで高速SQL処理可能）。\n内部推論は書かず、ツールを呼ぶか直接短く応答するかのみ。',
   },
@@ -180,7 +213,7 @@ function loadConfig() {
     if (fs.existsSync(CONFIG_FILE)) {
       const userConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
       const merged = { ...DEFAULT_CONFIG, ...userConfig };
-      ['systemPrompts', 'agentContext', 'transcribe', 'llamaServer', 'embeddingModel', 'ml', 'irodoriTts', 'orchestration'].forEach(key => {
+      ['systemPrompts', 'agentContext', 'transcribe', 'llamaServer', 'embeddingModel', 'ml', 'irodoriTts', 'orchestration', 'googleDrive'].forEach(key => {
         if (DEFAULT_CONFIG[key] && typeof DEFAULT_CONFIG[key] === 'object') {
           merged[key] = { ...DEFAULT_CONFIG[key], ...(userConfig[key] || {}) };
         }
@@ -191,6 +224,15 @@ function loadConfig() {
   return { ...DEFAULT_CONFIG };
 }
 const appConfig = loadConfig();
+
+// ─── Google Drive クライアント ───
+// 設定は毎回 appConfig から読む (config.json 編集 → 再起動で反映)。
+// log は関数宣言なので巻き上げにより、この時点で参照しても問題ない。
+const gdrive = createGoogleDrive({
+  getConfig: () => appConfig.googleDrive,
+  baseDir: __dirname,
+  log: (ip, msg) => log(ip, msg),
+});
 
 // ─── llama-server プロセス管理 ───
 // 1チャットモデル + 1Embeddingモデルを別プロセスで管理
@@ -437,6 +479,36 @@ function buildAgentDeps() {
     searchDocumentsSimple: async (query) => {
       return await ragSearch(query, 5);
     },
+    // ─── Google Drive ───
+    // agent_proxy は gdrive.* をそのまま呼ぶ。取り込み/書き出しだけは
+    // uploads の安全なパス解決が要るのでここでラップする。
+    gdrive,
+    gdriveImportToServer: async (fileId, savePath, preferOffice) => {
+      const dl = await gdrive.downloadFile(fileId, { preferOffice: !!preferOffice });
+      const rel = savePath || dl.name;
+      const abs = safeUploadPath(rel);
+      if (!abs) throw new Error('保存先パスが不正です');
+      if (dl.buffer.length > MAX_FILE_SIZE) throw new Error(`ファイルが大きすぎます (${dl.buffer.length} bytes)`);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, dl.buffer);
+      return { ok: true, path: rel, size: dl.buffer.length, mimeType: dl.mimeType, exported: dl.exported };
+    },
+    gdriveUploadFromServer: async (relPath, { name, folderId, overwrite, convertToGoogleDoc } = {}) => {
+      const abs = safeUploadPath(relPath);
+      if (!abs) throw new Error('パスが不正です');
+      if (!fs.existsSync(abs)) throw new Error(`ファイルが見つかりません: ${relPath}`);
+      const stat = fs.statSync(abs);
+      if (!stat.isFile()) throw new Error('ファイルではありません');
+      const fileName = name || path.basename(relPath);
+      return await gdrive.uploadFile({
+        name: fileName,
+        buffer: fs.readFileSync(abs),
+        mimeType: gdrive.guessMimeFromName(fileName),
+        folderId,
+        overwrite: overwrite !== false,
+        convertToGoogleDoc: !!convertToGoogleDoc,
+      });
+    },
   };
 }
 
@@ -485,6 +557,16 @@ async function startExternalServer({ modelName, host, port, apiKey, type, https,
       }
       // RAG ツールは embedding サーバーも事前ロードしておく
       ensureEmbeddingLoaded().catch(e => log('-', `[外部API] embedding起動失敗: ${e.message}`));
+    }
+
+    // Google Drive ツールは「有効かつ接続済み」でなければ外す
+    // (未接続のままツールを出すと、LLM が毎回エラーを踏んで無駄なターンを消費する)
+    if (enabledTools.includes('gdrive')) {
+      const st = gdrive.status();
+      if (!st.enabled || !st.connected) {
+        log('-', `[外部API] Google Driveツール無効化: ${st.reason || '未接続'}`);
+        enabledTools = enabledTools.filter(t => t !== 'gdrive');
+      }
     }
 
     const handle = await startAgentServer({
@@ -1875,6 +1957,10 @@ app.post('/external-servers', requireAuth, jsonParser, async (req, res) => {
         const emb = isEmbeddingAvailable();
         warnings.push(`RAGツール (search_documents) はembeddingサーバーが利用できないため無効化されました: ${emb.reason}`);
       }
+      if (removed.includes('gdrive')) {
+        const st = gdrive.status();
+        warnings.push(`Google Driveツール (gdrive_*) は利用できないため無効化されました: ${st.reason || '未接続'}`);
+      }
     }
     res.json({ ok: true, id, apiKey: finalApiKey, tools: actualTools, warnings });
   } catch (e) {
@@ -1892,6 +1978,12 @@ app.get('/external-servers/https-available', requireAuth, (req, res) => {
 app.get('/external-servers/embedding-available', requireAuth, (req, res) => {
   const r = isEmbeddingAvailable();
   res.json(r);
+});
+
+// Google Drive が利用可能か (UIのDriveチェックボックス制御用)
+app.get('/external-servers/gdrive-available', requireAuth, (req, res) => {
+  const st = gdrive.status();
+  res.json({ available: st.enabled && st.connected, reason: st.reason, account: st.account });
 });
 
 app.delete('/external-servers/:id', requireAuth, (req, res) => {
@@ -3723,8 +3815,9 @@ function requirePermission(perm) {
 }
 
 app.get('/config', (req, res) => {
-  // 公開しない: password, llamaServer内のbinPath, embeddingModelの実体パス, ml.apiTokens(機密)
-  const { password, llamaServer, embeddingModel, ml, irodoriTts, ...rest } = appConfig;
+  // 公開しない: password, llamaServer内のbinPath, embeddingModelの実体パス, ml.apiTokens(機密),
+  //             googleDrive の clientId/clientSecret/サービスアカウント鍵(機密)
+  const { password, llamaServer, embeddingModel, ml, irodoriTts, googleDrive, ...rest } = appConfig;
   const safeConfig = {
     ...rest,
     // llamaServer情報は最小限のみ
@@ -3732,6 +3825,16 @@ app.get('/config', (req, res) => {
     // ml は enabled のみ公開、apiTokens(機密)は出さない
     ml: { enabled: !!(ml?.enabled) },
   };
+  // Google Drive は「使えるか / 書けるか」だけ公開。認証情報は一切出さない
+  if (googleDrive) {
+    safeConfig.googleDrive = {
+      enabled: !!googleDrive.enabled,
+      readOnly: !(googleDrive.allowWrite && googleDrive.readOnly === false),
+      allowWrite: !!(googleDrive.allowWrite && googleDrive.readOnly === false),
+      allowDelete: !!googleDrive.allowDelete,
+      authMode: googleDrive.authMode === 'serviceAccount' ? 'serviceAccount' : 'oauth',
+    };
+  }
   // irodoriTts は機密(command/args/cwd/env/host/port)を伏せ、UI表示用の最小限のみ公開
   if (irodoriTts) {
     safeConfig.irodoriTts = {
@@ -4365,6 +4468,339 @@ app.delete('/files/*', requireAuth, (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ════════════════════════════════════════════════════════════════
+// Google Drive 連携 API
+// ════════════════════════════════════════════════════════════════
+// ブラウザUI (右パネルの「☁️ Drive」タブ) と、LLM のツール実行の両方から使う。
+// 秘密情報 (clientSecret / refreshToken) はこのAPIからは一切返さない。
+//
+// 権限:
+//   参照系 … requirePermission('gdrive:read')
+//   更新系 … requirePermission('gdrive:write')
+// Cookie セッション (ブラウザ) は全権限扱い。外部APIトークンは config.json の
+// ml.apiTokens[].permissions で個別に絞れる。
+
+// OAuth の state (CSRF対策)。発行から10分で失効
+const gdriveOAuthStates = new Map();  // state -> { at, ip }
+function issueGdriveState(ip) {
+  const state = crypto.randomBytes(24).toString('hex');
+  gdriveOAuthStates.set(state, { at: Date.now(), ip });
+  // 古いものを掃除
+  const now = Date.now();
+  for (const [k, v] of gdriveOAuthStates) {
+    if (now - v.at > 10 * 60 * 1000) gdriveOAuthStates.delete(k);
+  }
+  return state;
+}
+function consumeGdriveState(state) {
+  const rec = gdriveOAuthStates.get(state);
+  if (!rec) return false;
+  gdriveOAuthStates.delete(state);
+  return Date.now() - rec.at <= 10 * 60 * 1000;
+}
+
+// OAuth コールバックの中継ページ。
+// URL から code / state を自分で読み取り、同一サイトの POST でトークン交換させる。
+// サーバー側で値を埋め込まない (= XSS の入り込む余地を作らない) 作りにしている。
+const GDRIVE_CALLBACK_HTML = `<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GDrive 連携</title><style>
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#0f1115;color:#e6e8eb;
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px}
+.card{max-width:520px;padding:32px;border-radius:14px;background:#171a21;border:1px solid #262b36;text-align:center}
+h1{font-size:18px;margin:0 0 12px}p{font-size:13px;line-height:1.7;color:#a6adbb;margin:0 0 8px;word-break:break-word}
+.ic{font-size:40px;margin-bottom:8px}.ok{color:#34d399}.ng{color:#f87171}.wait{color:#60a5fa}
+b{color:#e6e8eb}
+</style></head><body>
+<div class="card">
+  <div class="ic wait" id="ic">⏳</div>
+  <h1 id="title">連携を完了しています...</h1>
+  <p id="msg">Google からの応答を処理しています。</p>
+  <p id="hint"></p>
+</div>
+<script>
+(function () {
+  var ic = document.getElementById('ic');
+  var title = document.getElementById('title');
+  var msg = document.getElementById('msg');
+  var hint = document.getElementById('hint');
+
+  function finish(ok, titleText, msgText) {
+    ic.textContent = ok ? '✅' : '⚠️';
+    ic.className = 'ic ' + (ok ? 'ok' : 'ng');
+    title.textContent = titleText;
+    msg.textContent = msgText || '';
+    hint.textContent = 'このタブは閉じて構いません。';
+    try {
+      if (window.opener) {
+        window.opener.postMessage({ type: 'gdrive-auth', ok: ok, message: msgText || '' }, window.location.origin);
+        if (ok) setTimeout(function () { window.close(); }, 1500);
+      }
+    } catch (e) {}
+  }
+
+  var p = new URLSearchParams(window.location.search);
+  var err = p.get('error');
+  var code = p.get('code');
+  var state = p.get('state');
+
+  if (err) return finish(false, '連携できませんでした', 'Google 側で拒否されました: ' + err);
+  if (!code) return finish(false, '連携できませんでした', '認可コードがありません。');
+
+  // ここは同一サイトの fetch なので、SameSite=Strict のセッションCookieも送信される
+  fetch('/gdrive/auth/exchange', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({ code: code, state: state }),
+  }).then(function (r) {
+    return r.json().catch(function () { return {}; }).then(function (d) { return { ok: r.ok, status: r.status, d: d }; });
+  }).then(function (res) {
+    if (res.ok) {
+      finish(true, 'GDrive と連携しました', res.d.account ? '接続アカウント: ' + res.d.account : '');
+    } else if (res.status === 401) {
+      finish(false, '連携できませんでした', 'OpenGeekLLMChat にログインしていません。元のタブでログインし直してから、もう一度「接続」してください。');
+    } else {
+      finish(false, '連携できませんでした', (res.d && res.d.error) || ('HTTP ' + res.status));
+    }
+  }).catch(function (e) {
+    finish(false, '連携できませんでした', String(e && e.message ? e.message : e));
+  });
+})();
+</script>
+</body></html>`;
+
+// エラー応答の共通化 (Google API のメッセージをそのまま見せた方がデバッグしやすい)
+function gdriveError(res, e, ip, label) {
+  const msg = e?.message || String(e);
+  log(ip, `[Drive] ${label} 失敗: ${msg}`);
+  const status = /未接続|未設定|無効です|読み取り専用|許可されていません/.test(msg) ? 400
+    : /認証|失効/.test(msg) ? 401
+    : /見つかりません/.test(msg) ? 404
+    : /範囲.*外/.test(msg) ? 403
+    : 500;
+  res.status(status).json({ error: msg });
+}
+
+// 接続状態
+app.get('/gdrive/status', requireAuth, (req, res) => {
+  try {
+    res.json(gdrive.status());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 接続テスト (アカウント・空き容量)
+app.get('/gdrive/about', requireAuth, requirePermission('gdrive:read'), async (req, res) => {
+  const ip = getIP(req);
+  try {
+    const info = await gdrive.about();
+    log(ip, `[Drive] 接続確認 OK (${info.user?.emailAddress || '-'})`);
+    res.json(info);
+  } catch (e) { gdriveError(res, e, ip, '接続確認'); }
+});
+
+// 認可URLの発行 (ブラウザはここで返るURLに遷移する)
+app.get('/gdrive/auth/url', requireAuth, (req, res) => {
+  const ip = getIP(req);
+  try {
+    if (appConfig.googleDrive?.authMode === 'serviceAccount') {
+      return res.status(400).json({ error: 'サービスアカウント方式ではブラウザ認可は不要です' });
+    }
+    const state = issueGdriveState(ip);
+    res.json({ url: gdrive.buildAuthUrl(state) });
+  } catch (e) { gdriveError(res, e, ip, '認可URL発行'); }
+});
+
+// OAuth コールバック (Google からブラウザがリダイレクトされてくる)
+//
+// ⚠️ ここに requireAuth は掛けられない。
+// Google からのリダイレクトは accounts.google.com → 当サーバー への
+// 「クロスサイトのトップレベル遷移」なので、セッションCookie (wz_session) は
+// SameSite=Strict によりブラウザから送信されない。requireAuth を掛けると
+// 必ず {"error":"認証が必要です"} になってしまう。
+//
+// そこでこのエンドポイントは【何も特権的なことをしない中継ページ】を返すだけにする。
+// ページ内の JavaScript から同一サイトの POST /gdrive/auth/exchange を叩くと、
+// そのリクエストは same-site 扱いになるので Strict Cookie が正しく送られ、
+// 認証つきでトークン交換ができる。
+// (セッションCookieを SameSite=Lax に緩める手もあるが、アプリ全体のCSRF耐性を
+//  この機能のために下げたくないので中継ページ方式にしている)
+app.get('/gdrive/auth/callback', (req, res) => {
+  res.type('html').send(GDRIVE_CALLBACK_HTML);
+});
+
+// 認可コード → リフレッシュトークンの交換 (中継ページから same-site で呼ばれる)
+// ここは通常どおり認証必須。state も1回限りで消費する。
+app.post('/gdrive/auth/exchange', requireAuth, jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  const { code, state } = req.body || {};
+  if (!code) return res.status(400).json({ error: '認可コードがありません' });
+  if (!state || !consumeGdriveState(String(state))) {
+    log(ip, '[Drive] state 不一致 (CSRFの疑い、有効期限切れ、または再読み込み)');
+    return res.status(400).json({
+      error: 'この認可リクエストを確認できませんでした。有効期限切れか、すでに使用済みです。もう一度「接続」からやり直してください',
+    });
+  }
+  try {
+    const r = await gdrive.exchangeCode(String(code));
+    log(ip, `[Drive] 連携完了 (${r.account || 'アカウント不明'})`);
+    res.json({ ok: true, account: r.account || '' });
+  } catch (e) {
+    log(ip, `[Drive] トークン交換失敗: ${e.message}`);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 連携解除
+app.post('/gdrive/disconnect', requireAuth, requirePermission('gdrive:write'), async (req, res) => {
+  const ip = getIP(req);
+  try {
+    await gdrive.disconnect();
+    log(ip, '[Drive] 連携を解除しました');
+    res.json({ ok: true });
+  } catch (e) { gdriveError(res, e, ip, '連携解除'); }
+});
+
+// ファイル一覧 (フォルダの中身)
+app.get('/gdrive/files', requireAuth, requirePermission('gdrive:read'), async (req, res) => {
+  const ip = getIP(req);
+  try {
+    const r = await gdrive.listFiles({
+      folderId: req.query.folderId,
+      query: req.query.q,
+      pageSize: req.query.pageSize,
+      pageToken: req.query.pageToken,
+      orderBy: req.query.orderBy,
+      onlyFolders: req.query.onlyFolders === '1',
+    });
+    log(ip, `[Drive] 一覧取得 folder=${r.folderId} (${r.files.length}件)`);
+    res.json(r);
+  } catch (e) { gdriveError(res, e, ip, '一覧取得'); }
+});
+
+// 検索 (ドライブ横断)
+app.get('/gdrive/search', requireAuth, requirePermission('gdrive:read'), async (req, res) => {
+  const ip = getIP(req);
+  try {
+    const r = await gdrive.searchFiles({
+      query: req.query.q,
+      folderId: req.query.folderId,
+      mimeType: req.query.mimeType,
+      pageSize: req.query.pageSize,
+      pageToken: req.query.pageToken,
+    });
+    log(ip, `[Drive] 検索「${req.query.q}」 (${r.files.length}件)`);
+    res.json(r);
+  } catch (e) { gdriveError(res, e, ip, '検索'); }
+});
+
+// メタデータ
+app.get('/gdrive/files/:id', requireAuth, requirePermission('gdrive:read'), async (req, res) => {
+  const ip = getIP(req);
+  try {
+    res.json(await gdrive.getFile(req.params.id));
+  } catch (e) { gdriveError(res, e, ip, 'メタデータ取得'); }
+});
+
+// 中身をテキストで取得 (?raw=1 でバイナリのまま配信)
+app.get('/gdrive/files/:id/content', requireAuth, requirePermission('gdrive:read'), async (req, res) => {
+  const ip = getIP(req);
+  try {
+    if (req.query.raw === '1') {
+      const dl = await gdrive.downloadFile(req.params.id, { preferOffice: req.query.office === '1' });
+      log(ip, `[Drive] ダウンロード ${dl.name} (${dl.buffer.length} bytes)`);
+      res.setHeader('Content-Type', dl.mimeType || 'application/octet-stream');
+      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(dl.name)}`);
+      return res.send(dl.buffer);
+    }
+    const r = await gdrive.readFileAsText(req.params.id, { maxChars: Number(req.query.maxChars) || undefined });
+    log(ip, `[Drive] 読み込み ${r.name} (${r.content.length}文字${r.truncated ? '/切り詰めあり' : ''})`);
+    res.json(r);
+  } catch (e) { gdriveError(res, e, ip, 'ファイル読み込み'); }
+});
+
+// 作成/更新 (テキスト)
+app.post('/gdrive/files', requireAuth, requirePermission('gdrive:write'), jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  try {
+    const { name, content, mimeType, folderId, fileId, overwrite, convertToGoogleDoc } = req.body || {};
+    const r = await gdrive.uploadFile({ name, content, mimeType, folderId, fileId, overwrite, convertToGoogleDoc });
+    log(ip, `[Drive] ${r.updated ? '更新' : '作成'} ${r.name} (${r.bytes} bytes)`);
+    res.json(r);
+  } catch (e) { gdriveError(res, e, ip, 'ファイル書き込み'); }
+});
+
+// フォルダ作成
+app.post('/gdrive/folders', requireAuth, requirePermission('gdrive:write'), jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  try {
+    const r = await gdrive.createFolder({ name: req.body?.name, folderId: req.body?.folderId });
+    log(ip, `[Drive] フォルダ作成 ${r.name}`);
+    res.json(r);
+  } catch (e) { gdriveError(res, e, ip, 'フォルダ作成'); }
+});
+
+// 削除 (既定はゴミ箱)
+app.delete('/gdrive/files/:id', requireAuth, requirePermission('gdrive:write'), async (req, res) => {
+  const ip = getIP(req);
+  try {
+    const r = await gdrive.deleteFile(req.params.id, { permanent: req.query.permanent === '1' });
+    log(ip, `[Drive] 削除 ${req.params.id} (${r.permanent ? '完全削除' : 'ゴミ箱'})`);
+    res.json(r);
+  } catch (e) { gdriveError(res, e, ip, '削除'); }
+});
+
+// Drive → サーバー (public/uploads) に取り込む
+// バイナリ・大きいファイル・Pythonで処理したいデータはこれを使う。
+app.post('/gdrive/import', requireAuth, requirePermission('gdrive:write'), jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  try {
+    const { fileId, savePath, preferOffice } = req.body || {};
+    if (!fileId) return res.status(400).json({ error: 'fileId が必要です' });
+    const dl = await gdrive.downloadFile(fileId, { preferOffice: !!preferOffice });
+    // 保存先: 指定がなければ Drive 上の名前をそのまま uploads 直下に
+    const rel = savePath || dl.name;
+    const abs = safeUploadPath(rel);
+    if (!abs) return res.status(400).json({ error: '保存先パスが不正です' });
+    if (dl.buffer.length > MAX_FILE_SIZE) {
+      return res.status(413).json({ error: `ファイルが大きすぎます (${dl.buffer.length} bytes)` });
+    }
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, dl.buffer);
+    log(ip, `[Drive] 取り込み ${dl.name} → uploads/${rel} (${dl.buffer.length} bytes)`);
+    res.json({ ok: true, path: rel, size: dl.buffer.length, mimeType: dl.mimeType, exported: dl.exported, driveFile: dl.meta });
+  } catch (e) { gdriveError(res, e, ip, '取り込み'); }
+});
+
+// サーバー (public/uploads) → Drive にアップロード
+app.post('/gdrive/export', requireAuth, requirePermission('gdrive:write'), jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  try {
+    const { path: relPath, name, folderId, overwrite, convertToGoogleDoc } = req.body || {};
+    if (!relPath) return res.status(400).json({ error: 'path (uploads配下の相対パス) が必要です' });
+    const abs = safeUploadPath(relPath);
+    if (!abs) return res.status(400).json({ error: 'パスが不正です' });
+    if (!fs.existsSync(abs)) return res.status(404).json({ error: `ファイルが見つかりません: ${relPath}` });
+    const stat = fs.statSync(abs);
+    if (!stat.isFile()) return res.status(400).json({ error: 'ファイルではありません' });
+
+    const buffer = fs.readFileSync(abs);
+    const fileName = name || path.basename(relPath);
+    const r = await gdrive.uploadFile({
+      name: fileName,
+      buffer,
+      mimeType: gdrive.guessMimeFromName(fileName),
+      folderId,
+      overwrite: overwrite !== false,
+      convertToGoogleDoc: !!convertToGoogleDoc,
+    });
+    log(ip, `[Drive] アップロード uploads/${relPath} → ${r.name} (${r.bytes} bytes)`);
+    res.json(r);
+  } catch (e) { gdriveError(res, e, ip, 'アップロード'); }
 });
 
 // ─── ユーザーアイコン (config.userIcon にパス保存、画像は public/uploads へ) ───

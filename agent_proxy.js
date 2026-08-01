@@ -6,7 +6,8 @@
  * server.js 内に Express アプリを立てて別ポートで listen し、
  * /v1/chat/completions を受けてエージェントループ (ツール判断→実行→最終応答) を回す。
  *
- * 対応ツール: ml_* (5), web_search, read_file, list_files, search_documents(簡易RAG)
+ * 対応ツール: ml_* (5), rl_* (6), web_search, read_file, list_files,
+ *             search_documents(簡易RAG), gdrive_* (Google Drive)
  * 非対応: generate_image, python実行 (セキュリティ・複雑性のため外部公開しない)
  *
  * server.js から提供される deps オブジェクト経由で内部関数を呼ぶ (循環参照回避)。
@@ -40,6 +41,7 @@ async function startAgentServer(opts, deps) {
     runMlPredict,                 // ML推論 (server.jsのspawn処理をラップ)
     UPLOADS_DIR,                  // ファイル操作
     listUploadFiles, readUploadFile,
+    gdrive,                       // Google Drive クライアント
   } = deps;
 
   const app = express();
@@ -118,7 +120,7 @@ async function startAgentServer(opts, deps) {
       }
 
       // ツール定義を構築
-      const tools = buildToolDefs(enabledTools, appConfig);
+      const tools = buildToolDefs(enabledTools, appConfig, deps);
 
       // エージェントループ
       const result = await runAgentLoop({
@@ -223,7 +225,7 @@ async function startAgentServer(opts, deps) {
 /**
  * ツール定義を構築 (OpenAI function calling 形式)
  */
-function buildToolDefs(enabledTools, appConfig) {
+function buildToolDefs(enabledTools, appConfig, deps = {}) {
   const tools = [];
 
   if (enabledTools.includes('web_search')) {
@@ -420,6 +422,144 @@ function buildToolDefs(enabledTools, appConfig) {
     });
   }
 
+  // ─── Google Drive ───
+  // 接続済みのときだけツールを出す (未接続だと LLM がエラーを踏んでターンを浪費するため)
+  if (enabledTools.includes('gdrive') && deps.gdrive) {
+    const st = (() => { try { return deps.gdrive.status(); } catch { return { enabled: false, connected: false }; } })();
+    if (st.enabled && st.connected) {
+      tools.push({
+        type: 'function',
+        function: {
+          name: 'gdrive_search_files',
+          description: 'Google Drive 上のファイルを、ファイル名と本文の全文検索で探す。「ドライブの〜という資料」「Google Drive にある〜」のような依頼で最初に使う。返ってきた id を gdrive_read_file に渡して中身を読む。',
+          parameters: {
+            type: 'object',
+            properties: {
+              query: { type: 'string', description: '検索キーワード (ファイル名の一部、または本文に含まれる語)' },
+              folderId: { type: 'string', description: '任意: 特定フォルダに絞る場合のフォルダIDまたはフォルダ名' },
+              pageSize: { type: 'number', description: '任意: 最大件数 (既定20)' },
+            },
+            required: ['query'],
+          },
+        },
+      });
+      tools.push({
+        type: 'function',
+        function: {
+          name: 'gdrive_list_files',
+          description: 'Google Drive のフォルダの中身を一覧する。folderId を省略するとマイドライブ直下 (rootFolderId 設定時はその配下)。folderId にはIDのほか "資料/2026年度" のようなフォルダパスも指定できる。',
+          parameters: {
+            type: 'object',
+            properties: {
+              folderId: { type: 'string', description: '任意: フォルダIDまたはフォルダ名/パス' },
+              query: { type: 'string', description: '任意: このフォルダ内で名前を絞り込むキーワード' },
+              pageSize: { type: 'number', description: '任意: 最大件数 (既定30)' },
+            },
+          },
+        },
+      });
+      tools.push({
+        type: 'function',
+        function: {
+          name: 'gdrive_read_file',
+          description: 'Google Drive のファイルの中身をテキストで読む。Google ドキュメントはテキスト、スプレッドシートはCSVに自動変換される。fileId には gdrive_search_files / gdrive_list_files で得た id を渡すこと (ファイル名でも可)。PDFや画像などのバイナリは読めないので gdrive_import_to_server を使う。',
+          parameters: {
+            type: 'object',
+            properties: {
+              fileId: { type: 'string', description: 'ファイルID (推奨) またはファイル名' },
+              maxChars: { type: 'number', description: '任意: 取得する最大文字数' },
+            },
+            required: ['fileId'],
+          },
+        },
+      });
+      tools.push({
+        type: 'function',
+        function: {
+          name: 'gdrive_import_to_server',
+          description: 'Google Drive のファイルをサーバーの uploads フォルダに取り込む。PDF・画像・Excel等そのままでは読めないファイルや、後で処理したいデータに使う。取り込み後は read_file で参照できる。',
+          parameters: {
+            type: 'object',
+            properties: {
+              fileId: { type: 'string', description: 'ファイルID (推奨) またはファイル名' },
+              savePath: { type: 'string', description: '任意: uploads 配下の保存先相対パス (省略時は Drive 上の名前)' },
+            },
+            required: ['fileId'],
+          },
+        },
+      });
+
+      if (st.allowWrite) {
+        tools.push({
+          type: 'function',
+          function: {
+            name: 'gdrive_write_file',
+            description: 'Google Drive にテキストファイルを作成または更新する。fileId を指定すると更新、指定しなければ folderId の中に name で新規作成する。',
+            parameters: {
+              type: 'object',
+              properties: {
+                name: { type: 'string', description: 'ファイル名 (新規作成時は必須。拡張子を付けるとMIMEが決まる)' },
+                content: { type: 'string', description: 'ファイルの内容 (テキスト)' },
+                folderId: { type: 'string', description: '任意: 作成先フォルダIDまたはフォルダ名/パス' },
+                fileId: { type: 'string', description: '任意: 更新したい既存ファイルのID' },
+                overwrite: { type: 'boolean', description: '任意: 同名ファイルがあれば上書きする (既定false)' },
+              },
+              required: ['content'],
+            },
+          },
+        });
+        tools.push({
+          type: 'function',
+          function: {
+            name: 'gdrive_upload_from_server',
+            description: 'サーバーの uploads フォルダにあるファイルを Google Drive にアップロードする。バイナリも可。',
+            parameters: {
+              type: 'object',
+              properties: {
+                path: { type: 'string', description: 'uploads 配下の相対パス (例: "report.csv")' },
+                name: { type: 'string', description: '任意: Drive 上でのファイル名 (省略時は元のファイル名)' },
+                folderId: { type: 'string', description: '任意: アップロード先フォルダIDまたはフォルダ名/パス' },
+              },
+              required: ['path'],
+            },
+          },
+        });
+        tools.push({
+          type: 'function',
+          function: {
+            name: 'gdrive_create_folder',
+            description: 'Google Drive にフォルダを作成する。',
+            parameters: {
+              type: 'object',
+              properties: {
+                name: { type: 'string', description: 'フォルダ名' },
+                folderId: { type: 'string', description: '任意: 親フォルダIDまたはフォルダ名/パス' },
+              },
+              required: ['name'],
+            },
+          },
+        });
+      }
+
+      if (st.allowDelete) {
+        tools.push({
+          type: 'function',
+          function: {
+            name: 'gdrive_delete_file',
+            description: 'Google Drive のファイルをゴミ箱に移動する。ユーザーが明確に削除を依頼した時だけ使うこと。',
+            parameters: {
+              type: 'object',
+              properties: {
+                fileId: { type: 'string', description: 'ファイルID (推奨) またはファイル名' },
+              },
+              required: ['fileId'],
+            },
+          },
+        });
+      }
+    }
+  }
+
   if (enabledTools.includes('rag')) {
     tools.push({
       type: 'function',
@@ -535,7 +675,14 @@ async function executeTool(fnName, fnArgs, deps, ip) {
     rlOnlineAct, rlOnlineLearn,
     listUploadFiles, readUploadFile,
     searchDocumentsSimple,
+    gdrive, gdriveImportToServer, gdriveUploadFromServer,
   } = deps;
+
+  // Google Drive ツールの共通ガード
+  const needGdrive = () => {
+    if (!gdrive) throw new Error('Google Drive 連携が利用できません');
+    return gdrive;
+  };
 
   switch (fnName) {
     case 'web_search': {
@@ -703,6 +850,59 @@ async function executeTool(fnName, fnArgs, deps, ip) {
       } catch (e) {
         return { error: e.message };
       }
+    }
+
+    // ─── Google Drive ───
+    case 'gdrive_search_files': {
+      const r = await needGdrive().searchFiles({
+        query: fnArgs.query, folderId: fnArgs.folderId, pageSize: fnArgs.pageSize,
+      });
+      return { files: r.files, count: r.files.length };
+    }
+
+    case 'gdrive_list_files': {
+      const r = await needGdrive().listFiles({
+        folderId: fnArgs.folderId, query: fnArgs.query, pageSize: fnArgs.pageSize,
+      });
+      return { folderId: r.folderId, files: r.files, count: r.files.length };
+    }
+
+    case 'gdrive_read_file': {
+      const id = fnArgs.fileId || fnArgs.id || fnArgs.name || fnArgs.file;
+      return await needGdrive().readFileAsText(id, { maxChars: fnArgs.maxChars });
+    }
+
+    case 'gdrive_import_to_server': {
+      if (!gdriveImportToServer) throw new Error('Google Drive の取り込みは利用できません');
+      const id = fnArgs.fileId || fnArgs.id || fnArgs.name || fnArgs.file;
+      return await gdriveImportToServer(id, fnArgs.savePath, fnArgs.preferOffice);
+    }
+
+    case 'gdrive_write_file': {
+      return await needGdrive().uploadFile({
+        name: fnArgs.name,
+        content: fnArgs.content,
+        folderId: fnArgs.folderId,
+        fileId: fnArgs.fileId,
+        overwrite: !!fnArgs.overwrite,
+        mimeType: fnArgs.mimeType,
+      });
+    }
+
+    case 'gdrive_upload_from_server': {
+      if (!gdriveUploadFromServer) throw new Error('Google Drive へのアップロードは利用できません');
+      return await gdriveUploadFromServer(fnArgs.path, {
+        name: fnArgs.name, folderId: fnArgs.folderId, overwrite: fnArgs.overwrite,
+      });
+    }
+
+    case 'gdrive_create_folder': {
+      return await needGdrive().createFolder({ name: fnArgs.name, folderId: fnArgs.folderId });
+    }
+
+    case 'gdrive_delete_file': {
+      const id = fnArgs.fileId || fnArgs.id || fnArgs.name || fnArgs.file;
+      return await needGdrive().deleteFile(id, { permanent: false });
     }
 
     // 新名 + 後方互換 (search_documents) の両方を受ける

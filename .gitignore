@@ -10,6 +10,11 @@ public/uploads/*
 # HTTPS証明書（秘密鍵を誤コミットしないため）
 cert.pem
 key.pem
+# Google Drive のリフレッシュトークン / サービスアカウントキー（機密）
+gdrive_token.json
+gdrive-service-account*.json
+# 配布用ZIP（更新ファイルをまとめた成果物。ソースではないので追跡しない）
+opengeek-llmchat-*.zip
 # Python venv
 .venv-transcribe/
 # Python キャッシュ

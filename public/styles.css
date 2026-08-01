@@ -851,6 +851,243 @@
     gap: 4px;
   }
 
+  /* ── Google Drive パネル ── */
+  .gdrive-panel-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 4px 0;
+  }
+
+  .gdrive-status-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+
+  .gdrive-status-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .gdrive-status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .gdrive-status-dot.ok { background: var(--accent); box-shadow: 0 0 6px var(--accent-glow); }
+  .gdrive-status-dot.ng { background: var(--text-muted); }
+
+  .gdrive-status-text {
+    flex: 1;
+    min-width: 0;
+    font-size: 12px;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .gdrive-mode-badge {
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+  .gdrive-mode-badge.ro { background: var(--bg-secondary); color: var(--text-muted); border: 1px solid var(--border); }
+  .gdrive-mode-badge.rw { background: var(--accent-dim); color: var(--accent); border: 1px solid var(--accent); }
+
+  .gdrive-status-hint {
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.6;
+  }
+
+  .gdrive-status-actions {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .gdrive-btn {
+    padding: 6px 10px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    font-family: var(--font-sans);
+    font-size: 11px;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .gdrive-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .gdrive-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .gdrive-btn.primary {
+    background: var(--accent-dim);
+    border-color: var(--accent);
+    color: var(--accent);
+    font-weight: 500;
+  }
+  .gdrive-btn.danger:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
+
+  .gdrive-error {
+    padding: 8px 10px;
+    background: var(--red-dim);
+    border: 1px solid var(--red);
+    border-radius: var(--radius-sm);
+    color: var(--red);
+    font-size: 11px;
+    line-height: 1.6;
+    word-break: break-word;
+  }
+
+  .gdrive-search-row {
+    display: flex;
+    gap: 6px;
+  }
+
+  .gdrive-search-input {
+    flex: 1;
+    min-width: 0;
+    padding: 7px 10px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: 12px;
+    outline: none;
+  }
+  .gdrive-search-input:focus { border-color: var(--accent); }
+
+  .gdrive-breadcrumb {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 2px;
+    font-size: 11px;
+    padding: 2px 0;
+  }
+  .gdrive-breadcrumb-sep { color: var(--text-muted); }
+  .gdrive-breadcrumb-item {
+    background: transparent;
+    border: none;
+    color: var(--accent);
+    font-family: var(--font-sans);
+    font-size: 11px;
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: 4px;
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .gdrive-breadcrumb-item:hover { background: var(--accent-dim); }
+  .gdrive-breadcrumb-item.current { color: var(--text-secondary); cursor: default; }
+  .gdrive-breadcrumb-item.current:hover { background: transparent; }
+
+  .gdrive-loading {
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: center;
+    padding: 20px 8px;
+  }
+
+  .gdrive-file-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    transition: border-color 0.15s;
+  }
+  .gdrive-file-item:hover { border-color: var(--accent); }
+
+  .gdrive-file-main {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .gdrive-file-icon { font-size: 15px; flex-shrink: 0; }
+
+  .gdrive-file-info { flex: 1; min-width: 0; overflow: hidden; }
+
+  .gdrive-file-name {
+    font-size: 12px;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .gdrive-file-meta {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+
+  .gdrive-file-actions {
+    display: flex;
+    gap: 2px;
+    flex-shrink: 0;
+  }
+
+  .gdrive-icon-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 4px 5px;
+    border-radius: 4px;
+    text-decoration: none;
+    transition: background 0.15s;
+  }
+  .gdrive-icon-btn:hover:not(:disabled) { background: var(--accent-dim); }
+  .gdrive-icon-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .gdrive-upload-section {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 8px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+  }
+
+  .gdrive-section-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+
+  .gdrive-upload-select {
+    padding: 7px 10px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: 12px;
+    outline: none;
+    cursor: pointer;
+  }
+  .gdrive-upload-select:focus { border-color: var(--accent); }
+
   /* ── 外部APIサーバー管理 ── */
   .api-panel-body {
     display: flex;
@@ -1912,6 +2149,28 @@
     margin-bottom: 4px;
   }
 
+  /* 資料の出どころバッジ (GDrive など) */
+  .msg-context-source {
+    display: inline-block;
+    font-size: 10px;
+    padding: 1px 6px;
+    margin-right: 6px;
+    border-radius: 4px;
+    background: var(--accent-dim);
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    vertical-align: 1px;
+  }
+
+  /* ファイル名リンク (クリックで GDrive を開く) */
+  .msg-context-link {
+    color: var(--text-primary);
+    font-weight: 600;
+    text-decoration: none;
+    border-bottom: 1px dotted var(--text-muted);
+  }
+  .msg-context-link:hover { color: var(--accent); border-bottom-color: var(--accent); }
+
   /* ── Token Info ── */
   .token-info {
     margin-top: 8px;
@@ -2441,6 +2700,20 @@
   }
   .toolbar-btn.web-search-toggle:hover { opacity: 0.8; }
   .toolbar-btn.web-search-toggle.active:hover { opacity: 1; }
+
+  /* Google Drive トグル: Web検索トグルと同じ挙動 */
+  .toolbar-btn.gdrive-toggle {
+    opacity: 0.4;
+    position: relative;
+  }
+  .toolbar-btn.gdrive-toggle.active {
+    opacity: 1;
+    background: var(--accent-dim);
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  .toolbar-btn.gdrive-toggle:hover { opacity: 0.8; }
+  .toolbar-btn.gdrive-toggle.active:hover { opacity: 1; }
 
   @keyframes mic-pulse {
     0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5); }

@@ -442,6 +442,25 @@
       }
     ]
   },
+  "googleDrive": {
+    "enabled": false,
+    "authMode": "oauth",
+    "clientId": "",
+    "clientSecret": "",
+    "redirectUri": "http://localhost:3000/gdrive/auth/callback",
+    "serviceAccountKeyFile": "",
+    "impersonateUser": "",
+    "rootFolderId": "",
+    "readOnly": true,
+    "allowWrite": false,
+    "allowDelete": false,
+    "maxDownloadMB": 20,
+    "maxUploadMB": 20,
+    "maxTextChars": 20000,
+    "defaultPageSize": 30,
+    "sharedDrives": true,
+    "tokenFile": "gdrive_token.json"
+  },
   "ragTopK": 30,
   "ragMode": "agentic",
   "systemPrompts": {
@@ -449,6 +468,7 @@
     "documents": "【参照可能なドキュメント】(チャットに添付されたファイル): {docList}\nユーザーの質問が「ドキュメントについて」「資料を見て」「添付ファイル」などを示唆する場合、必ず最初に search_documents ツールを使ってください。\nこれらは添付ドキュメントであり、サーバーファイル（uploads配下）とは別物です。",
     "webSearch": "最新の情報や知らないことについては web_search ツールでインターネット検索できます。",
     "fileAccess": "【サーバーファイル操作】(uploads配下、ドキュメントとは別物)\n- list_files: uploadsフォルダの一覧を取得\n- read_file(path): uploadsフォルダのファイル読み込み\n- write_file(path, content): uploadsフォルダにファイル書き込み（ユーザーが明示的に「保存」「書き込み」と依頼した場合のみ）\n重要: pathには\"uploads/\"プレフィックスを付けずにファイル名のみを指定してください（例: \"hello.py\"、\"data/config.json\"）。\nユーザーが明確に「サーバーファイル」「uploadsフォルダ」「ファイルを保存して」など、サーバー側のファイルシステム操作を依頼した場合のみ使用してください。\nチャットに添付されたドキュメントについての質問では list_files/read_file/write_file は使わず、search_documents を使ってください。",
+    "googleDrive": "【Google Drive】(サーバーのuploadsフォルダとも、チャット添付ドキュメントとも別物)\n- gdrive_search_files(query): Drive 全体からファイル名・本文で検索\n- gdrive_list_files(folderId): フォルダの中身を一覧 (folderId は省略可。\"資料/2026年度\" のようなフォルダパスでも指定できる)\n- gdrive_read_file(fileId): ファイルの中身をテキストで読む (Google ドキュメント→テキスト、スプレッドシート→CSV に自動変換)\n- gdrive_import_to_server(fileId): Drive のファイルをサーバーの uploads に取り込む (PDF・画像・Excel 等、そのままでは読めないファイルや Python で処理したい時)\n- gdrive_write_file(name, content): Drive にファイルを作成/更新 (書き込み許可時のみ)\n- gdrive_upload_from_server(path): uploads のファイルを Drive にアップロード (書き込み許可時のみ)\n- gdrive_create_folder(name): フォルダ作成 (書き込み許可時のみ)\n- gdrive_delete_file(fileId): ゴミ箱に移動 (削除許可時のみ、明示的な依頼がある場合だけ)\n\n使い方の手順:\n1. まず gdrive_search_files か gdrive_list_files で目的のファイルを特定する\n2. 返ってきた id を gdrive_read_file に渡して中身を読む\nID が分からないうちに読もうとしないこと。\nIDは長くて写し間違えやすいので、自信が無ければ一覧の【通し番号 (1, 2, 3...)】か【ファイル名】を fileId に渡してもよい。読み込みに失敗しても、同じIDで何度も試さず、候補の番号か名前で指定し直すこと。バイナリ (PDF/画像/Excel) は gdrive_read_file では読めないので gdrive_import_to_server を使うこと。\nユーザーが「ドライブ」「Google Drive」「グーグルドライブ」「クラウドのファイル」等に言及した場合に使ってください。",
     "python": "Pythonコード作成・実行について:\n\n【重要】「Pythonで〜を作って」「〜するコードを書いて」のような単純なコード作成依頼では、絶対に write_file ツールを使わないでください。代わりに応答に ```python ... ``` のコードブロックを含めるだけで完了します。ユーザー側で実行ボタンが表示されます。\n\nwrite_file を使うべき場合（明示的な保存依頼のみ）:\n- 「ファイルに保存して」「sample.pyに書き込んで」のように、ユーザーが明示的にサーバーへの保存を求めている場合\n- それ以外は絶対に write_file を呼ばないでください\n\nその他のヒント:\n- グラフ・図の作成依頼には matplotlib を使ったPythonコードを提示してください（matplotlib.use('Agg')の指定は不要、plt.show()で自動的にチャットに画像表示されます）。\n- データ処理・計算・可視化の依頼では、迷わずPythonコードブロックを返してください。それだけで完結します。ツール呼び出しは不要です。\n- 大量データ・CSV/Parquet/JSON処理・複雑な集計には DuckDB を使ってください。\n  使い方: import duckdb; con = duckdb.connect(); df = con.execute(\"SELECT ... FROM 'data.csv'\").df()",
     "meta": "【重要・最終応答に関する厳格なルール】\n- 内部的な推論・検索戦略・計画・メタ的な説明は一切出力しないでください。\n- 以下のような自己独白パターンは絶対に書かないでください:\n  ❌ \"I will write it now.\" / \"I will not mention the date.\" / \"I will just answer.\"\n  ❌ \"The user's query is short.\" / \"The user wants ...\" / \"My answer is ...\"\n  ❌ \"Let me think.\" / \"This sounds good.\" / \"I will proceed.\"\n  ❌ \"私はこれから...\" / \"ユーザーは...と聞いている\" / \"私の回答は...\"\n- ツールを呼び出すと決めたら、即座にツールを呼び出してください。テキスト応答と併用しないでください。\n- 検索結果が得られなかった場合は、その旨を簡潔に伝え、自分の知識で回答してください。\n- 思考が必要なら <think>...</think> タグの中だけに書き、ユーザーへの最終応答 (</think> 以降) には絶対に独白を混ぜないでください。\n- ユーザーへの応答は、結論から直接書き始めてください。前置きや自己説明は不要です。",
     "judge": "以下のツールを必要に応じて呼び出してください。\n{toolList}\n\n【重要・必ず守ること】\n- 「最新」「今日」「現在」「現時点」「今の」「今週」「最近」などの語があれば、それは現在情報の要求 → 必ず web_search を使う\n- 株価/天気/ニュース/価格/為替/順位/結果/スコア → 必ず web_search を使う\n- 「リアルタイムデータは取得できません」「私は最新の情報にアクセスできません」のような断りの応答は禁止。ツールを使えば取得できる\n- 自分の知識で答えるべきか、検索すべきか迷ったら web_search を選ぶ\n\n【絶対に守ること - write_fileを使わない場合】\n- 「Pythonで〜を作って」「コードを書いて」「プログラムを書いて」→ ツール不要、コードブロックのみで応答\n- write_file は「保存して」「ファイルに書き込んで」と明示的に依頼された場合のみ使う\n- 単なるコード作成依頼で write_file を呼ぶのは禁止\n\n注意: チャット添付ドキュメントとサーバーuploadsファイルは別物。ドキュメント関連は search_documents、サーバーファイル関連は list_files/read_file/write_file。\nグラフ・計算・データ処理はツール不要。```python ... ``` コードブロックを応答に含めれば自動実行されます（matplotlibで画像表示、DuckDBで高速SQL処理可能）。\n内部推論は書かず、ツールを呼ぶか直接短く応答するかのみ。"

@@ -1,4 +1,4 @@
-const { useState, useEffect, useRef, useCallback } = React;
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
 
 // 秒数を "1h 23m" 形式に変換
 function formatUptime(seconds) {
@@ -717,7 +717,8 @@ function App() {
   const [backups, setBackups] = useState([]);
   const [showBackups, setShowBackups] = useState(false);
   const [parsedTree, setParsedTree] = useState(null);
-  const [view, setView] = useState('text'); // 'text' | 'tree' | 'orchestra'
+  // 既定はツリー編集。生JSONを直接いじるより事故りにくいので、そちらを入口にする
+  const [view, setView] = useState('tree'); // 'tree' | 'text' | 'orchestra'
   const [restartInfo, setRestartInfo] = useState(null);  // {isSystemd, pid, uptime}
   const [restarting, setRestarting] = useState(false);   // 再起動中フラグ
   const [restartDone, setRestartDone] = useState(false); // 再起動完了(手動リロードボタン表示用)
@@ -772,6 +773,8 @@ function App() {
   }, [authenticated]);
 
   // テキスト変更時にJSON構文チェック
+  // 構文エラー時は parsedTree を null にする。古いツリーを残したまま編集させると、
+  // テキスト側の変更を巻き戻して上書きしてしまうため（ツリーは常に現在の content の像）。
   useEffect(() => {
     if (!content) { setParseError(''); setParsedTree(null); return; }
     try {
@@ -780,9 +783,18 @@ function App() {
       setParsedTree(parsed);
     } catch (e) {
       setParseError(e.message);
-      // パースエラー時は古いparsedTreeを残す
+      setParsedTree(null);
     }
   }, [content]);
+
+  /**
+   * ツリーで編集された結果を content（生テキスト）に書き戻す。
+   * content が唯一の正なので、保存・未保存判定・テキスト表示はこれまで通り動く。
+   */
+  const applyTreeChange = useCallback((nextRoot) => {
+    setError('');
+    setContent(JSON.stringify(nextRoot, null, 2));
+  }, []);
 
   async function loadConfig() {
     setLoading(true); setError('');
@@ -1253,11 +1265,15 @@ function App() {
           <div className="main-title">⚙️ config.json エディタ</div>
           <div className="main-actions">
             <div className="view-switch">
-              <button className={`view-btn ${view === 'text' ? 'active' : ''}`} onClick={() => setView('text')}>📝 テキスト</button>
-              <button className={`view-btn ${view === 'tree' ? 'active' : ''}`} onClick={() => setView('tree')}>🌳 ツリー</button>
+              <button className={`view-btn ${view === 'tree' ? 'active' : ''}`} onClick={() => setView('tree')}>🌳 ツリー編集</button>
+              <button className={`view-btn ${view === 'text' ? 'active' : ''}`} onClick={() => setView('text')}>
+                📝 テキスト{parseError ? ' ⚠️' : ''}
+              </button>
               <button className={`view-btn ${view === 'orchestra' ? 'active' : ''}`} onClick={() => setView('orchestra')}>🎼 マルチLLM</button>
             </div>
-            <button className="btn" onClick={formatJson} disabled={!!parseError} title="JSONを整形">✨ 整形</button>
+            {view === 'text' && (
+              <button className="btn" onClick={formatJson} disabled={!!parseError} title="JSONを整形">✨ 整形</button>
+            )}
             <button className="btn" onClick={discardChanges} disabled={!hasChanges}>↺ 破棄</button>
             <button className="btn primary" onClick={saveConfig} disabled={saving || !hasChanges || !!parseError}>
               {saving ? '保存中...' : '💾 保存 (Ctrl+S)'}
@@ -1332,9 +1348,26 @@ function App() {
             hasUnsavedText={hasChanges}
             onSaved={async () => { await loadConfig(); await loadBackups(); }}
           />
+        ) : parsedTree !== null && typeof parsedTree === 'object' ? (
+          <JsonTreeEditor
+            root={parsedTree}
+            onChange={applyTreeChange}
+            onError={setError}
+          />
         ) : (
           <div className="tree-container">
-            {parsedTree ? <TreeView value={parsedTree} /> : <div className="empty-hint">構文エラーのためツリー表示できません</div>}
+            <div className="tree-broken">
+              <div className="tree-broken-icon">⚠️</div>
+              <div className="tree-broken-title">JSONの構文エラーのため、ツリー編集できません</div>
+              {parseError && <div className="tree-broken-msg">{parseError}</div>}
+              <div className="tree-broken-hint">
+                テキスト表示で該当箇所を直すか、変更を破棄して読み込み直してください。
+              </div>
+              <div className="tree-broken-actions">
+                <button className="btn" onClick={() => setView('text')}>📝 テキストで修正する</button>
+                <button className="btn" onClick={discardChanges} disabled={!hasChanges}>↺ 変更を破棄</button>
+              </div>
+            </div>
           </div>
         )}
       </main>
@@ -1342,46 +1375,727 @@ function App() {
   );
 }
 
-// ─── ツリービュー（読み取り専用、構造を確認しやすく） ───
-function TreeView({ value, level = 0, label }) {
-  const [collapsed, setCollapsed] = useState(level > 1);
+// ════════════════════════════════════════════════
+// JSON ツリーエディタ（編集可能）
+// ════════════════════════════════════════════════
+// config.json を「テキストとして」直すと、括弧・カンマ・エスケープの対応を
+// 人間が追う必要があり事故りやすい。ツリー編集では
+//   - 値を型ごとの入力UIで編集（文字列/数値/真偽/null/オブジェクト/配列）
+//   - キーの追加・リネーム・削除
+//   - 配列要素の並べ替え・複製・削除
+//   - 部分ツリーだけをJSONテキストで編集（複雑な箇所の逃げ道）
+// を GUI で行い、結果を JSON.stringify(root, null, 2) で content に書き戻す。
+//
+// content（生テキスト）が唯一の正 (single source of truth) なので、
+// テキスト表示・保存・未保存判定・バックアップはこれまで通り動く。
 
-  if (value === null) return <div className="tree-row" style={{ paddingLeft: level * 16 }}>{label && <span className="tree-key">{label}: </span>}<span className="tree-null">null</span></div>;
-  if (typeof value === 'boolean') return <div className="tree-row" style={{ paddingLeft: level * 16 }}>{label && <span className="tree-key">{label}: </span>}<span className="tree-bool">{String(value)}</span></div>;
-  if (typeof value === 'number') return <div className="tree-row" style={{ paddingLeft: level * 16 }}>{label && <span className="tree-key">{label}: </span>}<span className="tree-num">{value}</span></div>;
-  if (typeof value === 'string') {
-    const truncated = value.length > 200 ? value.slice(0, 200) + '…' : value;
-    return <div className="tree-row" style={{ paddingLeft: level * 16 }}>{label && <span className="tree-key">{label}: </span>}<span className="tree-str">"{truncated}"</span></div>;
+// ─── JSON の型判定 ───
+function jsonType(v) {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return 'array';
+  const t = typeof v;
+  return (t === 'string' || t === 'number' || t === 'boolean') ? t : 'object';
+}
+
+const TYPE_OPTIONS = [
+  { value: 'string', label: '文字列' },
+  { value: 'number', label: '数値' },
+  { value: 'boolean', label: '真偽' },
+  { value: 'null', label: 'null' },
+  { value: 'object', label: 'オブジェクト' },
+  { value: 'array', label: '配列' },
+];
+
+/** 型を変えた時に、できるだけ値を保つように変換する */
+function coerceToType(value, type) {
+  switch (type) {
+    case 'string':
+      if (value === null || value === undefined) return '';
+      return (typeof value === 'object') ? JSON.stringify(value) : String(value);
+    case 'number': {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : 0;
+    }
+    case 'boolean':
+      if (typeof value === 'string') return !(value === '' || value === 'false' || value === '0');
+      return !!value;
+    case 'null': return null;
+    case 'object':
+      return (value && typeof value === 'object' && !Array.isArray(value)) ? value : {};
+    case 'array':
+      if (Array.isArray(value)) return value;
+      return (value === null || value === undefined || value === '') ? [] : [value];
+    default: return value;
   }
-  if (Array.isArray(value)) {
-    if (value.length === 0) return <div className="tree-row" style={{ paddingLeft: level * 16 }}>{label && <span className="tree-key">{label}: </span>}<span className="tree-bracket">[]</span></div>;
-    return (
-      <div>
-        <div className="tree-row" style={{ paddingLeft: level * 16, cursor: 'pointer' }} onClick={() => setCollapsed(!collapsed)}>
-          <span className="tree-toggle">{collapsed ? '▶' : '▼'}</span>
-          {label && <span className="tree-key">{label}: </span>}
-          <span className="tree-bracket">[{value.length} 個]</span>
+}
+
+/** 型ごとの初期値（キー追加時） */
+function emptyValueOfType(type) {
+  return { string: '', number: 0, boolean: false, null: null, object: {}, array: [] }[type];
+}
+
+// ─── パス操作（すべてイミュータブル） ───
+// path は ['chatModels', 0, 'name'] のような配列。数値は配列インデックス。
+
+function pathToKey(path) {
+  // キーに '/' や '.' が入りうるので、JSON文字列には現れない NUL を区切りに使う
+  return path.map(String).join(' ');
+}
+
+function getAtPath(root, path) {
+  let cur = root;
+  for (const seg of path) {
+    if (cur === null || typeof cur !== 'object') return undefined;
+    cur = cur[seg];
+  }
+  return cur;
+}
+
+function shallowCopy(v) {
+  return Array.isArray(v) ? v.slice() : { ...v };
+}
+
+function setAtPath(root, path, value) {
+  if (path.length === 0) return value;
+  const [head, ...rest] = path;
+  const copy = shallowCopy(root);
+  copy[head] = rest.length === 0 ? value : setAtPath(root[head], rest, value);
+  return copy;
+}
+
+function deleteAtPath(root, path) {
+  if (path.length === 0) return root;
+  const parentPath = path.slice(0, -1);
+  const last = path[path.length - 1];
+  const parent = getAtPath(root, parentPath);
+  if (parent === null || typeof parent !== 'object') return root;
+  let nextParent;
+  if (Array.isArray(parent)) {
+    nextParent = parent.slice();
+    nextParent.splice(Number(last), 1);
+  } else {
+    nextParent = { ...parent };
+    delete nextParent[last];
+  }
+  return setAtPath(root, parentPath, nextParent);
+}
+
+/** キー名を変更する。オブジェクトのキー順を保つため作り直す */
+function renameKeyAtPath(root, objPath, oldKey, newKey) {
+  const obj = getAtPath(root, objPath);
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return root;
+  const next = {};
+  for (const k of Object.keys(obj)) {
+    if (k === oldKey) next[newKey] = obj[oldKey];
+    else next[k] = obj[k];
+  }
+  return setAtPath(root, objPath, next);
+}
+
+/** 配列要素を from → to に動かす */
+function moveArrayItem(root, arrPath, from, to) {
+  const arr = getAtPath(root, arrPath);
+  if (!Array.isArray(arr)) return root;
+  if (to < 0 || to >= arr.length) return root;
+  const next = arr.slice();
+  const [item] = next.splice(from, 1);
+  next.splice(to, 0, item);
+  return setAtPath(root, arrPath, next);
+}
+
+/** 配列の index の直後に値を差し込む */
+function insertIntoArray(root, arrPath, index, value) {
+  const arr = getAtPath(root, arrPath);
+  if (!Array.isArray(arr)) return root;
+  const next = arr.slice();
+  next.splice(index, 0, value);
+  return setAtPath(root, arrPath, next);
+}
+
+/** 深いコピー（複製ボタン用。JSONなので structuredClone 相当で十分） */
+function deepCopy(v) {
+  return (v === null || typeof v !== 'object') ? v : JSON.parse(JSON.stringify(v));
+}
+
+// ─── 検索マッチ判定 ───
+function nodeMatches(value, label, q) {
+  if (String(label ?? '').toLowerCase().includes(q)) return true;
+  const t = jsonType(value);
+  if (t === 'string') return value.toLowerCase().includes(q);
+  if (t === 'number' || t === 'boolean') return String(value).includes(q);
+  return false;
+}
+
+function subtreeMatches(value, label, q) {
+  if (nodeMatches(value, label, q)) return true;
+  const t = jsonType(value);
+  if (t === 'object') return Object.keys(value).some(k => subtreeMatches(value[k], k, q));
+  if (t === 'array') return value.some((v, i) => subtreeMatches(v, String(i), q));
+  return false;
+}
+
+// ─── キーの説明（ツリー上に薄く表示して、何の設定かわかるようにする） ───
+// パスは配列インデックスを [] に正規化した形で引く（例: chatModels[].name）
+const CONFIG_HINTS = {
+  'appName': 'ブラウザのタイトル・表示名',
+  'logoMain': 'ロゴの主テキスト',
+  'logoSub': 'ロゴの副テキスト',
+  'welcomeMessage': '新規チャットの説明文',
+  'welcomeHints': '新規チャットに並ぶ質問例',
+  'accentColor': 'テーマカラー（HEX）',
+  'defaultModel': '初期選択モデル名（chatModels[].name、空なら先頭）',
+  'password': 'ログインパスワードのMD5/SHA-256ハッシュ（空で認証なし）',
+  'pythonPath': 'Python実行コマンド（venvのパス推奨）',
+  'logLevel': 'normal / quiet（quietでllama-serverのログを抑制）',
+  'llamaCppDir': 'llama.cpp のディレクトリ（GGUF変換等で使用）',
+  'maxRequestSize': 'JSONボディ上限（例 "100mb"）',
+  'maxFileSize': 'アップロード上限（MB）',
+  'maxHeaderSize': 'HTTPヘッダー上限（バイト）',
+  'requestTimeoutSec': 'リクエストタイムアウト（秒）',
+  'llamaServer': 'llama-server（推論エンジン）の接続設定',
+  'llamaServer.binPath': 'llama-server バイナリの絶対パス',
+  'llamaServer.chatHost': 'チャット推論サーバーのホスト',
+  'llamaServer.chatPort': 'チャット推論サーバーのポート',
+  'llamaServer.embeddingHost': 'Embeddingサーバーのホスト',
+  'llamaServer.embeddingPort': 'Embeddingサーバーのポート',
+  'llamaServer.commonArgs': '全モデル共通の起動引数',
+  'llamaServer.readyTimeoutMs': 'モデル起動完了を待つ上限（ms）',
+  'llamaServer.idleUnloadMs': '無操作時に自動アンロードするまで（ms、0で無効）',
+  'llamaServer.nParallel': 'llama-server の並列スロット数 -np',
+  'chatModels': 'チャットに使うGGUFモデル一覧',
+  'chatModels[].name': 'UIに表示する名前',
+  'chatModels[].path': 'GGUFファイルの絶対パス',
+  'chatModels[].ctx': 'コンテキスト長（起動時に固定）',
+  'chatModels[].ngl': 'GPUに載せるレイヤー数（99で全部）',
+  'chatModels[].chatTemplate': 'チャットテンプレート（空でGGUFのメタデータ）',
+  'chatModels[].extraArgs': 'このモデル専用の追加引数（--mmproj 等）',
+  'embeddingModel': 'RAG用Embeddingモデル',
+  'embeddingModel.path': 'Embedding用GGUFの絶対パス',
+  'embeddingModel.ctx': 'Embeddingのコンテキスト長',
+  'embeddingModel.poolingType': 'mean / cls / last / none',
+  'webSearch': 'Web検索（DuckDuckGo）を使えるようにする',
+  'fileAccess': 'サーバーファイル（uploads配下）の読み書きを許可',
+  'imageGen': '画像生成（stable-diffusion.cpp連携）',
+  'ttsGen': '音声合成（Irodori-TTS連携）',
+  'googleDrive': 'GDrive (Google Drive) 連携',
+  'googleDrive.enabled': 'GDrive連携のON/OFF',
+  'googleDrive.authMode': 'oauth（個人アカウント）/ serviceAccount（ヘッドレス）',
+  'googleDrive.clientId': 'OAuthクライアントID（Google Cloud Consoleで発行）',
+  'googleDrive.clientSecret': 'OAuthクライアントシークレット（外部には公開されない）',
+  'googleDrive.redirectUri': 'Cloud Consoleの承認済みリダイレクトURIと完全一致させる',
+  'googleDrive.serviceAccountKeyFile': 'サービスアカウントJSONキーのパス',
+  'googleDrive.impersonateUser': 'ドメイン全体の委任で代理するユーザー',
+  'googleDrive.rootFolderId': '指定するとこのフォルダ配下だけに限定',
+  'googleDrive.readOnly': 'true で読み取り専用（書き込みツールを出さない）',
+  'googleDrive.allowWrite': 'readOnly:false と両方 true で書き込み許可',
+  'googleDrive.allowDelete': 'ゴミ箱への移動を許可',
+  'googleDrive.maxDownloadMB': '1ファイルのダウンロード上限（MB）',
+  'googleDrive.maxUploadMB': '1ファイルのアップロード上限（MB）',
+  'googleDrive.maxTextChars': 'LLMに渡すテキストの最大文字数',
+  'googleDrive.sharedDrives': '共有ドライブも対象に含める',
+  'googleDrive.tokenFile': 'リフレッシュトークンの保存先',
+  'ml': '機械学習（ML）機能',
+  'ml.enabled': 'ML機能のON/OFF（要 npm install duckdb）',
+  'ml.apiTokens': '外部API用トークン（name / token / permissions）',
+  'ragTopK': 'RAGで取得するチャンク数',
+  'ragMode': 'agentic（LLMが検索要否を判断）/ always',
+  'systemPrompts': 'LLMに渡すシステムプロンプト群',
+  'systemPrompts.base': '全フェーズ共通の土台（{date} が展開される）',
+  'systemPrompts.documents': 'ドキュメント添付時の追記（{docList}）',
+  'systemPrompts.webSearch': 'Web検索が有効な時の追記',
+  'systemPrompts.fileAccess': 'サーバーファイル操作が有効な時の追記',
+  'systemPrompts.googleDrive': 'Google Drive が有効かつ接続済みの時の追記',
+  'systemPrompts.python': 'Python実行の案内',
+  'systemPrompts.meta': 'メタ的な独り言を抑制する指示',
+  'systemPrompts.judge': 'ツール判断専用の軽量プロンプト（{toolList}）',
+  'agentContext': 'ツール判断フェーズの生成量チューニング',
+  'agentContext.smallPredict': '通常質問時の max_tokens',
+  'agentContext.largePredict': 'ファイル生成など長文時の max_tokens',
+  'agentContext.judgeHistoryCount': 'ツール判断に渡す直近メッセージ数',
+  'agentContext.largeGenKeywords': '長文モードに切り替えるキーワード（nullで既定）',
+  'recentMessageCount': 'そのまま送る直近メッセージ数（それ以前は圧縮）',
+  'topK': 'サンプリング top-k',
+  'topP': 'サンプリング top-p',
+  'temperature': '生成のランダム性（低いほど堅い）',
+  'repeatPenalty': '繰り返しペナルティ（1.0で無効）',
+  'repeatLastN': 'ペナルティを見る直近トークン数',
+  'presencePenalty': 'OpenAI互換 presence_penalty',
+  'frequencyPenalty': 'OpenAI互換 frequency_penalty',
+  'dryMultiplier': 'DRYサンプラー強度（0で無効、ループ対策に有効）',
+  'dryBase': 'DRYサンプラーの基数',
+  'dryAllowedLength': 'DRYが許容する繰り返し長',
+  'dryPenaltyLastN': 'DRYの対象範囲（-1で全体）',
+  'chatMaxTokens': '1応答あたりの最大生成トークン',
+  'orchestration': 'マルチLLMオーケストレーション（🎼タブで編集推奨）',
+  'orchestration.enabled': 'マルチLLM機能のON/OFF',
+  'orchestration.poolMode': 'auto / resident（全常駐）/ swap（逐次載せ替え）',
+  'orchestration.maxResident': '同時常駐させるワーカー数の上限',
+  'orchestration.workflows': 'ワークフロー定義（🎼 マルチLLM タブで編集）',
+  'stableDiffusion': '画像生成サーバー（sd-server）の設定',
+  'imageModels': '画像生成モデル一覧',
+  'irodoriTts': '音声合成サーバー（Irodori-TTS）の設定',
+  'ttsVoices': '声のプリセット一覧',
+  'transcribe': '音声認識サーバーの設定',
+  'tuning': 'ファインチューニングの実行環境設定',
+};
+
+function hintForPath(path) {
+  if (path.length === 0) return '';
+  const norm = path
+    .map(seg => (typeof seg === 'number' ? '[]' : seg))
+    .reduce((acc, seg) => (seg === '[]' ? acc + '[]' : (acc ? acc + '.' + seg : seg)), '');
+  return CONFIG_HINTS[norm] || '';
+}
+
+// ════════════════════════════════════════════════
+// ツリーエディタ本体
+// ════════════════════════════════════════════════
+function JsonTreeEditor({ root, onChange, onError }) {
+  const [query, setQuery] = useState('');
+  // pathKey -> true/false の明示指定。無ければ defaultOpen / 深さで決める
+  const [openOverride, setOpenOverride] = useState({});
+  // null = 深さ基準（浅い階層だけ開く）、true/false = 全展開/全折りたたみ
+  const [defaultOpen, setDefaultOpen] = useState(null);
+
+  const q = query.trim().toLowerCase();
+
+  const isOpen = useCallback((pathKey, depth) => {
+    if (q) return true;                                   // 検索中は絞り込み結果を全部見せる
+    if (pathKey in openOverride) return openOverride[pathKey];
+    if (defaultOpen !== null) return defaultOpen;
+    return depth < 1;                                     // 既定はトップレベルの一覧まで
+  }, [openOverride, defaultOpen, q]);
+
+  const toggle = useCallback((pathKey, depth) => {
+    setOpenOverride(prev => {
+      const cur = (pathKey in prev) ? prev[pathKey]
+        : (defaultOpen !== null ? defaultOpen : depth < 1);
+      return { ...prev, [pathKey]: !cur };
+    });
+  }, [defaultOpen]);
+
+  // ─── 編集操作（すべて新しい root を作って onChange に渡す） ───
+  const ctx = useMemo(() => ({
+    q,
+    isOpen,
+    toggle,
+    update: (path, value) => onChange(setAtPath(root, path, value)),
+    remove: (path, label) => {
+      if (!confirm(`「${label}」を削除しますか？`)) return;
+      onChange(deleteAtPath(root, path));
+    },
+    rename: (objPath, oldKey, newKey) => {
+      if (!newKey || newKey === oldKey) return;
+      const obj = getAtPath(root, objPath);
+      if (obj && Object.prototype.hasOwnProperty.call(obj, newKey)) {
+        onError(`キー「${newKey}」は既に存在します`);
+        return;
+      }
+      onChange(renameKeyAtPath(root, objPath, oldKey, newKey));
+    },
+    addKey: (objPath, key, type) => {
+      const obj = getAtPath(root, objPath);
+      if (!key) { onError('キー名を入力してください'); return false; }
+      if (obj && Object.prototype.hasOwnProperty.call(obj, key)) {
+        onError(`キー「${key}」は既に存在します`);
+        return false;
+      }
+      onChange(setAtPath(root, [...objPath, key], emptyValueOfType(type)));
+      return true;
+    },
+    addItem: (arrPath, type) => {
+      const arr = getAtPath(root, arrPath) || [];
+      onChange(insertIntoArray(root, arrPath, arr.length, emptyValueOfType(type)));
+    },
+    duplicateItem: (arrPath, index) => {
+      const arr = getAtPath(root, arrPath);
+      if (!Array.isArray(arr)) return;
+      onChange(insertIntoArray(root, arrPath, index + 1, deepCopy(arr[index])));
+    },
+    moveItem: (arrPath, from, to) => onChange(moveArrayItem(root, arrPath, from, to)),
+    changeType: (path, value, type) => {
+      const cur = jsonType(value);
+      if (cur === type) return;
+      const isFilledContainer = (cur === 'object' && Object.keys(value).length > 0)
+        || (cur === 'array' && value.length > 0);
+      if (isFilledContainer && type !== 'object' && type !== 'array') {
+        if (!confirm('中身のある構造を単純な値に変換します。元の内容は失われます。続行しますか？')) return;
+      }
+      onChange(setAtPath(root, path, coerceToType(value, type)));
+    },
+  }), [root, onChange, onError, q, isOpen, toggle]);
+
+  const rootType = jsonType(root);
+  const rootKeys = rootType === 'object' ? Object.keys(root) : [];
+
+  return (
+    <div className="tree-editor">
+      <div className="tree-toolbar">
+        <div className="tree-search-wrap">
+          <span className="tree-search-icon">🔍</span>
+          <input
+            className="tree-search"
+            placeholder="キー名・値で絞り込み（例: googleDrive, ポート, 8080）"
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+          />
+          {query && <button className="tree-search-clear" onClick={() => setQuery('')} title="クリア">✕</button>}
         </div>
-        {!collapsed && value.map((v, i) => (
-          <TreeView key={i} value={v} level={level + 1} label={`[${i}]`} />
-        ))}
+        <button className="tree-tool-btn" onClick={() => { setOpenOverride({}); setDefaultOpen(true); }}>⊞ 全展開</button>
+        <button className="tree-tool-btn" onClick={() => { setOpenOverride({}); setDefaultOpen(false); }}>⊟ 全折りたたみ</button>
+        <button className="tree-tool-btn" onClick={() => { setOpenOverride({}); setDefaultOpen(null); }}>↺ 表示リセット</button>
+      </div>
+      <div className="tree-usage-hint">
+        {rootKeys.length} 個のトップレベル設定 ・
+        値はクリックして編集（確定は Enter / フォーカスを外す、取り消しは Esc）・
+        キー名クリックで改名 ・ <code>{'{ }'}</code> でそのまとまりをJSONのまま編集 ・
+        編集内容は「💾 保存」を押すまで config.json には書き込まれません
+      </div>
+
+      <div className="tree-container">
+        <TreeNode
+          ctx={ctx}
+          path={[]}
+          label="config.json"
+          value={root}
+          depth={0}
+          parentType={null}
+        />
+        {q && rootType === 'object' && !rootKeys.some(k => subtreeMatches(root[k], k, q)) && (
+          <div className="empty-hint">「{query}」に一致する設定はありません</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── ツリーの1ノード ───
+// ancestorMatched: 祖先のキー/値が検索語に一致している。この場合は配下を丸ごと見せる
+// （「googleDrive」で検索したら googleDrive の中身は全部見たい、という当たり前の期待に合わせる）
+function TreeNode({ ctx, path, label, value, depth, parentType, index, siblingCount, ancestorMatched }) {
+  const [renaming, setRenaming] = useState(false);
+  const [renameDraft, setRenameDraft] = useState('');
+  const [adding, setAdding] = useState(false);
+  const [addKey, setAddKey] = useState('');
+  const [addType, setAddType] = useState('string');
+  const [jsonEditing, setJsonEditing] = useState(false);
+  const [jsonDraft, setJsonDraft] = useState('');
+  const [jsonErr, setJsonErr] = useState('');
+
+  const q = ctx.q;
+  const type = jsonType(value);
+  const isContainer = type === 'object' || type === 'array';
+  const pathKey = pathToKey(path);
+  const isRoot = path.length === 0;
+
+  // 検索中の表示判定
+  //   selfMatch      … このノード自身（キー名 or 単純値）が一致
+  //   visible        … 自分・祖先・子孫のいずれかが一致していれば描画する
+  const selfMatch = useMemo(() => !!q && nodeMatches(value, label, q), [q, value, label]);
+  const visible = useMemo(
+    () => !q || isRoot || ancestorMatched || selfMatch || subtreeMatches(value, label, q),
+    [q, isRoot, ancestorMatched, selfMatch, value, label]
+  );
+  // 子に伝える「祖先が一致しているか」。自分の子孫が一致しただけの場合は伝えない
+  // （その場合は一致した枝だけを見せたいため）
+  const childAncestorMatched = !!q && (ancestorMatched || selfMatch);
+  if (!visible) return null;
+
+  const open = isContainer ? ctx.isOpen(pathKey, depth) : true;
+  const hint = hintForPath(path);
+  const inArray = parentType === 'array';
+  // インデント幅は CSS 変数にしておき、モバイルでは詰める
+  const indent = { paddingLeft: `calc(var(--tree-indent, 15px) * ${depth})` };
+
+  const keys = type === 'object' ? Object.keys(value) : [];
+  const childEntries = type === 'object'
+    ? keys.map(k => ({ key: k, label: k, value: value[k] }))
+    : type === 'array'
+      ? value.map((v, i) => ({ key: i, label: `[${i}]`, value: v }))
+      : [];
+
+  function startRename() {
+    setRenameDraft(String(label));
+    setRenaming(true);
+  }
+  function commitRename() {
+    setRenaming(false);
+    const next = renameDraft.trim();
+    if (next && next !== label) ctx.rename(path.slice(0, -1), label, next);
+  }
+
+  function openJsonEdit() {
+    setJsonDraft(JSON.stringify(value, null, 2));
+    setJsonErr('');
+    setJsonEditing(true);
+  }
+  function applyJsonEdit() {
+    try {
+      const parsed = JSON.parse(jsonDraft);
+      ctx.update(path, parsed);
+      setJsonEditing(false);
+      setJsonErr('');
+    } catch (e) {
+      setJsonErr(e.message);
+    }
+  }
+
+  // ─── 行の共通パーツ ───
+  const keyLabel = label === null ? null : (
+    renaming ? (
+      <input
+        className="tree-rename-input"
+        value={renameDraft}
+        autoFocus
+        onChange={e => setRenameDraft(e.target.value)}
+        onBlur={commitRename}
+        onKeyDown={e => {
+          if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); }
+          if (e.key === 'Escape') { setRenaming(false); }
+        }}
+      />
+    ) : (
+      <span
+        className={`tree-key ${(inArray || isRoot) ? 'idx' : 'renamable'}`}
+        onClick={() => { if (!inArray && !isRoot) startRename(); }}
+        title={(inArray || isRoot) ? '' : 'クリックでキー名を変更'}
+      >{label}</span>
+    )
+  );
+
+  const actions = (
+    <span className="tree-actions">
+      {!isRoot && (
+        <select
+          className="tree-type-select"
+          value={type}
+          onChange={e => ctx.changeType(path, value, e.target.value)}
+          title="値の型を変更"
+        >
+          {TYPE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
+      )}
+      {isContainer && (
+        <button className="tree-act" title="このまとまりをJSONテキストで直接編集" onClick={openJsonEdit}>{'{ }'}</button>
+      )}
+      {inArray && (
+        <>
+          <button className="tree-act" title="上へ" disabled={index === 0}
+            onClick={() => ctx.moveItem(path.slice(0, -1), index, index - 1)}>↑</button>
+          <button className="tree-act" title="下へ" disabled={index === siblingCount - 1}
+            onClick={() => ctx.moveItem(path.slice(0, -1), index, index + 1)}>↓</button>
+          <button className="tree-act" title="複製"
+            onClick={() => ctx.duplicateItem(path.slice(0, -1), index)}>⧉</button>
+        </>
+      )}
+      {!isRoot && (
+        <button className="tree-act danger" title="削除"
+          onClick={() => ctx.remove(path, inArray ? `${path[path.length - 2] ?? ''}${label}` : label)}>✕</button>
+      )}
+    </span>
+  );
+
+  // ─── コンテナ（オブジェクト / 配列） ───
+  if (isContainer) {
+    const doAdd = () => {
+      if (type === 'object') {
+        if (ctx.addKey(path, addKey.trim(), addType)) { setAdding(false); setAddKey(''); }
+      } else {
+        ctx.addItem(path, addType);
+        setAdding(false);
+      }
+    };
+    const summary = type === 'array'
+      ? `[ ${value.length} 個 ]`
+      : `{ ${keys.length} キー }`;
+    return (
+      <div className={`tree-node ${isRoot ? 'root' : ''}`}>
+        <div className="tree-row container" style={indent}>
+          <span className="tree-toggle" onClick={() => ctx.toggle(pathKey, depth)}>
+            {open ? '▼' : '▶'}
+          </span>
+          {keyLabel}
+          {label !== null && <span className="tree-colon">:</span>}
+          <span className="tree-bracket" onClick={() => ctx.toggle(pathKey, depth)}>{summary}</span>
+          {hint && <span className="tree-hint">{hint}</span>}
+          {actions}
+        </div>
+
+        {jsonEditing && (
+          <div className="tree-json-edit" style={{ marginLeft: `calc(var(--tree-indent, 15px) * ${depth + 1})` }}>
+            <textarea
+              className="tree-json-area"
+              value={jsonDraft}
+              onChange={e => setJsonDraft(e.target.value)}
+              spellCheck={false}
+              rows={Math.min(24, Math.max(4, jsonDraft.split('\n').length + 1))}
+            />
+            {jsonErr && <div className="tree-json-err">構文エラー: {jsonErr}</div>}
+            <div className="tree-json-actions">
+              <button className="tree-tool-btn primary" onClick={applyJsonEdit}>適用</button>
+              <button className="tree-tool-btn" onClick={() => setJsonEditing(false)}>キャンセル</button>
+            </div>
+          </div>
+        )}
+
+        {open && (
+          <>
+            {childEntries.map(ent => (
+              <TreeNode
+                key={String(ent.key)}
+                ctx={ctx}
+                path={[...path, ent.key]}
+                label={ent.label}
+                value={ent.value}
+                depth={depth + 1}
+                parentType={type}
+                index={type === 'array' ? ent.key : undefined}
+                siblingCount={type === 'array' ? value.length : undefined}
+                ancestorMatched={childAncestorMatched}
+              />
+            ))}
+
+            {/* 追加フォーム。検索で一部だけ表示している場所では隠す
+                （絞り込み中に「どこへ追加されるのか」が分かりにくいため）*/}
+            {(!q || ancestorMatched) && (
+              adding ? (
+                <div className="tree-add-form" style={{ paddingLeft: `calc(var(--tree-indent, 15px) * ${depth + 1})` }}>
+                  {type === 'object' && (
+                    <input
+                      className="tree-add-key"
+                      placeholder="キー名"
+                      value={addKey}
+                      autoFocus
+                      onChange={e => setAddKey(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter') doAdd(); if (e.key === 'Escape') setAdding(false); }}
+                    />
+                  )}
+                  <select className="tree-type-select" value={addType} onChange={e => setAddType(e.target.value)}>
+                    {TYPE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                  <button className="tree-tool-btn primary" onClick={doAdd}>追加</button>
+                  <button className="tree-tool-btn" onClick={() => { setAdding(false); setAddKey(''); }}>キャンセル</button>
+                </div>
+              ) : (
+                <div className="tree-add-row" style={{ paddingLeft: `calc(var(--tree-indent, 15px) * ${depth + 1})` }}>
+                  <button className="tree-add-btn" onClick={() => { setAdding(true); setAddKey(''); }}>
+                    ＋ {type === 'array' ? '要素を追加' : 'キーを追加'}
+                  </button>
+                  {type === 'array' && value.length > 0 && (
+                    <button className="tree-add-btn" title="末尾の要素をコピーして追加"
+                      onClick={() => ctx.duplicateItem(path, value.length - 1)}>
+                      ⧉ 末尾を複製
+                    </button>
+                  )}
+                </div>
+              )
+            )}
+          </>
+        )}
       </div>
     );
   }
-  // object
-  const keys = Object.keys(value);
-  if (keys.length === 0) return <div className="tree-row" style={{ paddingLeft: level * 16 }}>{label && <span className="tree-key">{label}: </span>}<span className="tree-bracket">{'{}'}</span></div>;
+
+  // ─── リーフ（文字列 / 数値 / 真偽 / null） ───
   return (
-    <div>
-      <div className="tree-row" style={{ paddingLeft: level * 16, cursor: 'pointer' }} onClick={() => setCollapsed(!collapsed)}>
-        <span className="tree-toggle">{collapsed ? '▶' : '▼'}</span>
-        {label && <span className="tree-key">{label}: </span>}
-        <span className="tree-bracket">{'{' + keys.length + ' キー}'}</span>
+    <div className="tree-node">
+      <div className="tree-row leaf" style={indent}>
+        <span className="tree-toggle" />
+        {keyLabel}
+        {label !== null && <span className="tree-colon">:</span>}
+        <LeafEditor
+          value={value}
+          type={type}
+          onCommit={v => ctx.update(path, v)}
+        />
+        {hint && <span className="tree-hint">{hint}</span>}
+        {actions}
       </div>
-      {!collapsed && keys.map(k => (
-        <TreeView key={k} value={value[k]} level={level + 1} label={k} />
-      ))}
     </div>
+  );
+}
+
+// ─── リーフ値の入力UI ───
+// 入力中は draft(ローカル state) を編集し、blur / Enter で確定する。
+// 1打鍵ごとに全体を再シリアライズすると重いうえ、再描画でカーソルが飛ぶため。
+function LeafEditor({ value, type, onCommit }) {
+  const toText = (v) => (v === null || v === undefined) ? '' : String(v);
+  const [draft, setDraft] = useState(() => toText(value));
+  const [invalid, setInvalid] = useState(false);
+
+  // 外部から値が変わったら（読み込み・破棄・復元・型変更）追従する
+  useEffect(() => { setDraft(toText(value)); setInvalid(false); }, [value, type]);
+
+  if (type === 'boolean') {
+    return (
+      <button
+        className={`tree-bool-toggle ${value ? 'on' : 'off'}`}
+        onClick={() => onCommit(!value)}
+        title="クリックで切り替え"
+      >{String(value)}</button>
+    );
+  }
+
+  if (type === 'null') {
+    return <span className="tree-null" title="型を変更すると値を入力できます">null</span>;
+  }
+
+  function commit() {
+    if (type === 'number') {
+      const t = draft.trim();
+      const n = Number(t);
+      if (t === '' || !Number.isFinite(n)) { setInvalid(true); return; }
+      setInvalid(false);
+      if (n !== value) onCommit(n);
+      return;
+    }
+    if (draft !== value) onCommit(draft);
+  }
+
+  const commonProps = {
+    value: draft,
+    onChange: e => { setDraft(e.target.value); if (invalid) setInvalid(false); },
+    onBlur: commit,
+    spellCheck: false,
+  };
+
+  if (type === 'number') {
+    return (
+      <input
+        {...commonProps}
+        className={`tree-input num ${invalid ? 'invalid' : ''}`}
+        inputMode="decimal"
+        title={invalid ? '数値として解釈できません' : ''}
+        onKeyDown={e => {
+          if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); }
+          if (e.key === 'Escape') { setDraft(toText(value)); setInvalid(false); }
+        }}
+      />
+    );
+  }
+
+  // 文字列: 改行を含むか、かなり長い場合は textarea（systemPrompts など）。
+  // モデルのフルパス程度（〜100文字）は1行入力のままの方が見やすいので閾値は高めにする。
+  const multiline = typeof value === 'string' && (value.includes('\n') || value.length > 100);
+  if (multiline) {
+    return (
+      <textarea
+        {...commonProps}
+        className="tree-input str multiline"
+        rows={Math.min(14, Math.max(2, draft.split('\n').length))}
+        onKeyDown={e => { if (e.key === 'Escape') setDraft(toText(value)); }}
+      />
+    );
+  }
+  return (
+    <input
+      {...commonProps}
+      className="tree-input str"
+      onKeyDown={e => {
+        if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); }
+        if (e.key === 'Escape') { setDraft(toText(value)); }
+      }}
+    />
   );
 }
 

@@ -41,6 +41,27 @@ APIキー不要。検索結果のスニペットだけでなく、上位3件の�
 ### 📁 サーバーファイル読み書き
 LLMが直接サーバーのファイルシステムに `.py` / `.xml` / `.json` 等を保存可能。Agenticツールとして `read_file`, `write_file`, `list_files` を実装。バイナリファイル（PNG/PDF/Parquet等）もFormData経由で安全にアップロード・ダウンロード可能。
 
+### ☁️ Google Drive 連携（LLMがドライブを読み書き）
+「ドライブの議事録まとめて」「あの資料の売上、月別に集計して」で、LLMが自分で Google Drive を検索・閲覧します。追加の npm パッケージは不要（Node標準の `https` / `crypto` だけで OAuth2 と Drive API v3 を実装）。
+
+| ツール | できること |
+|---|---|
+| `gdrive_search_files` | ファイル名＋**本文の全文検索**でドライブ全体から探す |
+| `gdrive_list_files` | フォルダの中身を一覧（`"資料/2026年度"` のようなパス指定も可） |
+| `gdrive_read_file` | 中身をテキストで読む。**Google ドキュメント→テキスト、スプレッドシート→CSV に自動変換** |
+| `gdrive_import_to_server` | PDF・画像・Excel 等を `uploads/` に取り込む → そのまま Python/DuckDB で処理できる |
+| `gdrive_write_file` | Drive にファイルを作成・更新（書き込み許可時のみ） |
+| `gdrive_upload_from_server` | `uploads/` のファイルを Drive にアップロード（書き込み許可時のみ） |
+| `gdrive_create_folder` / `gdrive_delete_file` | フォルダ作成／ゴミ箱へ移動（それぞれ許可時のみ） |
+
+**安全側に倒した設計**
+- 既定は **読み取り専用**。書き込みは `allowWrite`、削除は `allowDelete` を明示的に true にした時だけツール自体が生えます
+- `rootFolderId` を設定すると、**そのフォルダ配下だけ**にアクセスを限定（親を遡って範囲外を拒否）
+- `clientSecret` はブラウザに一切返しません。リフレッシュトークンは `config.json` ではなく `gdrive_token.json`（chmod 600・gitignore 済み）に保存
+- チャット入力欄の ☁️ ボタンでいつでも ON/OFF、右パネルの「☁️ GDrive」タブから接続・ファイル閲覧・取り込みができます
+
+→ セットアップ手順は [☁️ Google Drive 連携のセットアップ](#️-google-drive-連携のセットアップ) を参照
+
 ### 🎯 ドラッグ&ドロップ統合UI
 3つのドロップゾーンが状況に応じて自動で振り分け:
 - **チャット入力欄**: 画像→Vision添付、その他→ドキュメント取り込み
@@ -235,8 +256,8 @@ config.json から HTTPサーバーや llama-server の細かな設定を調整�
 ### ⚙️ ブラウザから config.json 編集
 `/editconfig.html` で config.json を直接編集可能。チャット画面左下の小さな歯車アイコンからもアクセスできる。
 
-- **テキストエディタ + リアルタイム JSON 構文チェック**: 編集中に構文エラーをハイライト
-- **ツリービュー**: 構造を折りたたみ可能なツリーで可視化（読み取り専用）
+- **🌳 ツリー編集（既定表示）**: 括弧・カンマ・`\n` エスケープを気にせず GUI で設定を編集。値は型ごとの入力UI（真偽値はトグル、長文プロンプトは複数行エリア）、キーの追加/改名/削除、配列の並べ替え・複製、キーの説明表示、キー名や値での絞り込み検索。まとまり単位で JSON テキスト編集する逃げ道も用意
+- **📝 テキストエディタ + リアルタイム JSON 構文チェック**: 生JSONを直接見たい時用。編集中に構文エラーをハイライト（ツリー編集の結果もここで確認できる）
 - **整形（pretty-print）/ 破棄 / Ctrl+S 保存**: VS Code風の操作感
 - **保存時に自動バックアップ**: `config.json.bak.<timestamp>` を最新10件まで保持
 - **バックアップから復元**: サイドバーのバックアップ一覧からワンクリック復元
@@ -832,6 +853,8 @@ opengeek-llm-chat/
 ├── rl_online_server.py         # 強化学習(RL)オンライン常駐ワーカー (act/learn HTTP API)
 ├── rl_common.py                # 強化学習の共通ロジック (Qネット構築・状態エンコード・損失計算)
 ├── agent_proxy.js              # 外部API用ツール対応モード (OpenAI互換 + エージェントループ)
+├── google_drive.js             # Google Drive 連携 (OAuth2/サービスアカウント + Drive API v3、依存なし)
+├── gdrive_token.json           # Driveのリフレッシュトークン (自動生成・gitignore済み・chmod600)
 ├── llm_pool.js                 # マルチLLMワーカープール (複数llama-server同時起動・VRAM自動判定)
 ├── gguf_info.js                # GGUFのVRAM見積り診断ツール (node gguf_info.js で全モデル診断)
 ├── orchestrator.js             # マルチLLMオーケストレーション実行エンジン (ワークフローDAG実行)
@@ -943,6 +966,27 @@ opengeek-llm-chat/
 
   "webSearch": true,
   "fileAccess": true,
+
+  "googleDrive": {
+    "enabled": false,
+    "authMode": "oauth",
+    "clientId": "",
+    "clientSecret": "",
+    "redirectUri": "http://localhost:3000/gdrive/auth/callback",
+    "serviceAccountKeyFile": "",
+    "impersonateUser": "",
+    "rootFolderId": "",
+    "readOnly": true,
+    "allowWrite": false,
+    "allowDelete": false,
+    "maxDownloadMB": 20,
+    "maxUploadMB": 20,
+    "maxTextChars": 20000,
+    "defaultPageSize": 30,
+    "sharedDrives": true,
+    "tokenFile": "gdrive_token.json"
+  },
+
   "ragTopK": 10,
   "ragMode": "agentic",
   "agentContext": {
@@ -999,6 +1043,20 @@ opengeek-llm-chat/
 | `tuning.modelPresets[].epochs/lr/batch/accum/r/alpha/maxLen` | プリセット選択時に自動入力されるハイパラ |
 | `webSearch` | DuckDuckGo検索 ON/OFF（UIトグル初期値） |
 | `fileAccess` | サーバーファイル読み書き ON/OFF |
+| `googleDrive.enabled` | Google Drive 連携 ON/OFF |
+| `googleDrive.authMode` | `oauth`（個人アカウント・推奨） / `serviceAccount`（ヘッドレス・共有ドライブ） |
+| `googleDrive.clientId` / `clientSecret` | OAuth クライアント認証情報（Google Cloud Console で発行）。`/config` では公開されない |
+| `googleDrive.redirectUri` | OAuth のリダイレクト先。Cloud Console の「承認済みリダイレクトURI」と完全一致させる |
+| `googleDrive.serviceAccountKeyFile` | サービスアカウントJSONキーのパス（相対ならサーバーのディレクトリ基準） |
+| `googleDrive.impersonateUser` | Workspace のドメイン全体の委任で代理するユーザー（サービスアカウント時のみ） |
+| `googleDrive.rootFolderId` | 指定するとこのフォルダ配下だけにアクセスを限定（親を遡って範囲外を拒否） |
+| `googleDrive.readOnly` | `true`（既定）で読み取り専用。書き込みツールをLLMに提示しない |
+| `googleDrive.allowWrite` | `readOnly:false` と両方 true で書き込み許可 |
+| `googleDrive.allowDelete` | ゴミ箱への移動を許可 |
+| `googleDrive.maxDownloadMB` / `maxUploadMB` | 1ファイルあたりの上限（既定20MB） |
+| `googleDrive.maxTextChars` | LLMに渡すテキストの最大文字数（既定20000） |
+| `googleDrive.sharedDrives` | 共有ドライブ（旧チームドライブ）も対象に含める |
+| `googleDrive.tokenFile` | リフレッシュトークンの保存先（既定 `gdrive_token.json`、chmod600） |
 | `imageGen` | 画像生成（stable-diffusion.cpp連携）ON/OFF。`imageModels[]` を定義した上で `true` にして有効化 |
 | `stableDiffusion.binPath` | sd-server バイナリの絶対パス |
 | `stableDiffusion.port` | sd-server HTTP ポート（内部通信用、デフォルト 7860） |
@@ -1119,6 +1177,7 @@ LLMへの指示文を `config.json` の `systemPrompts` キーで完全カスタ
 | `documents` | ドキュメント添付時の追記 | `{docList}` |
 | `webSearch` | Web検索有効時の追記 | - |
 | `fileAccess` | サーバーファイル操作有効時の追記 | - |
+| `googleDrive` | Google Drive 連携が有効かつ接続済みの時の追記 | - |
 | `python` | Python実行案内（常時） | - |
 | `meta` | メタ抑制指示（常時） | - |
 | `judge` | ツール判断専用（軽量） | `{toolList}` |
@@ -1253,6 +1312,199 @@ LLMが自分で判断してツールを呼びます。プロンプトに「検�
 
 ---
 
+## ☁️ Google Drive 連携のセットアップ
+
+LLMから Google Drive のファイルを検索・閲覧・（許可すれば）書き込みできるようにします。
+**追加の npm パッケージは不要**です（Node標準の `https` / `crypto` だけで OAuth2 と Drive API v3 を実装しています）。
+
+認証方式は2つ。ふつうは **OAuth（個人アカウント）** で十分です。
+
+| 方式 | 向いている用途 | 特徴 |
+|:--|:--|:--|
+| `oauth` | 自分の Google アカウントのドライブを見せたい | ブラウザで1回同意するだけ。リフレッシュトークンを保存して以後は自動更新 |
+| `serviceAccount` | ヘッドレス運用・共有ドライブ・Workspace | JSONキーだけで動く。ブラウザ操作不要。共有ドライブまたはフォルダをサービスアカウントに共有しておく必要あり |
+
+---
+
+### 方式A: OAuth（個人アカウント・推奨）
+
+#### 1. Google Cloud Console で認証情報を作る
+
+1. [Google Cloud Console](https://console.cloud.google.com/) でプロジェクトを作成（または既存を選択）
+2. **APIとサービス → ライブラリ** から **Google Drive API** を検索して **有効にする**
+3. **APIとサービス → OAuth同意画面** を設定
+   - User Type: 個人利用なら **外部**（社内だけなら **内部**）
+   - スコープの追加で `.../auth/drive.readonly`（書き込みも使うなら `.../auth/drive`）を追加
+   - **テストユーザー** に自分のGoogleアカウントを追加（同意画面を「公開」しない場合は必須）
+4. **APIとサービス → 認証情報 → 認証情報を作成 → OAuth クライアント ID**
+   - アプリケーションの種類: **ウェブ アプリケーション**
+   - **承認済みのリダイレクト URI** に、これから `config.json` に書くものと**完全に同じ文字列**を登録:
+     ```
+     http://localhost:3000/gdrive/auth/callback
+     ```
+     （HTTPS化している／別ホスト名で使うなら `https://your-host:3000/gdrive/auth/callback` のように実際にブラウザからアクセスするURLに合わせる）
+5. 発行された **クライアントID** と **クライアントシークレット** を控える
+
+#### 2. config.json を編集
+
+```jsonc
+"googleDrive": {
+  "enabled": true,                    // ← 機能ON
+  "authMode": "oauth",
+  "clientId": "xxxxxxxx.apps.googleusercontent.com",
+  "clientSecret": "GOCSPX-xxxxxxxxxxxx",
+  "redirectUri": "http://localhost:3000/gdrive/auth/callback",  // ← 手順4と完全一致させる
+
+  "rootFolderId": "",                 // 特定フォルダ配下に限定したい時だけ設定（後述）
+  "readOnly": true,                   // true = 読み取り専用（既定）
+  "allowWrite": false,                // 書き込みを許すなら readOnly:false と両方設定
+  "allowDelete": false,               // ゴミ箱への移動を許すなら true
+
+  "maxDownloadMB": 20,                // 1ファイルのダウンロード上限
+  "maxUploadMB": 20,
+  "maxTextChars": 20000,              // LLMに渡すテキストの最大文字数
+  "defaultPageSize": 30,
+  "sharedDrives": true,               // 共有ドライブも対象に含める
+  "tokenFile": "gdrive_token.json"    // リフレッシュトークンの保存先
+}
+```
+
+#### 3. 再起動 → ブラウザから接続
+
+```bash
+npm start
+```
+
+1. 右上の **📁 ファイル**ボタン（右パネル）を開き、**☁️ GDrive** タブへ
+2. **🔗 Google Drive に接続** をクリック → ポップアップで Google の同意画面が出る
+3. 許可すると自動でタブが閉じ、パネルに `接続中: you@example.com` と表示されます
+
+以後はチャット入力欄の **☁️ ボタン**が点灯し、LLM がドライブを使えるようになります。
+
+> **補足: コールバックの作り**
+> Google からのリダイレクト（`accounts.google.com` → 本体）は**クロスサイトのトップレベル遷移**なので、
+> セッションCookie（`SameSite=Strict`）はブラウザから送られてきません。
+> そのため `/gdrive/auth/callback` は**中継ページを返すだけ**にしてあり、
+> 実際のトークン交換はそのページから同一サイトの `POST /gdrive/auth/exchange`（認証必須）で行います。
+> セッションCookieを `SameSite=Lax` に緩めてアプリ全体のCSRF耐性を下げる、という選択はしていません。
+
+---
+
+### 方式B: サービスアカウント（ヘッドレス／共有ドライブ）
+
+1. Google Cloud Console → **IAMと管理 → サービス アカウント** で作成
+2. 作成したサービスアカウントの **キー → 鍵を追加 → JSON** をダウンロード
+3. JSONをサーバーに置く（例: `/home/user/opengeek-llm-chat/gdrive-service-account.json`）
+   - `.gitignore` に `gdrive-service-account*.json` を登録済みなので、リポジトリ直下に置いても誤コミットされません
+4. **Drive 側で共有設定**: 見せたいフォルダ（または共有ドライブ）を、サービスアカウントのメールアドレス
+   （`xxx@yyy.iam.gserviceaccount.com`）に **共有** する ← これを忘れると何も見えません
+5. `config.json`:
+
+```jsonc
+"googleDrive": {
+  "enabled": true,
+  "authMode": "serviceAccount",
+  "serviceAccountKeyFile": "gdrive-service-account.json",  // 相対パスならサーバーのディレクトリ基準
+  "impersonateUser": "",              // Workspaceのドメイン全体の委任を使う場合のみユーザーを指定
+  "rootFolderId": "",
+  "readOnly": true,
+  "allowWrite": false,
+  "allowDelete": false
+}
+```
+
+ブラウザでの接続操作は不要です。再起動すれば ☁️ GDrive タブが「接続中」になります。
+
+---
+
+### 権限モデル（安全側に倒してあります）
+
+| config | 生えるツール |
+|:--|:--|
+| 既定（`readOnly: true`） | `gdrive_search_files` / `gdrive_list_files` / `gdrive_read_file` / `gdrive_import_to_server` |
+| `readOnly: false` かつ `allowWrite: true` | ＋ `gdrive_write_file` / `gdrive_upload_from_server` / `gdrive_create_folder` |
+| ＋ `allowDelete: true` | ＋ `gdrive_delete_file`（ゴミ箱へ移動。完全削除はAPIのみ） |
+
+**許可していない操作のツールは、LLMに提示すらされません。** 「プロンプトで禁止する」のではなく、
+そもそも呼べる関数として存在させない方式です。
+
+`readOnly` の状態は OAuth のスコープにも反映されます（読み取り専用なら `drive.readonly` しか要求しない）。
+**後から書き込みを許可した場合は、スコープが変わるため一度「連携解除」してから接続し直してください。**
+
+### アクセス範囲を1フォルダに限定する（rootFolderId）
+
+ドライブ全体ではなく、特定フォルダの中だけを見せたい場合:
+
+1. ブラウザで Drive のフォルダを開き、URL の末尾からIDを取る
+   `https://drive.google.com/drive/folders/1AbCdEfGhIjKlMnOpQrStUvWxYz` → `1AbCdEfGhIjKlMnOpQrStUvWxYz`
+2. `"rootFolderId": "1AbCdEfGhIjKlMnOpQrStUvWxYz"` を設定
+
+一覧・検索の基準がこのフォルダになり、ファイルIDを直接指定された場合も **親を遡って配下かどうかを検証**し、
+範囲外なら 403 で拒否します。
+
+### 使い方の例
+
+```
+ユーザー: "ドライブにある議事録を探して、直近のものを要約して"
+  ↓
+LLM: ☁️ gdrive_search_files("議事録") → 5件（id付き）取得
+  ↓
+LLM: ☁️ gdrive_read_file("1xY...") → Googleドキュメントをテキストに変換して取得
+  ↓
+LLM: 要約を応答
+
+ユーザー: "ドライブの売上データ.xlsx を月別に集計してグラフにして"
+  ↓
+LLM: ☁️ gdrive_search_files("売上データ") → id取得
+  ↓
+LLM: ⬇️ gdrive_import_to_server(id) → uploads/売上データ.xlsx に保存
+  ↓
+LLM: ```python ... pandas/DuckDBで集計 + matplotlib``` を出力 → 実行してグラフ表示
+```
+
+Google ドキュメント／スプレッドシート／スライドは、そのままではダウンロードできない形式なので
+**自動で テキスト／CSV／テキスト に変換**してから LLM に渡しています。
+PDF・画像・Excel などのバイナリは `gdrive_read_file` では読めないため、LLM には
+「`gdrive_import_to_server` を使え」というエラーメッセージを返し、自力でリカバリできるようにしてあります。
+
+### 外部API（ツール対応モード）から使う
+
+右パネルの **🌐 API** タブで外部APIサーバーを「ツール対応モード」で起動するとき、
+**☁️ GDrive (gdrive_* ツール)** にチェックを入れると、OpenAI互換APIの向こう側からも
+ドライブを触れます（Drive未接続の場合はチェックボックスが無効化されます）。
+
+外部APIトークン（`config.json` の `ml.apiTokens`）には `gdrive:read` / `gdrive:write` 権限を指定できます:
+
+```jsonc
+"ml": {
+  "apiTokens": [
+    { "name": "読み取り専用BOT", "token": "xxx", "permissions": ["gdrive:read"] },
+    { "name": "書き込みも可", "token": "yyy", "permissions": ["gdrive:read", "gdrive:write"] }
+  ]
+}
+```
+
+### トラブルシューティング
+
+| 症状 | 原因と対処 |
+|:--|:--|
+| 「接続」ボタンが押せない | `clientId` / `clientSecret` が未設定。config.json を確認して再起動 |
+| `redirect_uri_mismatch` と出る | Cloud Console の「承認済みのリダイレクトURI」と `config.json` の `redirectUri` が1文字でも違う。末尾スラッシュ・http/https・ポート番号まで一致させる |
+| ポップアップが出ない | ブラウザのポップアップブロック。このサイトを許可する |
+| 認可の途中で `{"error":"認証が必要です"}` と出る | 本体を古いバージョンのまま動かしている可能性。セッションCookieが `SameSite=Strict` のため、Googleからのリダイレクト（クロスサイト遷移）ではCookieが送られず、コールバックが401になる。現在は中継ページ方式で解消済み（`server.js` を更新して再起動してください） |
+| 「OpenGeekLLMChat にログインしていません」と出る | OAuthの途中でセッションが切れた。元のタブでログインし直してから、もう一度「接続」する |
+| 「有効期限切れか、すでに使用済みです」と出る | 認可の `state` は**1回限り・10分間**有効。コールバックページの再読み込みや、認可画面を開いたまま放置した場合に出る。「接続」からやり直す |
+| `403 ... Drive API has not been used` | Cloud Console で **Google Drive API を有効化**していない |
+| サービスアカウントで何も見えない | 対象フォルダ／共有ドライブをサービスアカウントのメールアドレスに**共有**していない |
+| 「Google の認可が失効しています」 | リフレッシュトークンが取り消された（パスワード変更・長期間未使用など）。「連携解除」→再接続 |
+| 書き込みツールが出てこない | `readOnly: false` **と** `allowWrite: true` の両方が必要。設定後は再起動＋（スコープが変わるので）連携解除→再接続 |
+| ファイルが大きすぎると言われる | `maxDownloadMB` を上げる。ただしLLMのコンテキストを圧迫するので `gdrive_import_to_server` + Python 処理を推奨 |
+| 読み込みの途中で応答が止まる / 「Let me try reading with the exact original ID...」で終わる | LLM が33文字のファイルIDを写し間違えて読み込みに失敗し、やり直しでツールのターンを使い切っていた。現在は**通し番号やファイル名でも指定でき、崩れたIDも自動補正**するよう修正済み（`public/js/index.jsx` を更新して再読み込み） |
+| ファイルの内容を表示する途中で止まる | ループ検出の誤検出。CSVやログを引用すると同じ100文字が何度も現れるため打ち切られていた。現在は末尾の連続した繰り返しだけを見るよう修正済み |
+| 「参照した資料」に `(類似度: NaN%)` やファイルIDが出る | GDrive はベクトル検索ではなく直接読み込みなのでスコアが無い。現在は**ファイル名（GDriveへのリンク付き）と GDrive バッジ**を表示し、スコアが無い時は類似度を出さないよう修正済み |
+
+---
+
 ## 🧪 環境変数
 
 | 変数名 | デフォルト | 説明 |
@@ -1305,6 +1557,22 @@ LLMが自分で判断してツールを呼びます。プロンプトに「検�
 | `DELETE` | `/files/*` | ✓ | ファイル削除 |
 | `GET` | `/files` | ✓ | ファイル一覧 |
 | `GET` | `/plots/*` | ✓ | matplotlib生成画像の配信（uploadsとは分離管理） |
+| `GET` | `/gdrive/status` | ✓ | Google Drive の接続状態（機密は返さない） |
+| `GET` | `/gdrive/about` | ✓ | 接続テスト（アカウント・空き容量） |
+| `GET` | `/gdrive/auth/url` | ✓ | OAuth 認可URLの発行（state付き・10分有効） |
+| `GET` | `/gdrive/auth/callback` | — | OAuth コールバックの中継ページ（特権処理なし。Cookieが届かないため認証を掛けられない） |
+| `POST` | `/gdrive/auth/exchange` | ✓ | 認可コード→リフレッシュトークン保存（中継ページから same-site で呼ばれる。state は1回限り） |
+| `POST` | `/gdrive/disconnect` | ✓ | 連携解除（トークンを失効させてローカルからも削除） |
+| `GET` | `/gdrive/files?folderId=` | ✓ | フォルダの中身を一覧 |
+| `GET` | `/gdrive/search?q=` | ✓ | ファイル名＋本文の全文検索 |
+| `GET` | `/gdrive/files/:id` | ✓ | メタデータ取得 |
+| `GET` | `/gdrive/files/:id/content` | ✓ | 中身をテキストで取得（`?raw=1` でバイナリ配信） |
+| `POST` | `/gdrive/files` | ✓ | ファイル作成/更新（要 `allowWrite`） |
+| `POST` | `/gdrive/folders` | ✓ | フォルダ作成（要 `allowWrite`） |
+| `DELETE` | `/gdrive/files/:id` | ✓ | ゴミ箱へ移動（要 `allowDelete`。`?permanent=1` で完全削除） |
+| `POST` | `/gdrive/import` | ✓ | Drive → `public/uploads` に取り込み |
+| `POST` | `/gdrive/export` | ✓ | `public/uploads` → Drive にアップロード（要 `allowWrite`） |
+| `GET` | `/external-servers/gdrive-available` | ✓ | Drive が外部APIツールで使えるか |
 | `GET` | `/config` | — | 公開設定（セッション有効時は `authenticated:true`） |
 | `GET` | `/config/raw` | ✓ | config.jsonの生テキスト取得（editconfig.html用） |
 | `POST` | `/config/raw` | ✓ | config.json保存（自動バックアップ作成、JSON検証） |
@@ -1550,6 +1818,7 @@ print(r.json()["x_tools_used"])
    - 🌐 Web検索 (`web_search`)
    - 📁 ファイル参照 (`list_files` / `read_file`)
    - 📚 RAG文書検索 (`search_documents`) — embeddingサーバー必要
+   - ☁️ GDrive (`gdrive_*`) — GDrive連携が有効かつ接続済みの時のみ
 5. 🚀 起動
 
 起動後、起動中サーバー一覧に **「🔧 ツール対応」バッジ** が表示されます。
@@ -1567,6 +1836,14 @@ print(r.json()["x_tools_used"])
 | `list_files` | uploads フォルダの一覧 | |
 | `read_file` | uploads のファイルを読む | |
 | `search_documents` | 永続RAGドキュメントから embedding 検索 | 別途 RAG 登録必要 |
+| `gdrive_search_files` | Google Drive をファイル名+本文で全文検索 | Drive接続必要 |
+| `gdrive_list_files` | Drive フォルダの中身を一覧 | フォルダパス指定可 |
+| `gdrive_read_file` | Drive のファイルをテキストで読む | Googleドキュメント/シートは自動変換 |
+| `gdrive_import_to_server` | Drive のファイルを uploads に取り込む | バイナリ対応 |
+| `gdrive_write_file` | Drive にファイル作成/更新 | 要 `allowWrite` |
+| `gdrive_upload_from_server` | uploads のファイルを Drive へ | 要 `allowWrite` |
+| `gdrive_create_folder` | Drive にフォルダ作成 | 要 `allowWrite` |
+| `gdrive_delete_file` | Drive のファイルをゴミ箱へ | 要 `allowDelete` |
 
 **非対応** (セキュリティ・複雑性のため):
 - `generate_image` (画像生成)
@@ -1583,6 +1860,17 @@ RAG (`search_documents`) は内部 embedding サーバーが必要です。
 4. **agent_proxy**: ツール一覧から自動除外
 
 embedding を有効化するには `config.json` の `embeddingModel.path` に GGUF embedding モデル (例: `mxbai-embed-large-v1-f16.gguf`) のパスを指定してください。
+
+### Google Drive も同じく段階的に無効化される
+
+`gdrive_*` ツールも、**Drive連携が無効／未接続なら自動的にツール一覧から外れます**。
+さらに `allowWrite` / `allowDelete` を許可していない場合、書き込み系・削除系のツールは
+**そもそもLLMに提示されません**（プロンプトで禁止するのではなく、呼べる関数として存在させない）。
+
+1. **UI**: GDriveチェックボックスが灰色 + 「⚠️ GDrive未接続のため利用不可」表示
+2. **サーバー起動時**: gdrive を要求しても自動除外され、警告レスポンス
+3. **API**: `/gdrive/*` が 400/401 で理由付きエラー
+4. **agent_proxy**: ツール一覧から自動除外（権限に応じて write/delete も個別に除外）
 
 ### 動作原理
 
@@ -2825,14 +3113,50 @@ llama_model_load: error loading model: unable to allocate ROCm0 buffer
 
 | 機能 | 説明 |
 |:--|:--|
+| 🌳 **ツリー編集**（既定） | **括弧やカンマを気にせず、GUIで設定を編集**。値の型ごとの入力UI、キーの追加/改名/削除、配列の並べ替え/複製、キーの説明表示、検索 |
 | 📝 テキスト編集 | 行番号付き、リアルタイムJSON構文チェック、Ctrl+S 保存 |
-| 🌳 ツリービュー | JSON構造を折りたたみ可能なツリーで可視化 |
-| ✨ 整形 | JSON pretty-print（2スペースインデント） |
+| ✨ 整形 | JSON pretty-print（2スペースインデント、テキスト表示時のみ） |
 | 💾 自動バックアップ | 保存時に `config.json.bak.<timestamp>` を作成、最新10件保持 |
 | ⏮ 復元 | サイドバーのバックアップ一覧からワンクリック復元 |
 | 🔄 本体を再起動 | ブラウザから OpenGeekLLMChat 本体プロセスを再起動 |
 | 📊 サーバー情報 | PID、起動時間、systemd管理下かどうかを表示 |
 | ⬇ モデル追加 | HuggingFace の GGUF リンクから1ボタンでダウンロード＆`chatModels`登録 |
+
+### 🌳 ツリー編集（既定の表示）
+
+生のJSONを直接いじると、括弧・カンマ・`\n` のエスケープの対応を人間が追うことになり、
+1文字の打ち間違いで起動しなくなる。ツリー編集はそこを GUI に置き換えたもの。
+
+```
+▼ config.json : { 46 キー }
+    appName    : [OpenGeekLLMChat        ]  ブラウザのタイトル・表示名
+    webSearch  : ( true )                   Web検索（DuckDuckGo）を使えるようにする
+  ▼ chatModels : [ 3 個 ]                   チャットに使うGGUFモデル一覧
+    ▼ [0] : { 5 キー }          [型▼] { } ↑ ↓ ⧉ ✕
+        name : [Gemma4 31B            ]     UIに表示する名前
+        ctx  : [32768]                      コンテキスト長（起動時に固定）
+```
+
+| できること | 操作 |
+|:--|:--|
+| **値を編集** | 値をクリックして入力。確定は Enter またはフォーカスを外す、取り消しは Esc |
+| **真偽値の切り替え** | `true` / `false` のバッジをクリック |
+| **長文の編集** | `systemPrompts` のような改行入りの文字列は複数行のテキストエリアで編集（`\n` を手で書く必要なし） |
+| **キー名の変更** | キー名をクリックして書き換え（キーの並び順は保たれる） |
+| **キー / 要素の追加** | `＋ キーを追加` / `＋ 要素を追加`。型（文字列・数値・真偽・null・オブジェクト・配列）を選べる |
+| **配列の並べ替え・複製・削除** | 行をホバーすると出る `↑ ↓ ⧉ ✕`。`⧉ 末尾を複製` でモデル定義を雛形からもう1つ増やせる |
+| **型の変更** | 行右の型セレクタ。`"8080"`（文字列）→ `8080`（数値）のような直しに使う |
+| **まとまりをJSONで編集** | オブジェクト/配列の行の `{ }` ボタン。その部分だけをJSONテキストで一括編集（構文エラーは適用前に弾く） |
+| **検索** | 上部の検索ボックスにキー名や値を入れると該当箇所だけに絞り込み、自動で展開。一致したキーの配下は丸ごと表示される |
+| **説明の表示** | 主要な設定キーには右側に用途の説明が出る（`llamaServer.chatPort` → 「チャット推論サーバーのポート」など） |
+| **全展開 / 全折りたたみ** | 上部のボタン。既定はトップレベルだけ開いた状態 |
+
+編集結果は内部で `JSON.stringify(root, null, 2)` としてテキストに書き戻されるので、
+**📝 テキスト表示に切り替えればいつでも生JSONを確認でき**、保存・バックアップ・差分判定はこれまで通り動く。
+編集しても「💾 保存」を押すまで config.json には書き込まれない。
+
+テキスト表示側で構文を壊した場合、ツリー編集は**止まる**（壊れたデータを元に編集して
+テキストの変更を巻き戻さないため）。その時はテキスト表示で直すか「↺ 破棄」で読み込み直す。
 
 ### ⬇ HuggingFace GGUF モデルのワンボタン導入
 
@@ -3009,6 +3333,7 @@ nc -zv 192.168.100.11 50052
 | AI | llama.cpp (llama-server, OpenAI互換API) · mxbai-embed-large · Tool Calling · マルチターン実行 |
 | Python | matplotlib（画像自動表示）· 日本語フォント自動選択 · DuckDB（SQL処理） |
 | Search | DuckDuckGo HTML Lite + 本文取得 |
+| Cloud | Google Drive API v3（OAuth2 / サービスアカウントJWT を Node標準 https + crypto だけで実装、追加依存なし） |
 | Auth | セッションCookie (24h) · MD5/SHA-256 + timingSafeEqual · HTTPS時Secure自動付与 |
 | GPU監視 | rocm-smi / nvidia-smi |
 | クラスタ | llama.cpp RPC mode（オプション、ConnectX等の高速NW推奨） |

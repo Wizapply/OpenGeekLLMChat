@@ -53,6 +53,7 @@
 | `hashpass.py` | パスワードハッシュ生成 | Python標準 |
 | `generate-cert.sh` | 自己署名SSL生成 | openssl |
 | `transcribe-server.py` | Gemma4音声認識（参考実装） | transformers, torch |
+| `google_drive.js` | Google Drive 連携（OAuth2/JWT + Drive API v3） | Node標準のみ（`https`, `crypto`） |
 | `opengeek-llm-chat.service` | systemdテンプレート | - |
 
 ---
@@ -146,6 +147,18 @@ while (toolTurn < MAX_TOOL_TURNS) {
 | `list_files` | なし | `public/uploads/` 一覧 |
 | `read_file` | `path` | ファイル読み込み |
 | `write_file` | `path`, `content` | ファイル書き込み |
+| `gdrive_search_files` | `query`, `folderId?` | Google Drive をファイル名+本文で全文検索 |
+| `gdrive_list_files` | `folderId?`, `query?` | Drive フォルダの中身を一覧（フォルダパス指定可） |
+| `gdrive_read_file` | `fileId` | Drive のファイルをテキストで読む（Google形式は自動変換） |
+| `gdrive_import_to_server` | `fileId`, `savePath?` | Drive のファイルを `uploads/` に取り込む |
+| `gdrive_write_file` | `name`/`fileId`, `content` | Drive にファイル作成/更新（要 `allowWrite`） |
+| `gdrive_upload_from_server` | `path`, `folderId?` | `uploads/` のファイルを Drive へ（要 `allowWrite`） |
+| `gdrive_create_folder` | `name`, `folderId?` | Drive にフォルダ作成（要 `allowWrite`） |
+| `gdrive_delete_file` | `fileId` | Drive のファイルをゴミ箱へ（要 `allowDelete`） |
+
+`gdrive_*` は「Drive連携が有効 + 認可済み + チャット欄のトグルON」の3条件が揃った時だけ
+`tools` 配列に積まれる。書き込み系・削除系はさらに config の許可が要る（詳細は
+[☁️ Google Drive 連携の設計](#️-google-drive-連携の設計-google_drivejs)）。
 
 ### 引数の揺れ対応
 
@@ -153,6 +166,8 @@ LLMが `path`/`filename`/`file`/`filepath` など揺らぎで呼ぶため、フ�
 
 ```javascript
 const fpath = fnArgs.path || fnArgs.filename || fnArgs.file || fnArgs.filepath || '';
+// Google Drive も同様に fileId / id / file / name を吸収する
+const fileId = fnArgs.fileId || fnArgs.id || fnArgs.file || fnArgs.name || '';
 ```
 
 ### ドキュメントとサーバーファイルの優先順位
@@ -177,7 +192,7 @@ tools.push({
 
 ```javascript
 const textCallMatch = assistantMsg.content.match(
-  /(search_documents|web_search|read_file|list_files|write_file)\s*\(\s*([^)]*)\)/
+  /(search_documents|web_search|read_file|list_files|write_file|gdrive_search_files|gdrive_list_files|gdrive_read_file|gdrive_import_to_server)\s*\(\s*([^)]*)\)/
 );
 if (textCallMatch) {
   const fname = textCallMatch[1];
@@ -914,6 +929,353 @@ if (binaryExts[ext]) {
 
 ---
 
+## ☁️ Google Drive 連携の設計 (google_drive.js)
+
+LLM が Google Drive を「検索して・読んで・（許可されていれば）書く」ための層。
+`web_search` や `read_file` と同じく **agentic ツール** として提供する。
+
+### なぜ googleapis パッケージを使わないのか
+
+プロジェクトの依存は `express` / `ws` / `duckdb` の3つだけ、という方針を崩したくない。
+公式の `googleapis` は依存が数十MB規模になる。一方で必要なのは:
+
+- OAuth2 のトークン交換／リフレッシュ（`POST` と JSON パース）
+- サービスアカウントの JWT 署名（RS256）
+- Drive API v3 の数エンドポイント（`files.list` / `get` / `export` / `create` / `update` / `delete`）
+
+これらは **Node標準の `https` と `crypto` だけで完結する**。`crypto.createSign('RSA-SHA256')` が
+あればサービスアカウントの JWT も自前で作れるので、外部依存ゼロで実装している。
+
+### 全体構造
+
+```
+ブラウザ / LLMツール
+   ↓
+server.js  /gdrive/*  エンドポイント (requireAuth + requirePermission)
+   ↓
+google_drive.js  createGoogleDrive({ getConfig, baseDir, log })
+   ├─ 認証層   getAccessToken()  … トークンキャッシュ + 同時リフレッシュの束ね
+   │    ├─ oauth          refreshToken → access_token
+   │    └─ serviceAccount JWT(RS256) → access_token
+   ├─ 権限層   assertEnabled / assertWritable / assertDeletable / assertWithinRoot
+   └─ API層    listFiles / searchFiles / getFile / downloadFile / readFileAsText /
+               uploadFile / createFolder / deleteFile
+   ↓
+https://www.googleapis.com/drive/v3/...
+```
+
+`getConfig` は関数で受ける。`appConfig.googleDrive` を毎回読み直すので、
+設定オブジェクトを差し替えても新しい値が効く（テストでも設定を差し替えるだけで検証できる）。
+
+### 認証: 2方式
+
+| | `oauth` | `serviceAccount` |
+|:--|:--|:--|
+| 初回 | ブラウザで同意 → 認可コード → リフレッシュトークン | JSONキーを置くだけ |
+| 継続 | refresh_token で access_token を更新 | 毎回 JWT を署名して交換 |
+| 保存先 | `gdrive_token.json`（chmod 600） | キーファイルのパスのみ config に |
+| 向き | 個人のマイドライブ | ヘッドレス運用・共有ドライブ・Workspace |
+
+JWT の組み立て（サービスアカウント）:
+
+```javascript
+const claim = {
+  iss: key.client_email,
+  scope: currentScope(),
+  aud: 'https://oauth2.googleapis.com/token',
+  exp: now + 3600, iat: now,
+  // Workspace のドメイン全体の委任を使う時だけ sub を付ける
+  ...(impersonateUser ? { sub: impersonateUser } : {}),
+};
+const signingInput = `${b64url(header)}.${b64url(claim)}`;
+const sig = crypto.createSign('RSA-SHA256').update(signingInput).sign(key.private_key);
+// grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer で交換
+```
+
+### トークンのキャッシュと 401 リトライ
+
+- access_token は期限の1分前まで**メモリにキャッシュ**（毎回 `/token` を叩かない）
+- `refreshInFlight` に Promise を持たせ、**同時リクエストのリフレッシュを1本に束ねる**
+- API が 401 を返したら **1度だけ** 強制リフレッシュして再試行（アイドル後の復帰対策）
+- `invalid_grant`（認可が取り消された）は自動復旧できないので、
+  **トークンファイルを削除**して「再接続してください」を返す。放置すると毎回同じエラーを踏み続けるため
+
+### スコープは権限設定から導出する
+
+```javascript
+function currentScope() {
+  return (readOnly !== false && !allowWrite)
+    ? 'https://www.googleapis.com/auth/drive.readonly'
+    : 'https://www.googleapis.com/auth/drive';
+}
+```
+
+読み取り専用運用なら、**Google に要求するスコープ自体が readonly になる**。
+「書き込み権限を持っているが使わない」ではなく「そもそも権限を持たない」状態にできる。
+
+⚠️ 後から `allowWrite` を有効にした場合、既存のリフレッシュトークンは readonly スコープのままなので、
+**一度「連携解除」してから接続し直す**必要がある（README のトラブルシューティングにも記載）。
+
+### 権限モデル: ツールを「生やさない」
+
+プロンプトで「削除しないでください」と書くのは、LLM が従う保証がないので防御にならない。
+そこで **config で許可していない操作は、ツール定義自体を LLM に渡さない**:
+
+| config | LLM に見えるツール |
+|:--|:--|
+| 既定（`readOnly: true`） | `gdrive_search_files` / `gdrive_list_files` / `gdrive_read_file` / `gdrive_import_to_server` |
+| `readOnly:false` + `allowWrite:true` | ＋ `gdrive_write_file` / `gdrive_upload_from_server` / `gdrive_create_folder` |
+| ＋ `allowDelete:true` | ＋ `gdrive_delete_file` |
+
+さらに **サーバー側でも `assertWritable()` / `assertDeletable()` で二重に弾く**。
+フロントの判定をすり抜けて `/gdrive/files` を直接叩かれても、書き込みは通らない。
+
+### rootFolderId サンドボックス
+
+「このフォルダの中だけ見せたい」という要求への対応。一覧・検索の基準を変えるだけでは
+**ファイルIDを直接指定されたら素通り**してしまうので、ID指定の操作では親を遡って検証する:
+
+```javascript
+async function assertWithinRoot(fileId, depth = 10) {
+  if (!rootFolderId) return true;
+  let frontier = [fileId];
+  for (let i = 0; i < depth && frontier.length; i++) {
+    const next = [];
+    for (const id of frontier) {
+      const parents = await getParents(id);        // 5分キャッシュ付き
+      if (parents.includes(rootFolderId)) return true;
+      next.push(...parents);
+    }
+    frontier = next;
+  }
+  throw new Error('許可された範囲の外にあります');
+}
+```
+
+親の取得は `parentCache`（5分TTL）に載せる。連続してファイルを読む時に
+毎回 `files.get` が走るのを防ぐ。
+
+### クエリインジェクション対策
+
+Drive の `q=` は独自のクエリ言語で、文字列はシングルクォートで囲む。
+LLM やユーザーの入力をそのまま埋めると `' or name contains '` のような**クエリ注入**ができてしまう:
+
+```javascript
+function escapeQueryLiteral(s) {
+  return String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+// → "x' or name contains 'y" は "x\' or name contains \'y" になり、リテラルを閉じられない
+```
+
+全ての `q=` 組み立てでこれを通している。
+
+### Google ネイティブ形式の自動変換
+
+Google ドキュメント／スプレッドシート／スライドは実体がないので `alt=media` では落とせない。
+`files.export` で変換する。**LLM が読める形を優先**して既定のマッピングはテキスト系:
+
+| 元 | export先 | 拡張子 |
+|:--|:--|:--|
+| `...google-apps.document` | `text/plain` | `.txt` |
+| `...google-apps.spreadsheet` | `text/csv` | `.csv` |
+| `...google-apps.presentation` | `text/plain` | `.txt` |
+| `...google-apps.drawing` | `image/png` | `.png` |
+
+`preferOffice: true` を渡した時だけ docx/xlsx/pptx に切り替える（サーバー取り込み用）。
+
+### ファイルIDは「番号・名前・崩れたID」からでも解決する
+
+Drive の ID は 33文字前後のランダム文字列で、**LLM はこれを正確に書き写すのが非常に苦手**。
+1〜2文字変えたり途中で切ったりして読み込みに失敗し、
+「IDが違ったのでやり直す」でツールのターンを使い切り、
+`Let me try reading with the exact original ID from the search results.` と言ったまま
+**回答にたどり着かずに止まる**、という不具合が実際に起きた。
+
+対策は3つ。
+
+1. **一覧に通し番号を振る** — 検索/一覧の結果を `1. ファイル名 / id: ...` の形で返し、
+   「番号やファイル名でも指定してよい」と明示する。33文字を写すより 1文字の方が確実。
+2. **参照を実IDに解決する** (`resolveGdriveFileRef`) — 直前の一覧を覚えておき、
+   完全一致 → 通し番号 → ファイル名 → **崩れたID** の順に解決する。
+   崩れたIDは「先頭からの一致長 + 末尾からの一致長」が12文字以上なら同一とみなす
+   (IDはランダムなので、それだけ一致すれば別ファイルと衝突しない)。
+   末尾欠け・途中1文字違い・先頭欠けのいずれも救える。
+   補正した場合はその旨をツール結果に添え、モデルが次から正しく扱えるようにする。
+3. **失敗時に選択肢を返す** — 読み込みに失敗したら、直前の一覧のファイル名を番号付きで
+   添えて「この中から番号か名前で指定し直してください」と返す。
+   候補を出さないと同じ失敗を繰り返してターンを浪費する。
+
+あわせて `MAX_TOOL_TURNS` を 3→4 (Gemma は 1→2) に引き上げた。
+「探す → 読む → 答える」で最低2ターン、読み直しが入ると3ターン必要で、
+以前の上限では回答の生成前に打ち切られる余地があった。
+Gemma の 1 は「探して読む」が物理的にできない設定だったので 2 にしている
+(マルチターンでテキスト形式の tool_call を出す件は、テキスト検出のフォールバックで拾う)。
+
+### 「参照した資料」の表示は出どころで出し分ける
+
+資料パネルは元々 RAG 検索専用で、`(類似度: 93.1%)` を必ず出す作りだった。
+GDrive は**ベクトル検索ではなく直接読み込み**なのでスコアが存在せず、
+そのまま流すと `(類似度: NaN%)` と表示されてしまう。また `docName` に
+ファイルIDを入れていたため `GDrive: 1oGRlWup...` という判読不能な表示になっていた。
+
+そこで context に `source` と `url` を持たせ、出どころで表示を変えるようにした。
+
+| 出どころ | 表示 |
+|:--|:--|
+| RAG検索 (`score` あり) | `社内マニュアル.pdf (類似度: 93.1%) — 2チャンク参照` |
+| GDrive (`score` なし) | `[GDrive] 議事録_2026Q1.docx` (ファイル名がGDriveへのリンク) |
+
+スコアは `typeof c.score === 'number' && isFinite(c.score)` の時だけ表示する。
+`undefined` / `null` / `NaN` / 文字列 / `Infinity` のいずれでも NaN を出さない。
+
+### バイナリは「読めません」で終わらせない
+
+`gdrive_read_file` に PDF や画像を渡されたら、単にエラーにするのではなく
+**次の手をエラーメッセージに書く**:
+
+```
+「見積書.pdf」はバイナリファイル (application/pdf) のためテキストとして読めません。
+gdrive_import_to_server でサーバーに取り込んでから Python 等で処理してください
+```
+
+こう書いておくと、LLM は次のターンで自分から `gdrive_import_to_server` を呼び、
+そのあと Python コードブロックで PDF を処理する、という流れに自力で乗る。
+**エラーをリカバリ手順にする**のが agentic ツールの設計上の勘所。
+
+バイナリ判定は MIME だけに頼らず、先頭4KBに NUL バイトがあるかも見る
+（拡張子なしのソースコードなどを取りこぼさないため）。
+
+### コンテキストを守る3つの上限
+
+Drive のファイルは平気で数MBあるので、そのまま渡すとコンテキストが吹き飛ぶ:
+
+| 上限 | 既定 | 効果 |
+|:--|:--|:--|
+| `maxDownloadMB` | 20MB | ダウンロード前に `size` で拒否＋受信中もバイト数で打ち切り |
+| `maxTextChars` | 20000文字 | LLM に渡すテキストを切り詰め（`truncated` と `totalChars` を併記） |
+| フロント側 `GDRIVE_RESULT_MAX` | 24000文字 | 一覧結果などツール応答全体の上限 |
+
+切り詰めた時は「全5000文字のうち先頭500文字」と明示するので、
+LLM は「続きが要るなら import して Python で処理する」と判断できる。
+
+### 一覧結果は「次の一手」が見える形で返す
+
+LLM 向けのツール応答は、id を必ず添えて返す:
+
+```
+Google Drive の検索結果 (3件):
+- 議事録_2026Q1
+  id: 1AbCdEf...
+  種類: application/vnd.google-apps.document / 更新: 2026/03/14 10:22 / テキストとして読める
+...
+中身を読むには gdrive_read_file に上記の id を渡してください。
+```
+
+`readableAsText` フラグを付けておくと、LLM が
+「これは read_file、これは import_to_server」を自分で振り分けられる。
+
+### OAuth コールバックと SameSite=Strict の罠
+
+**当初 `/gdrive/auth/callback` に `requireAuth` を掛けていたが、これは必ず失敗する。**
+
+このアプリのセッションCookieは
+`wz_session=...; Path=/; HttpOnly; SameSite=Strict` で発行されている。
+`SameSite=Strict` は「他サイトからのトップレベル遷移ではCookieを送らない」という指定で、
+Google の認可後のリダイレクト
+
+```
+accounts.google.com  ──(302)──>  自サーバー/gdrive/auth/callback?code=...&state=...
+```
+
+はまさにその「クロスサイトのトップレベル遷移」に当たる。
+結果、コールバックにはCookieが届かず `requireAuth` が
+`{"error":"認証が必要です"}` を返して、連携が一切完了しない。
+
+#### 採らなかった案: Cookie を SameSite=Lax にする
+
+`Lax` ならトップレベルGET遷移でCookieが送られるので1行で直る。
+しかし**この機能のためだけにアプリ全体のCSRF耐性を下げる**ことになる。
+`/files/*`（サーバーファイル書き込み）や `/config/raw`（設定書き換え）といった
+強い副作用を持つエンドポイントを抱えているので、この選択はしなかった。
+
+#### 採った案: 中継ページ + 同一サイトでのトークン交換
+
+コールバックを2段に割る。
+
+```
+Google ──(クロスサイト遷移, Cookieなし)──> GET /gdrive/auth/callback
+                                             │ 何も特権的なことをしない中継HTMLを返すだけ
+                                             ▼
+                                   ページ内 JS が location.search から code/state を読む
+                                             │
+                                             │ (同一サイトの fetch → Strict Cookie が付く)
+                                             ▼
+                                   POST /gdrive/auth/exchange   ← requireAuth + state消費
+                                             │
+                                             ▼
+                                   Google のトークンエンドポイントへ交換
+```
+
+ポイントは「**遷移が終わればトップレベルのサイトは自サイトになる**」こと。
+その文書から出る同一オリジンの `fetch` は same-site 扱いになるので、
+`SameSite=Strict` のCookieも通常どおり送信される。
+これにより、**実際に認証情報を保存する処理は認証必須のまま**にできる。
+
+中継ページはサーバー側で `code` / `state` を埋め込まず、
+**ブラウザ側が `location.search` から読む**作りにしている（HTMLに値を差し込まない＝XSSの入り口を作らない）。
+
+#### state による CSRF 対策
+
+`/gdrive/auth/url`（認証必須）が発行する `state`（32バイト乱数）を `Map` に保持し、
+`/gdrive/auth/exchange` で**1回だけ消費**する。10分で失効。
+コールバックページ側では消費しない（描画するだけ）ので、
+「ページを再読み込みしたら state が消えていた」という事故も起きにくい。
+
+#### 完了通知
+
+交換に成功したら中継ページが `window.opener.postMessage({type:'gdrive-auth', ok:true})`
+を投げて自分を閉じる。フロントは `message` を受け、**オリジンを検証**してから状態を再取得する:
+
+```javascript
+if (e.origin !== window.location.origin) return;   // 別オリジンは無視
+if (e.data?.type !== 'gdrive-auth') return;
+```
+
+失敗時は `ok:false` と理由を送り、右パネルにも同じ理由を表示する
+（ポップアップを閉じてしまっても何が起きたか分かるように）。
+ポップアップを手で閉じられたケースに備え、`win.closed` のポーリングでも拾う二段構え。
+
+### 秘密情報の扱い
+
+| 情報 | 保存先 | ブラウザに返すか |
+|:--|:--|:--|
+| `clientSecret` | `config.json` | ❌ `/config` の分割代入で明示的に除外 |
+| `clientId` | `config.json` | ❌（`hasClientId: true/false` だけ返す） |
+| リフレッシュトークン | `gdrive_token.json`（chmod 600） | ❌ |
+| サービスアカウント秘密鍵 | 別ファイル | ❌ |
+| 接続アカウント名 | トークンファイル | ⭕ UI表示用 |
+
+`/config` は `const { password, llamaServer, embeddingModel, ml, irodoriTts, googleDrive, ...rest }`
+で `googleDrive` を丸ごと外し、**安全なフィールドだけを組み直して**返している
+（`...rest` に残すと新しい秘密キーを追加した時に自動で漏れるため）。
+
+`.gitignore` には `gdrive_token.json` と `gdrive-service-account*.json` を登録済み。
+
+### 外部API（agent_proxy）との共有
+
+`buildAgentDeps()` に `gdrive` インスタンスと、uploads との橋渡し2関数
+（`gdriveImportToServer` / `gdriveUploadFromServer`）を渡している。
+`safeUploadPath` を通す必要があるので、この2つだけ server.js 側でラップしている。
+
+`buildToolDefs()` は起動時に `gdrive.status()` を見て、
+**未接続なら gdrive ツールを一切生成しない**。未接続のままツールを出すと、
+LLM が毎ターン同じエラーを踏んでターンを浪費するため。
+
+外部APIトークンには `gdrive:read` / `gdrive:write` の権限を指定できる
+（`requirePermission()` は Cookie セッションを全権限扱いするので、ブラウザUIには影響しない）。
+
+---
+
 ## 📜 自動スクロール
 
 ストリーミング中、下端に追従しつつ、ユーザーが上にスクロールしたら自動追従停止:
@@ -1008,24 +1370,44 @@ process.chdir(__dirname);  // cwd を server.js と同じ場所に固定
 
 ### 思考ループ自動検出
 
-ストリーミング中、思考+応答の末尾を **100文字ウィンドウ** でハッシュ化し、同じ内容が **3回以上出現** したらループとして自動検出:
+ストリーミング中、思考+応答の**末尾が「同じ文字列の連続した繰り返し」でできているか**を調べ、
+そうなっていたら暴走ループとして中断する (`findTailRepetition`)。
 
 ```javascript
-const seenChunks = new Map();
-const LOOP_CHUNK_SIZE = 100;
-const LOOP_THRESHOLD = 3;
-
-// 100文字単位でカウント
-const chunkText = fullText.slice(-LOOP_CHUNK_SIZE).replace(/\s+/g, ' ').trim();
-const count = (seenChunks.get(chunkText) || 0) + 1;
-seenChunks.set(chunkText, count);
-if (count >= LOOP_THRESHOLD) {
-  loopDetected = true;
-  abortRef.current.abort();  // 即停止
+// 100文字進むごとに、末尾1600文字を対象に周期性を調べる
+const insideCodeBlock = ((fullText.match(/```/g) || []).length % 2) === 1;
+if (!insideCodeBlock) {
+  const period = findTailRepetition(fullText.slice(-1600).replace(/[ \t]+/g, ' '));
+  if (period > 0) { loopDetected = true; abortRef.current.abort(); }
 }
 ```
 
+`findTailRepetition` は周期 p を 16〜400 文字の範囲で探し、末尾が
+**4回以上（かつ合計90文字以上）ぴったり同じ周期で繰り返されている**時だけ検出する。
+記号の羅列 (`======` や `,,,,,`) は文字種が8種未満なので除外する。
+
+#### なぜこの方式なのか（旧実装の問題）
+
+以前は「正規化した100文字の塊が応答**全体のどこかで**3回現れたら打ち切り」だった。
+これは誤検出が多い。CSV・ログ・設定ファイル・コードを引用すると、同じ100文字が
+離れた場所に何度も現れるのが普通だからで、**GDrive やサーバーのファイルを読ませると
+本文が表示される前に生成が止まる**という不具合になっていた。
+
+本物の暴走ループは「直前に出したものをそのまま繰り返す」ので、
+**末尾が連続して周期的か**だけを見る方が精度が高い。加えて:
+
+- **コードブロック (```) の中は判定しない** — 引用中に同じ行が並ぶのは当たり前
+- 少し変化しながら繰り返すループは取り逃がすが、その場合も `max_tokens` で
+  頭打ちになるだけ。**正しい回答を途中で切る方が害が大きい**という判断
+
 検出時はメッセージに `loopDetected: true` フラグをセットし、UIに「⚠️ 思考ループを中断・回答を要求」ボタンを表示する。
+
+### 同一ツール呼び出しの重複実行を防ぐ
+
+モデルが同じ引数で同じツールを何度も呼ぶことがある。特にファイル読み込みは結果が
+大きいため、2回3回と履歴に積むとコンテキストを食い潰し、最終応答が空になったり
+途中で止まったりする。実行済みの `ツール名 + 引数` を Set で覚えておき、
+2回目以降は結果を積まずに「既に実行済みです。上の結果を使ってください」とだけ返す。
 
 ### 「続きを生成」ボタン
 
@@ -1100,6 +1482,23 @@ isStreaming={isLoading && i === messages.length - 1}
 | `embeddingModel.extraArgs` | array | [] | Embedding用追加引数（GPU指定など） |
 | `webSearch` | bool | true | Web検索 |
 | `fileAccess` | bool | true | ファイル操作 |
+| `googleDrive.enabled` | bool | false | Google Drive 連携 |
+| `googleDrive.authMode` | string | "oauth" | "oauth" / "serviceAccount" |
+| `googleDrive.clientId` | string | "" | OAuth クライアントID（`/config` では非公開） |
+| `googleDrive.clientSecret` | string | "" | OAuth クライアントシークレット（`/config` では非公開） |
+| `googleDrive.redirectUri` | string | "http://localhost:3000/gdrive/auth/callback" | Cloud Console の承認済みURIと一致させる |
+| `googleDrive.serviceAccountKeyFile` | string | "" | サービスアカウントJSONキーのパス |
+| `googleDrive.impersonateUser` | string | "" | ドメイン全体の委任で代理するユーザー |
+| `googleDrive.rootFolderId` | string | "" | このフォルダ配下だけに限定（親を遡って検証） |
+| `googleDrive.readOnly` | bool | true | 読み取り専用（スコープも readonly になる） |
+| `googleDrive.allowWrite` | bool | false | readOnly:false と両方 true で書き込み許可 |
+| `googleDrive.allowDelete` | bool | false | ゴミ箱への移動を許可 |
+| `googleDrive.maxDownloadMB` | number | 20 | ダウンロード上限（受信中もバイト数で打ち切り） |
+| `googleDrive.maxUploadMB` | number | 20 | アップロード上限 |
+| `googleDrive.maxTextChars` | number | 20000 | LLMに渡すテキストの最大文字数 |
+| `googleDrive.defaultPageSize` | number | 30 | 一覧・検索の既定件数 |
+| `googleDrive.sharedDrives` | bool | true | 共有ドライブも対象に含める |
+| `googleDrive.tokenFile` | string | "gdrive_token.json" | リフレッシュトークン保存先（chmod600） |
 | `ragTopK` | number | 10 | RAG検索件数 |
 | `ragMode` | string | "agentic" | agentic / always |
 | `agentContext.smallPredict` | number | 512 | ツール判断時のmax_tokens（短文モード） |
@@ -1112,6 +1511,7 @@ isStreaming={isLoading && i === messages.length - 1}
 | `systemPrompts.documents` | string | (同上) | ドキュメント添付時追記（{docList}展開） |
 | `systemPrompts.webSearch` | string | (同上) | Web検索案内 |
 | `systemPrompts.fileAccess` | string | (同上) | サーバーファイル操作案内 |
+| `systemPrompts.googleDrive` | string | (同上) | Google Drive 案内（連携有効かつ接続済みの時のみ付加） |
 | `systemPrompts.python` | string | (同上) | Python実行案内 |
 | `systemPrompts.meta` | string | (同上) | メタ抑制指示 |
 | `systemPrompts.judge` | string | (同上) | ツール判断用プロンプト（{toolList}展開） |
@@ -1125,7 +1525,7 @@ isStreaming={isLoading && i === messages.length - 1}
 ```javascript
 function loadConfig() {
   const merged = { ...DEFAULT_CONFIG, ...userConfig };
-  ['systemPrompts', 'agentContext', 'transcribe'].forEach(key => {
+  ['systemPrompts', 'agentContext', 'transcribe', /* ... */ 'googleDrive'].forEach(key => {
     if (DEFAULT_CONFIG[key] && typeof DEFAULT_CONFIG[key] === 'object') {
       merged[key] = { ...DEFAULT_CONFIG[key], ...(userConfig[key] || {}) };
     }
@@ -1261,6 +1661,19 @@ const webSearchActive = appConfig.webSearch !== false && webSearchEnabled;
 ### UI
 
 `.toolbar-btn.web-search-toggle.active` でアクセントカラー強調、非active時は不透明度0.4。
+
+### Google Drive トグルも同じ形
+
+☁️ ボタンは同じ二段構えに、**接続状態**という第3の条件が加わる:
+
+```javascript
+const gdriveActive = !!(appConfig.googleDrive?.enabled   // 管理者が機能を有効化
+  && gdriveStatus?.connected                              // Google の認可が済んでいる
+  && gdriveEnabled);                                      // ユーザーがトグルON
+```
+
+未接続の状態で ☁️ を押した時はトグルを切り替えず、
+**右パネルの「☁️ Drive」タブを開いて接続へ誘導する**（押しても何も起きない、を避ける）。
 
 ---
 
@@ -2795,7 +3208,100 @@ GPUモニタ上部に、稼働中の `llama-server` のビルド番号・コミ�
 
 #### なぜ raw text で扱うか（パースしたJSON ではなく）
 
-クライアントとサーバー間で JSON をパース→再シリアライズすると、コメントやキー順序・空白が失われる。`config.json` は人間が編集することを前提としたファイルなので、フォーマットを保全するために生テキストで扱う。サーバー側では構文チェックだけして書き込み、保存後は `JSON.stringify(parsed, null, 2)` で正規化する（これは UI 側の「整形」ボタンと同等動作）。
+サーバーとの受け渡しは生テキストのままにしている。`config.json` は人間が編集することも前提のファイルなので、往復でフォーマットが勝手に変わらない方が扱いやすい。サーバー側では構文チェックだけして書き込み、保存後は `JSON.stringify(parsed, null, 2)` で正規化する（これは UI 側の「整形」ボタンと同等動作）。
+
+この「生テキストが唯一の正 (single source of truth)」という前提は、後述のツリー編集を足した後も変えていない。ツリー編集は**テキストを書き換える別の入力手段**であって、別系統の状態ではない。
+
+### 🌳 ツリー編集の設計
+
+生JSONを直接編集させると、括弧・カンマ・`\n` エスケープの整合を人間が取ることになり、
+1文字の打ち間違いでサーバーが起動しなくなる。しかも `systemPrompts` のような
+改行入りの長文は、テキスト表示だと1行の `"...\n...\n..."` になって実質編集不能。
+そこで**ツリー編集を既定の表示にした**。
+
+#### 状態の持ち方: テキストが唯一の正
+
+```
+content (生テキスト, useState)          ← 保存・未保存判定・バックアップはここを見る
+   │  JSON.parse           ↑ JSON.stringify(root, null, 2)
+   ▼                       │
+parsedTree (オブジェクト) ──┴── JsonTreeEditor が編集して onChange(nextRoot)
+```
+
+ツリー側に独立した状態を持たせない。編集のたびに新しい root を作って
+`setContent(JSON.stringify(next, null, 2))` するだけ。これにより:
+
+- 保存 (`saveConfig`)、未保存判定 (`content !== original`)、破棄、バックアップ復元が**一切変わらない**
+- テキスト表示に切り替えれば、ツリーの編集結果が生JSONとしてそのまま見える
+- どちらの表示で編集しても同じ経路を通るので、状態がズレようがない
+
+#### 構文エラー時はツリーを止める
+
+以前は「パースエラー時は古い parsedTree を残す」実装だったが、編集可能にすると
+**古い像を元に編集 → 書き戻しでテキストの変更が巻き戻る**という事故が起きる。
+そのため構文エラー時は `parsedTree = null` にし、ツリー編集は描画せず
+「テキストで直す / 破棄する」への導線だけを出す。
+
+#### 編集はイミュータブルなパス操作で行う
+
+`path = ['chatModels', 0, 'name']` のような配列でノードを指し、
+`setAtPath` / `deleteAtPath` / `renameKeyAtPath` / `moveArrayItem` / `insertIntoArray`
+がすべて**新しいオブジェクトを返す**（元は変異させない）。React の再描画が確実に走り、
+「編集したのに画面が変わらない」を構造的に防ぐ。
+
+キー名の変更だけは `{...obj}` では順序が壊れる（新キーが末尾に付く）ので、
+キーを順に舐めて作り直している。`config.json` は人が読むファイルなので、
+`llamaServer` の中身が突然並び替わると差分が読めなくなる。
+
+#### 入力は「ローカル下書き → blur で確定」
+
+1打鍵ごとに `setContent` すると、20KBのJSONを毎回シリアライズ・再パースすることになり、
+再描画で入力欄のカーソルも飛ぶ。そこで `LeafEditor` が自分の中に下書き state を持ち、
+**フォーカスを外す / Enter** で初めて確定する（Esc で取り消し）。
+
+型ごとの扱い:
+
+| 型 | UI | 確定時 |
+|:--|:--|:--|
+| 文字列 | 1行入力。改行を含む or 100文字超なら textarea | そのまま |
+| 数値 | 1行入力 | `Number()` して有限数の時だけ確定。それ以外は赤枠にして**確定しない** |
+| 真偽 | クリックで切り替わるバッジ | 即時 |
+| null | `null` 表示 | 型セレクタで別の型に変えてから入力する |
+
+数値欄に「あいう」と入れて確定を拒否するのは重要で、ここを素通しすると
+`"chatPort": "あいう"` のような**構文としては正しいが起動しない** config ができてしまう。
+
+#### 検索は「祖先が一致したら配下を全部見せる」
+
+素朴に「自分か子孫が一致するノードだけ表示」にすると、`googleDrive` で検索した時に
+`googleDrive` の子のうち名前に "googledrive" を含むものしか出ず、中身が見えない。
+実際に欲しいのは「一致したまとまりの中身は全部見たい」なので、
+`ancestorMatched` フラグを子に伝播させている。
+
+ただし**自分の子孫が一致しただけの場合は伝播させない**（その枝だけを見せたいため）。
+伝播条件は「祖先が一致 or 自分自身のキー/値が一致」。
+
+#### キーの説明を持たせる
+
+`CONFIG_HINTS` に `llamaServer.chatPort` → 「チャット推論サーバーのポート」のような
+説明を持ち、行の右側に薄く出す。パスは配列インデックスを `[]` に正規化して引くので、
+`chatModels[].name` の1エントリが全モデルの `name` に効く。
+
+README を読みに行かなくても、その場で何の設定か分かるのが目的。
+未知のキーは説明なしで普通に編集できる（辞書は表示の補助であって、スキーマではない）。
+
+#### 逃げ道としての `{ }` ボタン
+
+`orchestration.workflows` のような深くて構造的な部分は、ツリーを1つずつ開くより
+JSONを直接書いた方が速い。オブジェクト/配列の行の `{ }` ボタンで、
+**その部分ツリーだけ**をテキスト編集できるようにした。適用前に `JSON.parse` して、
+失敗したらエラーを出して適用しない（壊れたまま全体に反映されない）。
+
+#### モバイル
+
+タッチ端末はホバーが無いので `@media (hover: none)` で行アクションを常時表示にする。
+狭い画面では説明文を隠して入力欄に幅を回し、インデント幅も CSS 変数
+（`--tree-indent`）で 15px → 9px に詰める。
 
 #### なぜ JSON 構文チェックを2段階にするか
 
@@ -3914,7 +4420,7 @@ Cookie セッション (全権限) か `Authorization: Bearer <token>` (トー�
 
 ### 設計の動機
 
-外部APIサーバーで「素のLLM」だけを公開していると、Webチャットで自然に使える機能 (Web検索、ML予測、ファイル参照、RAG文書検索) が外部プログラムから使えなかった。Webチャット側のツール実行ロジックは **ブラウザの JavaScript と server.js に分散** しているため、外部からは直接利用できない。
+外部APIサーバーで「素のLLM」だけを公開していると、Webチャットで自然に使える機能 (Web検索、ML予測、ファイル参照、RAG文書検索、Google Drive) が外部プログラムから使えなかった。Webチャット側のツール実行ロジックは **ブラウザの JavaScript と server.js に分散** しているため、外部からは直接利用できない。
 
 そこで:
 - server.js 内に **ツール実行ロジックを集約した Express サーバー** を別ポートで起動
@@ -3944,14 +4450,16 @@ agent_proxy.js (~600行)
 │   - Bearer トークン認証 (/health は除外)
 │   - エンドポイント定義
 │   - HTTP/HTTPS サーバー起動
-├── buildToolDefs(enabledTools, appConfig)
+├── buildToolDefs(enabledTools, appConfig, deps)
 │   - 有効ツールに応じて OpenAI 互換の関数定義配列を生成
+│   - gdrive は deps.gdrive.status() を見て接続状態・権限に応じ段階的に生成
 ├── runAgentLoop({ messages, tools, ... })
 │   - MAX_TURNS=5 のツール実行ループ
 │   - tool_calls があれば executeTool で実行 → 履歴に追加 → 再問い合わせ
 │   - tool_calls が無くなれば最終応答
 ├── executeTool(fnName, fnArgs, deps, ip)
-│   - 各ツールの実行 (ml_*, web_search, list_files, read_file, search_documents)
+│   - 各ツールの実行 (ml_*, rl_*, web_search, list_files, read_file,
+│     search_documents, gdrive_*)
 │   - ml_predict は派生列を自動サニタイズ
 └── callLlama({ ... })
     - 内部 llama-server の /v1/chat/completions を呼ぶラッパー
@@ -3977,6 +4485,11 @@ function buildAgentDeps() {
     listUploadFiles: async () => { /* uploads再帰列挙 */ },
     readUploadFile: async (path) => { /* safeUploadPath で安全に読む */ },
     searchDocumentsSimple: async (query) => await ragSearch(query, 5),
+    // Google Drive: クライアントはそのまま渡す。uploads との橋渡し2つだけ
+    // safeUploadPath を通す必要があるので server.js 側でラップする
+    gdrive,
+    gdriveImportToServer: async (fileId, savePath) => { /* downloadFile → uploads へ書き出し */ },
+    gdriveUploadFromServer: async (relPath, opts) => { /* uploads から読んで uploadFile */ },
   };
 }
 
@@ -4000,6 +4513,18 @@ function buildAgentDeps() {
 | File | `list_files` | (なし) | uploads 一覧 |
 | File | `read_file` | `path` | uploads ファイル読み |
 | RAG | `search_documents` | `query` | 永続RAG検索 |
+| Drive | `gdrive_search_files` | `query, folderId?` | Drive の全文検索 |
+| Drive | `gdrive_list_files` | `folderId?, query?` | Drive フォルダ一覧 |
+| Drive | `gdrive_read_file` | `fileId, maxChars?` | Drive のファイルをテキストで読む |
+| Drive | `gdrive_import_to_server` | `fileId, savePath?` | Drive → uploads 取り込み |
+| Drive | `gdrive_write_file` | `name/fileId, content` | Drive へ書き込み（要 allowWrite） |
+| Drive | `gdrive_upload_from_server` | `path, folderId?` | uploads → Drive（要 allowWrite） |
+| Drive | `gdrive_create_folder` | `name, folderId?` | フォルダ作成（要 allowWrite） |
+| Drive | `gdrive_delete_file` | `fileId` | ゴミ箱へ（要 allowDelete） |
+
+Drive 系は `buildToolDefs()` の中で `deps.gdrive.status()` を見て段階的に生成する。
+未接続なら1つも生やさない (LLM が毎ターン同じエラーを踏むのを防ぐ)。
+書き込み・削除は config の許可フラグが立っている時だけ。
 
 ### モデルロード保証の仕組み
 

@@ -21,6 +21,109 @@ function formatBytes(bytes) {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(1)}GB`;
 }
 
+// ─── Utility: 暴走ループ検出（末尾の周期性チェック） ───
+// 末尾が「同じ文字列の連続した繰り返し」でできているかを調べ、
+// 見つかったらその周期(文字数)を、無ければ 0 を返す。
+//
+// 【なぜこの方式にしたか】
+// 以前は「正規化した100文字の塊が応答全体のどこかで3回現れたら打ち切り」だった。
+// しかしファイル内容の引用 (CSV・ログ・設定ファイル・コード) では、同じ100文字が
+// 離れた場所に何度も現れるのが普通で、GDrive やサーバーのファイルを読ませると
+// 本文の途中で生成が中断される誤検出が多発していた。
+// 本物の暴走ループは「直前に出したものをそのまま繰り返す」ので、
+// 末尾が【連続して】周期的かどうかだけを見る方が精度が高い。
+// 少し変化しながら繰り返すループは取り逃がすが、その場合も max_tokens で
+// 頭打ちになるだけで、正しい回答を途中で切るより害が小さい。
+function findTailRepetition(text, opts = {}) {
+  const minPeriod = opts.minPeriod ?? 16;    // これ未満の短い繰り返しは見ない（箇条書き記号等の誤検出防止）
+  const maxPeriod = opts.maxPeriod ?? 400;   // 段落まるごとのループまで拾えるように広めに取る
+  const minRepeats = opts.minRepeats ?? 4;   // 4回以上ぴったり繰り返していたら異常とみなす
+  const minSpan = opts.minSpan ?? 90;        // 繰り返し部分の合計文字数の下限（短い周期ほど回数を要求する）
+  const minDistinct = opts.minDistinct ?? 8; // 記号の羅列 (====== や ,,,,,) は繰り返しでも正常
+  const n = text.length;
+  for (let p = minPeriod; p <= maxPeriod; p++) {
+    const repeats = Math.max(minRepeats, Math.ceil(minSpan / p));
+    const span = repeats * p;
+    if (span > n) break;                     // これ以上長い周期は末尾に収まらない
+    const limit = n - span;
+    let periodic = true;
+    for (let i = n - 1; i >= limit + p; i--) {
+      if (text[i] !== text[i - p]) { periodic = false; break; }
+    }
+    if (!periodic) continue;
+    if (new Set(text.slice(n - p)).size < minDistinct) continue;
+    return p;
+  }
+  return 0;
+}
+
+// ─── Utility: GDrive のファイル参照を実IDに解決する ───
+// Google Drive の ID は 33文字前後のランダム文字列で、LLM はこれを正確に書き写すのが
+// 非常に苦手。1〜2文字変えたり途中で切ったりして「IDが違ったのでやり直す」を繰り返し、
+// ツールのターン上限に当たって回答にたどり着けなくなる
+// (「Let me try reading with the exact original ID...」と言ったまま止まる現象)。
+//
+// そこで直前の検索/一覧の結果を覚えておき、
+//   ・通し番号 (1, 2, 3...)   ・ファイル名   ・多少崩れたID
+// のどれからでも正しい ID に解決できるようにする。
+function commonPrefixLen(a, b) {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a[i] === b[i]) i++;
+  return i;
+}
+function commonSuffixLen(a, b) {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a[a.length - 1 - i] === b[b.length - 1 - i]) i++;
+  return i;
+}
+
+/**
+ * @param {string} ref     LLM が渡してきた値 (ID / 番号 / ファイル名)
+ * @param {{list: Array<{id:string,name:string}>, seen: Map<string,string>}} recent
+ * @returns {{id: string, note: string}} note は補正した場合の説明 (LLMに返して学習させる)
+ */
+function resolveGdriveFileRef(ref, recent) {
+  const raw = String(ref ?? '').trim();
+  if (!raw) return { id: '', note: '' };
+  const list = recent?.list || [];
+  const seen = recent?.seen || new Map();
+  if (list.length === 0 && seen.size === 0) return { id: raw, note: '' };
+
+  // 1. 既知のIDと完全一致 → そのまま
+  if (seen.has(raw)) return { id: raw, note: '' };
+
+  // 2. 通し番号 ("2" や "[2]") → 直前の一覧の n 番目
+  const num = raw.match(/^\[?(\d{1,3})\]?$/);
+  if (num) {
+    const hit = list[Number(num[1]) - 1];
+    if (hit) return { id: hit.id, note: `(番号 ${num[1]} = 「${hit.name}」として解決)` };
+  }
+
+  // 3. ファイル名 (完全一致 → 前方一致 → 部分一致)
+  const lower = raw.toLowerCase();
+  const entries = [...seen.entries()].map(([id, name]) => ({ id, name: name || '' }));
+  const byName = entries.find(f => f.name.toLowerCase() === lower)
+    || entries.find(f => f.name.toLowerCase().startsWith(lower))
+    || (raw.length >= 3 ? entries.find(f => f.name.toLowerCase().includes(lower)) : null);
+  if (byName) return { id: byName.id, note: `(ファイル名 "${raw}" = 「${byName.name}」として解決)` };
+
+  // 4. 崩れたID: 前後の一致長が十分なら同じものとみなす。
+  //    IDはランダムなので十数文字一致すれば別ファイルと衝突しない。
+  if (raw.length >= 8) {
+    let best = null, bestScore = 0;
+    for (const f of entries) {
+      const score = commonPrefixLen(f.id, raw) + commonSuffixLen(f.id, raw);
+      if (score > bestScore) { bestScore = score; best = f; }
+    }
+    if (best && bestScore >= 12) {
+      return { id: best.id, note: `(ID の写し間違いを補正して「${best.name}」を読みました)` };
+    }
+  }
+  return { id: raw, note: '' };
+}
+
 // ─── Utility: テキストをチャンクに分割 ───
 // (サーバー側 ragChunkText と挙動を揃える: 末尾チャンク到達で break、overlap 不正値もガード)
 function chunkText(text, chunkSize = 500, overlap = 100) {
@@ -972,6 +1075,9 @@ function App() {
   const [persistentRagAvailable, setPersistentRagAvailable] = useState(false);
   const [persistentRagDocCount, setPersistentRagDocCount] = useState(0);
   const [persistentRagDocNames, setPersistentRagDocNames] = useState([]);
+  // Google Drive が外部APIのツール対応モードで使えるか
+  const [apiGdriveAvailable, setApiGdriveAvailable] = useState(false);
+  const [apiGdriveReason, setApiGdriveReason] = useState('');
   const [apiBusy, setApiBusy] = useState(false);
   const [tokenSpeed, setTokenSpeed] = useState(null); // { tokPerSec, totalTokens }
   const tokenHistoryRef = useRef([]); // [{ tokens, durationNs }]
@@ -1021,6 +1127,22 @@ function App() {
   const serverFileInputRef = useRef(null);
   const [isRecording, setIsRecording] = useState(false);
   const [webSearchEnabled, setWebSearchEnabled] = useState(true);  // チャット欄でのON/OFFトグル（初期値はconfigを後で反映）
+  // ─── Google Drive ───
+  // gdriveStatus は /gdrive/status の結果 (enabled / connected / allowWrite 等)。
+  // gdriveEnabled はチャット欄のトグル。接続済みでもユーザーがOFFにすればツールを出さない。
+  const [gdriveStatus, setGdriveStatus] = useState(null);
+  const [gdriveEnabled, setGdriveEnabled] = useState(true);
+  const [gdriveFiles, setGdriveFiles] = useState([]);
+  const [gdriveFolderId, setGdriveFolderId] = useState('');
+  // パンくず: [{ id, name }]。先頭は常にルート
+  const [gdriveBreadcrumb, setGdriveBreadcrumb] = useState([{ id: '', name: 'マイドライブ' }]);
+  const [gdriveQuery, setGdriveQuery] = useState('');
+  const [gdriveLoading, setGdriveLoading] = useState(false);
+  const [gdriveError, setGdriveError] = useState('');
+  const [gdriveBusy, setGdriveBusy] = useState(false);
+  // 直近の GDrive 検索/一覧の結果。LLM が渡してくる「番号・ファイル名・崩れたID」を
+  // 実IDに解決するために使う (resolveGdriveFileRef)。チャットをまたいで保持する。
+  const gdriveRecentRef = useRef({ list: [], seen: new Map() });
   const [speakingIndex, setSpeakingIndex] = useState(-1);
   const abortRef = useRef(null);
   const sendMessageRef = useRef(null);
@@ -1731,11 +1853,19 @@ function App() {
       // Web検索が利用可能か: configで許可されており、かつチャット欄でONになっている
       const webSearchActive = appConfig.webSearch !== false && webSearchEnabled;
 
+      // Google Drive が使えるか: configで有効 + 認可済み + チャット欄でON
+      const gdriveActive = !!(appConfig.googleDrive?.enabled
+        && gdriveStatus?.connected
+        && gdriveEnabled);
+      // 書き込み/削除は config 側で明示的に許可されている場合のみツールを出す
+      const gdriveCanWrite = gdriveActive && !!gdriveStatus?.allowWrite;
+      const gdriveCanDelete = gdriveActive && !!gdriveStatus?.allowDelete;
+
       // ツール判断ループ(agentic)に入る条件。
-      // ドキュメント添付 or Web検索ON に加え、画像生成/音声合成が有効なら
-      // 「描いて」「音声にして」等を検出できるよう常にツール判断を通す。
+      // ドキュメント添付 or Web検索ON に加え、画像生成/音声合成/Google Drive が有効なら
+      // 「描いて」「音声にして」「ドライブの資料見て」等を検出できるよう常にツール判断を通す。
       const useAgentic = appConfig.ragMode === 'agentic'
-        && (documents.length > 0 || webSearchActive || appConfig.imageGen || appConfig.ttsGen);
+        && (documents.length > 0 || webSearchActive || appConfig.imageGen || appConfig.ttsGen || gdriveActive);
 
       if (useAgentic) {
         // ─── Agentic RAG + Web検索: LLMがツールで検索を判断 ───
@@ -1795,6 +1925,140 @@ function App() {
               }
             }
           });
+        }
+
+        // ─── Google Drive ツール ───
+        // 参照系 (検索/一覧/読み込み/サーバー取り込み) は接続済みなら常に提供する。
+        // 「ドライブの資料を見て」のような依頼はキーワード事前判定が効きにくいため、
+        // web_search と同じくトグルON = 常時提供の方針にしている。
+        if (gdriveActive) {
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'gdrive_search_files',
+              description: 'Google Drive 上のファイルを、ファイル名と本文の全文検索で探す。ユーザーが「ドライブ」「Google Drive」「グーグルドライブ」「クラウド上のファイル」等に言及したら最初にこれを使う。返り値の id を gdrive_read_file に渡して中身を読むこと。テキストで関数呼び出しを書くのではなく、必ず実際のtool_callとして呼び出すこと。',
+              parameters: {
+                type: 'object',
+                properties: {
+                  query: { type: 'string', description: '検索キーワード（ファイル名の一部、または本文に含まれる語。簡潔に）' },
+                  folderId: { type: 'string', description: '任意: 絞り込むフォルダのIDまたはフォルダ名' },
+                },
+                required: ['query'],
+              },
+            },
+          });
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'gdrive_list_files',
+              description: 'Google Drive のフォルダの中身を一覧する。folderId 省略でマイドライブ直下。folderId にはIDのほか "資料/2026年度" のようなフォルダパスも指定できる。「ドライブに何がある?」のような質問で使う。',
+              parameters: {
+                type: 'object',
+                properties: {
+                  folderId: { type: 'string', description: '任意: フォルダIDまたはフォルダ名/パス' },
+                  query: { type: 'string', description: '任意: このフォルダ内での絞り込みキーワード' },
+                },
+              },
+            },
+          });
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'gdrive_read_file',
+              description: 'Google Drive のファイルの中身をテキストで読む。Google ドキュメントはテキストに、スプレッドシートはCSVに自動変換される。fileId には gdrive_search_files / gdrive_list_files の結果から、id をそのままコピーして渡すこと。長いIDを正確に写す自信が無い場合は、代わりに一覧の【通し番号（1, 2, 3...）】か【ファイル名】を渡してもよい（自動で解決される）。PDF・画像・Excel などのバイナリは読めないので、その場合は gdrive_import_to_server を使う。',
+              parameters: {
+                type: 'object',
+                properties: {
+                  fileId: { type: 'string', description: 'ファイルID、または直前の一覧の通し番号("2"など)、またはファイル名' },
+                },
+                required: ['fileId'],
+              },
+            },
+          });
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'gdrive_import_to_server',
+              description: 'Google Drive のファイルをサーバーの uploads フォルダにダウンロードして取り込む。PDF・画像・Excel等そのままでは読めないファイルや、Pythonで処理したいデータに使う。取り込み後は read_file やPythonコードから参照できる。',
+              parameters: {
+                type: 'object',
+                properties: {
+                  fileId: { type: 'string', description: 'ファイルID、または直前の一覧の通し番号("2"など)、またはファイル名' },
+                  savePath: { type: 'string', description: '任意: uploads配下の保存先相対パス（省略時はDrive上の名前）' },
+                },
+                required: ['fileId'],
+              },
+            },
+          });
+
+          if (gdriveCanWrite) {
+            tools.push({
+              type: 'function',
+              function: {
+                name: 'gdrive_write_file',
+                description: 'Google Drive にテキストファイルを作成または更新する。ユーザーが「ドライブに保存して」「Google Driveに書き出して」等を依頼した時のみ使う。fileId を指定すると更新、無ければ folderId の中に name で新規作成。',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    name: { type: 'string', description: 'ファイル名（新規作成時は必須。拡張子を付けるとMIMEが決まる）' },
+                    content: { type: 'string', description: 'ファイルの内容（文字列）' },
+                    folderId: { type: 'string', description: '任意: 作成先フォルダIDまたはフォルダ名/パス' },
+                    fileId: { type: 'string', description: '任意: 更新する既存ファイルのID' },
+                    overwrite: { type: 'boolean', description: '任意: 同名ファイルがあれば上書きする' },
+                  },
+                  required: ['content'],
+                },
+              },
+            });
+            tools.push({
+              type: 'function',
+              function: {
+                name: 'gdrive_upload_from_server',
+                description: 'サーバーの uploads フォルダにあるファイルを Google Drive にアップロードする。バイナリも可。「このファイルをドライブに上げて」等で使う。',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    path: { type: 'string', description: 'uploads配下の相対パス（例: "report.csv"）' },
+                    name: { type: 'string', description: '任意: Drive上でのファイル名' },
+                    folderId: { type: 'string', description: '任意: アップロード先フォルダIDまたはフォルダ名/パス' },
+                  },
+                  required: ['path'],
+                },
+              },
+            });
+            tools.push({
+              type: 'function',
+              function: {
+                name: 'gdrive_create_folder',
+                description: 'Google Drive にフォルダを作成する。',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    name: { type: 'string', description: 'フォルダ名' },
+                    folderId: { type: 'string', description: '任意: 親フォルダIDまたはフォルダ名/パス' },
+                  },
+                  required: ['name'],
+                },
+              },
+            });
+          }
+
+          if (gdriveCanDelete) {
+            tools.push({
+              type: 'function',
+              function: {
+                name: 'gdrive_delete_file',
+                description: 'Google Drive のファイルをゴミ箱に移動する。ユーザーが明確に削除を依頼した時だけ使うこと。推測で削除しないこと。',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    fileId: { type: 'string', description: 'ファイルID（推奨）またはファイル名' },
+                  },
+                  required: ['fileId'],
+                },
+              },
+            });
+          }
         }
 
         // 物体検出ツール: 画像が添付されていて、かつ ML 機能が有効な時のみ提供
@@ -2119,6 +2383,9 @@ function App() {
         if (appConfig.fileAccess !== false && sp.fileAccess) {
           agentSystem += '\n\n' + sp.fileAccess;
         }
+        if (gdriveActive && sp.googleDrive) {
+          agentSystem += '\n\n' + sp.googleDrive;
+        }
         if (sp.python) {
           agentSystem += '\n\n' + sp.python;
         }
@@ -2130,6 +2397,8 @@ function App() {
 
         let apiMessages = [{ role: 'system', content: agentSystem }, ...history];
         let allContexts = [];
+        // 実行済みツール呼び出し (fnName + 引数) の記録。同じ呼び出しの繰り返しを防ぐ
+        const executedToolCalls = new Set();
         let searchQueries = [];
         // ツールが実際に生成したメディアの本物URL。
         // LLMが [[gen_audio:...]]/[[gen_image:...]] のファイル名を改変して出力する
@@ -2172,6 +2441,15 @@ function App() {
         if (webSearchActive) {
           toolListLines.push('- web_search: インターネット検索（最新情報が必要な場合）');
         }
+        if (gdriveActive) {
+          const gdWrite = gdriveCanWrite ? '／gdrive_write_file・gdrive_upload_from_server・gdrive_create_folder: Drive への書き込み' : '';
+          const gdDelete = gdriveCanDelete ? '／gdrive_delete_file: Drive のファイルをゴミ箱へ' : '';
+          toolListLines.push(
+            '- gdrive_search_files / gdrive_list_files / gdrive_read_file / gdrive_import_to_server: Google Drive の検索・一覧・読み込み・サーバー取り込み ' +
+            '★「ドライブ」「Google Drive」「グーグルドライブ」「クラウドのファイル」等の言及があれば最優先。' +
+            'まず検索か一覧でIDを特定してから読むこと' + gdWrite + gdDelete
+          );
+        }
         if (hasImages && appConfig.ml?.enabled) {
           toolListLines.push('- detect_objects: 添付画像の物体検出（「何が写ってる」「物体を検出」「画像を分析」等で使う）');
         }
@@ -2207,7 +2485,14 @@ function App() {
         // Gemma系モデルはマルチターンのツール呼び出しが不安定（テキスト形式の<|tool_call|>を出力することがある）
         // → 1ターンのみに制限。Qwen系等は3ターンまで
         const isGemmaModel = /gemma/i.test(chatModel);
-        const MAX_TOOL_TURNS = isGemmaModel ? 1 : 3;
+        // ターン数の目安: 「探す → 読む → 答える」で最低2ターン必要。
+        // ID を間違えて読み直すと3ターン目に入り、以前の上限(3)では回答に
+        // たどり着く前に打ち切られていた (「Let me try reading with the exact
+        // original ID...」と言ったまま止まる)。余裕を見て4にする。
+        // Gemma はマルチターンのツール呼び出しでテキスト形式の tool_call を
+        // 出すことがあるため以前は1にしていたが、1では「探して読む」が
+        // 物理的にできない。テキスト形式は下のフォールバックで拾えるので2にする。
+        const MAX_TOOL_TURNS = isGemmaModel ? 2 : 4;
         let toolTurn = 0;
         let lastAssistantMsg = null;
 
@@ -2314,7 +2599,7 @@ function App() {
           }
           // パターン2: Python関数呼び出し形式 funcname(query='...')
           if ((!assistantMsg?.tool_calls || assistantMsg.tool_calls.length === 0) && assistantMsg?.content) {
-            const textCallMatch = assistantMsg.content.match(/(search_documents|search_persistent_documents|web_search|read_file|list_files|write_file)\s*\(\s*([^)]*)\)/);
+            const textCallMatch = assistantMsg.content.match(/(search_documents|search_persistent_documents|web_search|read_file|list_files|write_file|gdrive_search_files|gdrive_list_files|gdrive_read_file|gdrive_import_to_server)\s*\(\s*([^)]*)\)/);
             if (textCallMatch) {
               const fname = textCallMatch[1];
               const argsStr = textCallMatch[2];
@@ -2327,10 +2612,22 @@ function App() {
               const args = {};
               const queryMatch = argsStr.match(/query\s*=\s*['"]([^'"]+)['"]/);
               const pathMatch = argsStr.match(/(?:path|filename|file)\s*=\s*['"]([^'"]+)['"]/);
+              const fileIdMatch = argsStr.match(/(?:fileId|file_id|id)\s*=\s*['"]([^'"]+)['"]/);
+              const folderIdMatch = argsStr.match(/(?:folderId|folder_id|folder)\s*=\s*['"]([^'"]+)['"]/);
               if (queryMatch) args.query = queryMatch[1];
               if (pathMatch) args.path = pathMatch[1];
-              // queryもpathもないがlist_filesなら引数なし
-              if (fname === 'list_files' || Object.keys(args).length > 0) {
+              if (fileIdMatch) args.fileId = fileIdMatch[1];
+              if (folderIdMatch) args.folderId = folderIdMatch[1];
+              // 引数名なしの位置引数 gdrive_read_file('abc123') 形式も拾う
+              if (fname.startsWith('gdrive_') && Object.keys(args).length === 0) {
+                const bare = argsStr.match(/^\s*['"]([^'"]+)['"]\s*$/);
+                if (bare) {
+                  if (fname === 'gdrive_search_files' || fname === 'gdrive_list_files') args.query = bare[1];
+                  else args.fileId = bare[1];
+                }
+              }
+              // queryもpathもないがlist_files系なら引数なし
+              if (fname === 'list_files' || fname === 'gdrive_list_files' || Object.keys(args).length > 0) {
                 console.log(`[ツールテキスト検出] ${fname} を実ツール呼び出しに変換`);
                 fakeCall.function.arguments = JSON.stringify(args);
                 assistantMsg.tool_calls = [fakeCall];
@@ -2473,6 +2770,21 @@ function App() {
             if (typeof fnArgs === 'string') {
               try { fnArgs = JSON.parse(fnArgs); } catch { fnArgs = {}; }
             }
+
+            // ─── 同一ツール呼び出しの重複実行を防ぐ ───
+            // モデルが同じ引数で同じツールを繰り返し呼ぶことがある。特にファイル読み込みは
+            // 結果が大きいため、2回3回と積むとコンテキストを食い潰し、最終応答が空になったり
+            // 途中で止まったりする。既に実行済みなら結果を積まずにその旨だけ返す。
+            const callKey = `${fnName}:${JSON.stringify(fnArgs)}`;
+            if (executedToolCalls.has(callKey)) {
+              console.log(`[ツール重複] ${fnName} は同じ引数で実行済み → スキップ`);
+              apiMessages.push({
+                role: 'tool', tool_call_id: tc.id,
+                content: '同じ引数でのこの呼び出しは既に実行済みです。上の実行結果をそのまま使って回答してください。',
+              });
+              continue;
+            }
+            executedToolCalls.add(callKey);
 
             if (fnName === 'search_documents') {
               const query = fnArgs.query || text;
@@ -2661,6 +2973,224 @@ function App() {
                   }).join('\n\n===\n\n')
                 : 'Web検索結果が見つかりませんでした。';
               apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: resultText });
+
+            } else if (fnName && fnName.startsWith('gdrive_')) {
+              // ─── Google Drive 系ツール ───
+              // 進捗表示・エラー整形・結果の圧縮を1か所にまとめる。
+              // LLM には「次に何ができるか」が伝わる形 (id を含む一覧) で返す。
+              const gdLabel = {
+                gdrive_search_files: '🔍 GDrive を検索',
+                gdrive_list_files: '📂 GDrive を一覧',
+                gdrive_read_file: '📄 GDrive のファイルを読み込み',
+                gdrive_import_to_server: '⬇️ GDrive からサーバーへ取り込み',
+                gdrive_write_file: '✍️ GDrive に書き込み',
+                gdrive_upload_from_server: '⬆️ サーバーから GDrive へアップロード',
+                gdrive_create_folder: '📁 GDrive にフォルダ作成',
+                gdrive_delete_file: '🗑️ GDrive のファイルを削除',
+              }[fnName] || 'GDrive 操作';
+
+              const gdArgLabel = fnArgs.query || fnArgs.name || fnArgs.fileId || fnArgs.path || fnArgs.folderId || '';
+              searchQueries.push({
+                query: `GDrive: ${gdLabel.replace(/^\S+\s/, '')}${gdArgLabel ? `「${String(gdArgLabel).slice(0, 40)}」` : ''}`,
+                resultCount: null, type: 'gdrive',
+              });
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = {
+                  ...copy[copy.length - 1],
+                  agentStatus: `${gdLabel}${gdArgLabel ? `「${String(gdArgLabel).slice(0, 30)}」` : ''}中...`,
+                  searchQueries: [...searchQueries],
+                };
+                return copy;
+              });
+
+              let gdResultText = '';
+              let gdCount = 0;
+              let gdReadName = '';   // 「参照した資料」に出すファイル名
+              let gdReadLink = '';   // GDrive で開くリンク
+              try {
+                // ファイルIDの引数名ゆれを吸収 (モデルによって fileId / id / file / name)
+                const rawFileRef = fnArgs.fileId || fnArgs.id || fnArgs.file || fnArgs.name || '';
+                // 直近の検索/一覧の結果を使って、番号・ファイル名・崩れたIDを実IDに直す
+                const resolved = resolveGdriveFileRef(rawFileRef, gdriveRecentRef.current);
+                const fileId = resolved.id;
+                const idNote = resolved.note;
+                if (idNote) console.log(`[gdrive] ファイル参照を解決: "${rawFileRef}" ${idNote}`);
+                const folderId = fnArgs.folderId || fnArgs.folder || fnArgs.folder_id || '';
+
+                // 一覧結果を LLM 向けの行に整形するヘルパー。
+                // ID の写し間違いが多いので通し番号を振り、番号でも指定できるようにする。
+                const rememberFiles = (files) => {
+                  const seen = gdriveRecentRef.current.seen;
+                  files.forEach(f => seen.set(f.id, f.name));
+                  // 覚えすぎないよう古いものから捨てる
+                  if (seen.size > 300) {
+                    const keys = [...seen.keys()].slice(0, seen.size - 300);
+                    keys.forEach(k => seen.delete(k));
+                  }
+                  gdriveRecentRef.current.list = files.map(f => ({ id: f.id, name: f.name }));
+                };
+                const fmtFiles = (files) => files.map((f, i) =>
+                  `${i + 1}. ${f.isFolder ? '[フォルダ] ' : ''}${f.name}\n   id: ${f.id}\n   種類: ${f.mimeType}` +
+                  `${f.size ? ` / ${formatBytes(f.size)}` : ''}` +
+                  `${f.modifiedTime ? ` / 更新: ${new Date(f.modifiedTime).toLocaleString('ja-JP')}` : ''}` +
+                  `${f.readableAsText ? ' / テキストとして読める' : ''}`
+                ).join('\n');
+                const PICK_HINT = '\n\n次にこの中のファイルを読むときは、gdrive_read_file の fileId に'
+                  + '【上の id をそのまま】渡してください。IDを写し間違えやすい場合は、'
+                  + '代わりに【通し番号 (1, 2, 3...)】や【ファイル名】を渡しても構いません。';
+
+                if (fnName === 'gdrive_search_files') {
+                  const p = new URLSearchParams({ q: fnArgs.query || text });
+                  if (folderId) p.set('folderId', folderId);
+                  const res = await fetch(`/gdrive/search?${p.toString()}`);
+                  const data = await res.json().catch(() => ({}));
+                  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+                  const files = data.files || [];
+                  gdCount = files.length;
+                  rememberFiles(files);
+                  gdResultText = files.length > 0
+                    ? `Google Drive の検索結果 (${files.length}件):\n${fmtFiles(files)}${PICK_HINT}`
+                    : 'Google Drive に該当するファイルは見つかりませんでした。別のキーワードを試すか、gdrive_list_files でフォルダを確認してください。';
+
+                } else if (fnName === 'gdrive_list_files') {
+                  const p = new URLSearchParams();
+                  if (folderId) p.set('folderId', folderId);
+                  if (fnArgs.query) p.set('q', fnArgs.query);
+                  const res = await fetch(`/gdrive/files?${p.toString()}`);
+                  const data = await res.json().catch(() => ({}));
+                  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+                  const files = data.files || [];
+                  gdCount = files.length;
+                  rememberFiles(files);
+                  gdResultText = files.length > 0
+                    ? `Google Drive フォルダ (id: ${data.folderId}) の内容 (${files.length}件):\n${fmtFiles(files)}${PICK_HINT}`
+                    : 'このフォルダは空です。';
+
+                } else if (fnName === 'gdrive_read_file') {
+                  if (!fileId) throw new Error('fileId が指定されていません。先に gdrive_search_files でファイルを特定してください');
+                  const res = await fetch(`/gdrive/files/${encodeURIComponent(fileId)}/content`);
+                  const data = await res.json().catch(() => ({}));
+                  if (!res.ok) {
+                    // ID が違った場合、モデルが自力で立て直せるよう選択肢を添える。
+                    // ここで候補を出さないと「IDが違ったのでもう一度…」を繰り返して
+                    // ツールのターンを使い切り、回答にたどり着けなくなる。
+                    const known = gdriveRecentRef.current.list;
+                    const choices = known.length > 0
+                      ? '\n\n直前の検索/一覧で見つかっているファイルは次のとおりです。'
+                        + '【この中から選び、通し番号かファイル名で指定してください】(IDを写し直す必要はありません):\n'
+                        + known.map((f, i) => `${i + 1}. ${f.name}`).join('\n')
+                      : '\n\nまず gdrive_search_files でファイルを探してください。';
+                    throw new Error((data.error || `HTTP ${res.status}`) + choices);
+                  }
+                  gdCount = 1;
+                  gdReadName = data.name || '';
+                  gdReadLink = data.webViewLink || '';
+                  gdResultText = `Google Drive のファイル「${data.name}」の内容`
+                    + `${idNote ? ' ' + idNote : ''}`
+                    + `${data.exported ? ' (Google形式から自動変換)' : ''}`
+                    + `${data.truncated ? ` (全${data.totalChars}文字のうち先頭${data.content.length}文字)` : ''}`
+                    + `:\n\`\`\`\n${data.content}\n\`\`\``;
+
+                } else if (fnName === 'gdrive_import_to_server') {
+                  if (!fileId) throw new Error('fileId が指定されていません');
+                  const res = await fetch('/gdrive/import', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ fileId, savePath: fnArgs.savePath }),
+                  });
+                  const data = await res.json().catch(() => ({}));
+                  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+                  gdCount = 1;
+                  gdResultText = `Google Drive から uploads/${data.path} に取り込みました (${data.size}バイト, ${data.mimeType})。`
+                    + ' このファイルは read_file や Python コードから参照できます。';
+                  loadFileList();
+
+                } else if (fnName === 'gdrive_write_file') {
+                  let gcontent = fnArgs.content ?? fnArgs.data ?? fnArgs.text ?? '';
+                  if (typeof gcontent === 'object') gcontent = JSON.stringify(gcontent, null, 2);
+                  const res = await fetch('/gdrive/files', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      name: fnArgs.name, content: String(gcontent),
+                      folderId: folderId || undefined,
+                      fileId: fnArgs.fileId || undefined,
+                      overwrite: !!fnArgs.overwrite,
+                    }),
+                  });
+                  const data = await res.json().catch(() => ({}));
+                  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+                  gdCount = 1;
+                  gdResultText = `Google Drive に「${data.name}」を${data.updated ? '更新' : '作成'}しました (${data.bytes}バイト)。`
+                    + `${data.webViewLink ? `\nURL: ${data.webViewLink}` : ''}`;
+
+                } else if (fnName === 'gdrive_upload_from_server') {
+                  const res = await fetch('/gdrive/export', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      path: fnArgs.path, name: fnArgs.name,
+                      folderId: folderId || undefined, overwrite: true,
+                    }),
+                  });
+                  const data = await res.json().catch(() => ({}));
+                  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+                  gdCount = 1;
+                  gdResultText = `uploads/${fnArgs.path} を Google Drive に「${data.name}」としてアップロードしました。`
+                    + `${data.webViewLink ? `\nURL: ${data.webViewLink}` : ''}`;
+
+                } else if (fnName === 'gdrive_create_folder') {
+                  const res = await fetch('/gdrive/folders', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: fnArgs.name, folderId: folderId || undefined }),
+                  });
+                  const data = await res.json().catch(() => ({}));
+                  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+                  gdCount = 1;
+                  gdResultText = `Google Drive にフォルダ「${data.name}」を作成しました (id: ${data.id})。`;
+
+                } else if (fnName === 'gdrive_delete_file') {
+                  if (!fileId) throw new Error('fileId が指定されていません');
+                  const res = await fetch(`/gdrive/files/${encodeURIComponent(fileId)}`, { method: 'DELETE' });
+                  const data = await res.json().catch(() => ({}));
+                  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+                  gdCount = 1;
+                  gdResultText = `Google Drive のファイル「${data.name || fileId}」をゴミ箱に移動しました。`;
+
+                } else {
+                  gdResultText = `未対応の Google Drive ツールです: ${fnName}`;
+                }
+              } catch (e) {
+                console.error(`[${fnName}] エラー:`, e);
+                gdResultText = `Google Drive の操作に失敗しました: ${e.message}`;
+                gdCount = 0;
+              }
+
+              searchQueries[searchQueries.length - 1].resultCount = gdCount;
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: null, searchQueries: [...searchQueries] };
+                return copy;
+              });
+              // Drive の一覧結果はコンテキストを食うので上限を設ける
+              const GDRIVE_RESULT_MAX = 24000;
+              if (gdResultText.length > GDRIVE_RESULT_MAX) {
+                gdResultText = gdResultText.slice(0, GDRIVE_RESULT_MAX) + '\n... (以降省略)';
+              }
+              // 一覧・検索の結果は「資料」としても保持し、最終応答で参照できるようにする
+              if (fnName === 'gdrive_read_file' && gdCount > 0) {
+                // 「参照した資料」には ID ではなくファイル名を出す。
+                // 類似度スコアは無い (ベクトル検索ではなく直接読み込んでいる) ので付けない。
+                allContexts.push({
+                  docName: gdReadName || 'GDrive のファイル',
+                  source: 'GDrive',
+                  url: gdReadLink || null,
+                  chunk: gdResultText.slice(0, 8000),
+                });
+              }
+              apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: gdResultText });
 
             } else if (fnName === 'list_files') {
               searchQueries.push({ query: 'サーバーファイル一覧', resultCount: null, type: 'file' });
@@ -3399,11 +3929,10 @@ function App() {
     let buffer = '';  // SSE分割行のバッファ
     let firstTokenTime = 0;
     const startTime = Date.now();
-    // ループ検出用
+    // ループ検出用（詳細は findTailRepetition のコメント参照）
     let loopDetected = false;
-    const seenChunks = new Map();
-    const LOOP_CHUNK_SIZE = 100;
-    const LOOP_THRESHOLD = 3;
+    const LOOP_CHECK_STRIDE = 100;   // 何文字進むごとに調べるか
+    const LOOP_TAIL_SIZE = 1600;     // 末尾何文字を対象にするか（段落単位のループも入る長さ）
     let lastCheckedLen = 0;
 
     while (true) {
@@ -3461,16 +3990,20 @@ function App() {
             }
           }
 
-          // 思考ループ検出
+          // ─── 暴走ループ検出 ───
+          // コードブロック (```) の中は判定しない。ファイルの内容やログを引用している
+          // 最中は同じ行が並ぶのが当たり前で、そこで打ち切ると
+          // 「ファイルを読み込んだのに内容が表示される前に止まる」ことになる。
           const fullText = assistantThinking + assistantContent;
-          if (fullText.length - lastCheckedLen >= LOOP_CHUNK_SIZE) {
+          if (fullText.length - lastCheckedLen >= LOOP_CHECK_STRIDE) {
             lastCheckedLen = fullText.length;
-            const chunkText = fullText.slice(-LOOP_CHUNK_SIZE).replace(/\s+/g, ' ').trim();
-            if (chunkText.length >= 50) {
-              const count = (seenChunks.get(chunkText) || 0) + 1;
-              seenChunks.set(chunkText, count);
-              if (count >= LOOP_THRESHOLD) {
-                console.log('[ループ検出] 同一思考が', count, '回繰り返し:', chunkText.slice(0, 60));
+            const insideCodeBlock = ((fullText.match(/```/g) || []).length % 2) === 1;
+            if (!insideCodeBlock) {
+              const tail = fullText.slice(-LOOP_TAIL_SIZE).replace(/[ \t]+/g, ' ');
+              const period = findTailRepetition(tail);
+              if (period > 0) {
+                console.log(`[ループ検出] 末尾が周期${period}文字で繰り返し:`,
+                  JSON.stringify(tail.slice(-period)).slice(0, 80));
                 loopDetected = true;
                 if (abortRef.current) abortRef.current.abort();
                 break;
@@ -3496,7 +4029,7 @@ function App() {
           // 例: "I will write it now. I will not mention the date. ..."
           //     "The user's query is short. I will keep the answer short."
           // 検出した独白パターンの行を thinking 領域に移動
-          if (displayContent && /\bI (will|need to|should|am going to|must|won't|don't|'ll|'m)\b|\bThe user('s| is| wants| needs| asked)\b|\bMy (answer|response|reply|task)\b/.test(displayContent)) {
+          if (displayContent && /\bI (will|need to|should|am going to|must|won't|don't|'ll|'m|tried|used)\b|\bThe user('s| is| wants| needs| asked)\b|\bMy (answer|response|reply|task)\b|\bLet me\b|\bThe (first|second|third|next|last|previous|original|exact) (ID|id|call|result|attempt|query|search|one)\b/.test(displayContent)) {
             const lines = displayContent.split(/\n+/);
             const reasoningLines = [];
             const cleanLines = [];
@@ -3509,9 +4042,16 @@ function App() {
               /^\s*I'?ll? (just |now |proceed|make sure|keep|write|output|respond|answer)/i,
               /^\s*(Okay|OK|Alright|So|Now|Let me)\s*,?\s+I\b/i,
               /^\s*(Okay|OK|Alright)\s*,?\s+(the|so|let|now)\b/i,
-              /^\s*Let me (think|consider|check|analyze|see|write|now|just)/i,
+              /^\s*Let me\b/i,
               /^\s*The response will be /i,
               /^\s*I (need|want|have) to /i,
+              // ツール呼び出しをやり直そうとする独白 (ID の写し間違い等で発生)
+              // 「The first ID might be...」のようなツール呼び出しに関する独白のみ。
+              // 「The first point is...」のような普通の回答を消さないよう名詞を限定する
+              /^\s*The (first|second|third|next|last|previous|original|exact) (ID|id|call|result|attempt|query|search|one)\b/i,
+              /^\s*(Maybe|Perhaps) (I|the|that|it|this)\b/i,
+              /^\s*I (tried|used|got|see that|think the|believe the|notice|found that)\b/i,
+              /^\s*(That|It) (didn't|did not|doesn't|does not) (work|match|exist)/i,
             ];
             for (const line of lines) {
               const isReasoning = reasoningPatterns.some(p => p.test(line));
@@ -3884,13 +4424,167 @@ function App() {
     } catch {}
   }
 
+  // ─── Google Drive ───
+  // 接続状態を取得。ツール提供の可否判定にも使うのでチャット画面の初期化でも呼ぶ。
+  async function loadGdriveStatus() {
+    try {
+      const res = await fetch('/gdrive/status');
+      if (!res.ok) { setGdriveStatus(null); return null; }
+      const st = await res.json();
+      setGdriveStatus(st);
+      return st;
+    } catch {
+      setGdriveStatus(null);
+      return null;
+    }
+  }
+
+  // フォルダの中身 or 検索結果を読み込む
+  async function loadGdriveFiles(folderId = gdriveFolderId, query = '') {
+    setGdriveLoading(true);
+    setGdriveError('');
+    try {
+      const url = query
+        ? `/gdrive/search?q=${encodeURIComponent(query)}`
+        : `/gdrive/files?folderId=${encodeURIComponent(folderId || '')}`;
+      const res = await fetch(url);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setGdriveError(data.error || `HTTP ${res.status}`);
+        setGdriveFiles([]);
+        return;
+      }
+      setGdriveFiles(data.files || []);
+    } catch (e) {
+      setGdriveError(e.message);
+      setGdriveFiles([]);
+    } finally {
+      setGdriveLoading(false);
+    }
+  }
+
+  // フォルダを開く（パンくずを積む）
+  function openGdriveFolder(file) {
+    const id = file?.id || '';
+    const name = file?.name || 'マイドライブ';
+    setGdriveFolderId(id);
+    setGdriveBreadcrumb(prev => [...prev, { id, name }]);
+    setGdriveQuery('');
+    loadGdriveFiles(id, '');
+  }
+
+  // パンくずの任意の階層へ戻る
+  function gdriveNavigateTo(index) {
+    const crumb = gdriveBreadcrumb[index];
+    if (!crumb) return;
+    setGdriveBreadcrumb(gdriveBreadcrumb.slice(0, index + 1));
+    setGdriveFolderId(crumb.id);
+    setGdriveQuery('');
+    loadGdriveFiles(crumb.id, '');
+  }
+
+  // OAuth 認可フローを開始（別ウィンドウで同意 → postMessage で戻ってくる）
+  async function connectGdrive() {
+    setGdriveBusy(true);
+    setGdriveError('');
+    try {
+      const res = await fetch('/gdrive/auth/url');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { setGdriveError(data.error || `HTTP ${res.status}`); return; }
+      const win = window.open(data.url, 'gdrive-auth', 'width=520,height=680');
+      if (!win) {
+        setGdriveError('ポップアップがブロックされました。ブラウザの設定で許可してください。');
+        return;
+      }
+      // 認可完了は callback ページからの postMessage で受ける。
+      // ポップアップを手動で閉じられた場合に備えてポーリングでも拾う。
+      const timer = setInterval(async () => {
+        if (win.closed) {
+          clearInterval(timer);
+          const st = await loadGdriveStatus();
+          if (st?.connected) loadGdriveFiles('', '');
+        }
+      }, 800);
+    } catch (e) {
+      setGdriveError(e.message);
+    } finally {
+      setGdriveBusy(false);
+    }
+  }
+
+  async function disconnectGdrive() {
+    if (!confirm('GDrive の連携を解除しますか？\n（保存されているアクセス許可を取り消します）')) return;
+    setGdriveBusy(true);
+    try {
+      const res = await fetch('/gdrive/disconnect', { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) setGdriveError(data.error || `HTTP ${res.status}`);
+      setGdriveFiles([]);
+      setGdriveBreadcrumb([{ id: '', name: 'マイドライブ' }]);
+      setGdriveFolderId('');
+      await loadGdriveStatus();
+    } catch (e) {
+      setGdriveError(e.message);
+    } finally {
+      setGdriveBusy(false);
+    }
+  }
+
+  // Drive のファイルをサーバー (uploads) に取り込む
+  async function importGdriveFile(file) {
+    setGdriveBusy(true);
+    setGdriveError('');
+    try {
+      const res = await fetch('/gdrive/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileId: file.id }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { setGdriveError(data.error || `HTTP ${res.status}`); return; }
+      loadFileList();
+      alert(`サーバーに取り込みました: uploads/${data.path} (${formatBytes(data.size)})`);
+    } catch (e) {
+      setGdriveError(e.message);
+    } finally {
+      setGdriveBusy(false);
+    }
+  }
+
+  // Drive のファイルをそのままブラウザにダウンロード
+  function downloadGdriveFile(file) {
+    window.open(`/gdrive/files/${encodeURIComponent(file.id)}/content?raw=1`, '_blank');
+  }
+
+  // uploads のファイルを Drive にアップロード
+  async function uploadToGdrive(relPath) {
+    setGdriveBusy(true);
+    setGdriveError('');
+    try {
+      const res = await fetch('/gdrive/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: relPath, folderId: gdriveFolderId || undefined, overwrite: true }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { setGdriveError(data.error || `HTTP ${res.status}`); return; }
+      alert(`GDrive にアップロードしました: ${data.name}`);
+      if (!gdriveQuery) loadGdriveFiles(gdriveFolderId, '');
+    } catch (e) {
+      setGdriveError(e.message);
+    } finally {
+      setGdriveBusy(false);
+    }
+  }
+
   // ─── 外部APIサーバー管理 ───
   async function loadExternalServers() {
     try {
-      const [r1, r2, r3] = await Promise.all([
+      const [r1, r2, r3, r4] = await Promise.all([
         fetch('/external-servers'),
         fetch('/external-servers/https-available'),
         fetch('/external-servers/embedding-available'),
+        fetch('/external-servers/gdrive-available'),
       ]);
       if (r1.ok) {
         const data = await r1.json();
@@ -3910,6 +4604,13 @@ function App() {
         if (!embeddingAvailable) {
           setApiFormTools(prev => prev.filter(t => t !== 'rag'));
         }
+      }
+      if (r4.ok) {
+        const data = await r4.json();
+        setApiGdriveAvailable(!!data.available);
+        setApiGdriveReason(data.reason || '');
+        // 利用不可ならツール選択から gdrive を自動的に外す
+        if (!data.available) setApiFormTools(prev => prev.filter(t => t !== 'gdrive'));
       }
       return { embeddingAvailable };
     } catch {
@@ -4705,6 +5406,8 @@ ${conversationText}
     // 並行: チャット履歴・ファイル一覧・外部APIサーバー一覧・設定・永続RAG情報
     loadChatList();
     loadFileList();
+    // Google Drive の接続状態 (ツール提供の可否判定に使う)
+    loadGdriveStatus();
     // 外部APIサーバー情報を取得 → embedding 可否を永続RAG判定に渡す (fetch重複回避)
     loadExternalServers().then(({ embeddingAvailable }) => {
       loadPersistentRagInfo(embeddingAvailable);
@@ -4740,6 +5443,31 @@ ${conversationText}
       setTimeout(() => { settingsLoadedRef.current = true; }, 1000);
     })();
   }, [authenticated]);
+
+  // Google Drive の認可ポップアップからの完了通知を受ける
+  // (callback ページが window.opener.postMessage({type:'gdrive-auth'}) を投げてくる)
+  useEffect(() => {
+    const onMessage = async (e) => {
+      if (e.origin !== window.location.origin) return;   // 別オリジンからのメッセージは無視
+      if (e.data?.type !== 'gdrive-auth') return;
+      if (e.data.ok === false) {
+        // 認可ポップアップ側で失敗（拒否・state切れ・ログイン切れ等）。パネルにも理由を出す
+        setGdriveError(e.data.message || 'GDrive の連携に失敗しました');
+        setRightPanelTab('gdrive');
+        setGpuPanelOpen(true);
+        await loadGdriveStatus();
+        return;
+      }
+      setGdriveError('');
+      const st = await loadGdriveStatus();
+      if (st?.connected) {
+        setGdriveEnabled(true);
+        loadGdriveFiles('', '');
+      }
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, []);
 
   // chatId変更時にURLを更新（pushState）
   // - 新規/既存チャット切替で /chat/<id> に書き換え
@@ -5385,7 +6113,7 @@ ${conversationText}
                         <div key={si} className="agent-search-item">
                           {/* 画像/音声生成はクエリ文に説明があるため、2行目のアイコンは省略（重複防止） */}
                           {sq.type !== 'image' && sq.type !== 'audio' && (
-                            <span className="agent-search-icon">{sq.type === 'web' ? '🌐' : sq.type === 'file' ? '📁' : sq.type === 'data' ? '🗂️' : '🔍'}</span>
+                            <span className="agent-search-icon">{sq.type === 'web' ? '🌐' : sq.type === 'file' ? '📁' : sq.type === 'data' ? '🗂️' : sq.type === 'gdrive' ? '☁️' : '🔍'}</span>
                           )}
                           <span className="agent-search-query">{sq.query}</span>
                           {sq.resultCount != null && (
@@ -5444,13 +6172,22 @@ ${conversationText}
                     </div>
                   )}
                   {msg.contexts && (() => {
+                    // 資料の出どころによって出せる情報が違う:
+                    //   ・RAG検索  → 類似度スコアあり
+                    //   ・GDrive   → 直接読み込みなのでスコアなし。代わりにファイル名とリンク
+                    // スコアが無いものに「類似度: NaN%」と出さないよう、数値がある時だけ表示する。
                     const grouped = {};
                     msg.contexts.forEach(c => {
-                      if (!grouped[c.docName]) {
-                        grouped[c.docName] = { bestScore: c.score, count: 1 };
+                      const key = c.docName;
+                      const score = typeof c.score === 'number' && isFinite(c.score) ? c.score : null;
+                      if (!grouped[key]) {
+                        grouped[key] = { bestScore: score, count: 1, source: c.source || null, url: c.url || null };
                       } else {
-                        grouped[c.docName].count++;
-                        if (c.score > grouped[c.docName].bestScore) grouped[c.docName].bestScore = c.score;
+                        grouped[key].count++;
+                        if (score !== null && (grouped[key].bestScore === null || score > grouped[key].bestScore)) {
+                          grouped[key].bestScore = score;
+                        }
+                        if (!grouped[key].url && c.url) grouped[key].url = c.url;
                       }
                     });
                     const entries = Object.entries(grouped);
@@ -5459,7 +6196,12 @@ ${conversationText}
                         <div className="msg-context-label">参照した資料</div>
                         {entries.map(([name, info], j) => (
                           <div key={j} style={{ marginTop: j > 0 ? 6 : 0 }}>
-                            <strong>{name}</strong> (類似度: {(info.bestScore * 100).toFixed(1)}%){info.count > 1 && ` — ${info.count}チャンク参照`}
+                            {info.source && <span className="msg-context-source">{info.source}</span>}
+                            {info.url
+                              ? <a className="msg-context-link" href={info.url} target="_blank" rel="noreferrer" title="GDrive で開く">{name}</a>
+                              : <strong>{name}</strong>}
+                            {info.bestScore !== null && ` (類似度: ${(info.bestScore * 100).toFixed(1)}%)`}
+                            {info.count > 1 && ` — ${info.count}チャンク参照`}
                           </div>
                         ))}
                       </div>
@@ -5575,6 +6317,30 @@ ${conversationText}
                     🌐
                   </button>
                 )}
+                {/* Google Drive: 設定で有効な時だけ出す。未接続ならクリックで接続パネルへ誘導 */}
+                {appConfig.googleDrive?.enabled && (
+                  <button
+                    className={`toolbar-btn gdrive-toggle ${gdriveStatus?.connected && gdriveEnabled ? 'active' : ''}`}
+                    title={
+                      !gdriveStatus?.connected
+                        ? 'GDrive: 未接続（クリックで接続パネルを開く）'
+                        : gdriveEnabled
+                          ? `GDrive: ON（クリックでOFF）${gdriveStatus.account ? ` / ${gdriveStatus.account}` : ''}`
+                          : 'GDrive: OFF（クリックでON）'
+                    }
+                    onClick={() => {
+                      if (!gdriveStatus?.connected) {
+                        setRightPanelTab('gdrive');
+                        setGpuPanelOpen(true);
+                        loadGdriveStatus();
+                        return;
+                      }
+                      setGdriveEnabled(v => !v);
+                    }}
+                  >
+                    ☁️
+                  </button>
+                )}
               </div>
               {isLoading ? (
                 <button className="stop-btn" onClick={stopGeneration} title="生成を停止">
@@ -5619,6 +6385,7 @@ ${conversationText}
           <div className="gpu-panel-title" style={{ margin: 0 }}>
             {rightPanelTab === 'gpu' && <>{gpuData.some(g => g.gpus?.length > 0) && <span className="gpu-live-dot" />} GPU モニター</>}
             {rightPanelTab === 'files' && <>📁 サーバーファイル</>}
+            {rightPanelTab === 'gdrive' && <>☁️ GDrive</>}
             {rightPanelTab === 'api' && <>🌐 外部APIサーバー</>}
           </div>
           <button className="clear-btn" onClick={() => setGpuPanelOpen(false)}>✕</button>
@@ -5632,6 +6399,18 @@ ${conversationText}
             <button className={`right-panel-tab wide ${rightPanelTab === 'files' ? 'active' : ''}`} onClick={() => { setRightPanelTab('files'); loadFileList(); }}>
               📁 ファイル{fileList.length > 0 && ` (${fileList.length})`}
             </button>
+            {appConfig.googleDrive?.enabled && (
+              <button
+                className={`right-panel-tab ${rightPanelTab === 'gdrive' ? 'active' : ''}`}
+                onClick={async () => {
+                  setRightPanelTab('gdrive');
+                  const st = await loadGdriveStatus();
+                  if (st?.connected && gdriveFiles.length === 0) loadGdriveFiles(gdriveFolderId, gdriveQuery);
+                }}
+              >
+                ☁️ GDrive
+              </button>
+            )}
             <button className={`right-panel-tab ${rightPanelTab === 'api' ? 'active' : ''}`} onClick={() => { setRightPanelTab('api'); loadExternalServers(); }}>
               🌐 API{externalServers.length > 0 && ` (${externalServers.length})`}
             </button>
@@ -5835,6 +6614,184 @@ ${conversationText}
             </div>
           )}
 
+          {rightPanelTab === 'gdrive' && (
+            <div className="gdrive-panel-body">
+              {/* ── 接続状態 ── */}
+              <div className="gdrive-status-card">
+                <div className="gdrive-status-row">
+                  <span className={`gdrive-status-dot ${gdriveStatus?.connected ? 'ok' : 'ng'}`} />
+                  <span className="gdrive-status-text">
+                    {gdriveStatus?.connected
+                      ? `接続中${gdriveStatus.account ? `: ${gdriveStatus.account}` : ''}`
+                      : '未接続'}
+                  </span>
+                  {gdriveStatus?.connected && (
+                    <span className={`gdrive-mode-badge ${gdriveStatus.allowWrite ? 'rw' : 'ro'}`}>
+                      {gdriveStatus.allowWrite ? '読み書き可' : '読み取り専用'}
+                    </span>
+                  )}
+                </div>
+                {!gdriveStatus?.connected && gdriveStatus?.reason && (
+                  <div className="gdrive-status-hint">{gdriveStatus.reason}</div>
+                )}
+                {gdriveStatus?.rootFolderId && (
+                  <div className="gdrive-status-hint">
+                    アクセス範囲を限定中 (rootFolderId: {gdriveStatus.rootFolderId})
+                  </div>
+                )}
+                <div className="gdrive-status-actions">
+                  {gdriveStatus?.connected ? (
+                    <>
+                      <button className="gdrive-btn" disabled={gdriveBusy} onClick={() => loadGdriveFiles(gdriveFolderId, gdriveQuery)}>
+                        🔄 更新
+                      </button>
+                      {gdriveStatus.authMode === 'oauth' && (
+                        <button className="gdrive-btn danger" disabled={gdriveBusy} onClick={disconnectGdrive}>
+                          連携解除
+                        </button>
+                      )}
+                    </>
+                  ) : gdriveStatus?.authMode === 'serviceAccount' ? (
+                    <span className="gdrive-status-hint">
+                      サービスアカウント方式です。config.json の googleDrive.serviceAccountKeyFile を設定して再起動してください。
+                    </span>
+                  ) : (
+                    <button
+                      className="gdrive-btn primary"
+                      disabled={gdriveBusy || !gdriveStatus?.hasClientId}
+                      onClick={connectGdrive}
+                      title={gdriveStatus?.hasClientId ? '' : 'config.json の googleDrive.clientId / clientSecret を設定してください'}
+                    >
+                      🔗 GDrive に接続
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {gdriveError && <div className="gdrive-error">{gdriveError}</div>}
+
+              {gdriveStatus?.connected && (
+                <>
+                  {/* ── 検索 ── */}
+                  <div className="gdrive-search-row">
+                    <input
+                      className="gdrive-search-input"
+                      placeholder="GDrive 内を検索（ファイル名・本文）"
+                      value={gdriveQuery}
+                      onChange={e => setGdriveQuery(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter') loadGdriveFiles(gdriveFolderId, gdriveQuery); }}
+                    />
+                    <button className="gdrive-btn" onClick={() => loadGdriveFiles(gdriveFolderId, gdriveQuery)}>🔍</button>
+                    {gdriveQuery && (
+                      <button className="gdrive-btn" onClick={() => { setGdriveQuery(''); loadGdriveFiles(gdriveFolderId, ''); }}>✕</button>
+                    )}
+                  </div>
+
+                  {/* ── パンくず ── */}
+                  {!gdriveQuery && (
+                    <div className="gdrive-breadcrumb">
+                      {gdriveBreadcrumb.map((c, i) => (
+                        <React.Fragment key={`${c.id}-${i}`}>
+                          {i > 0 && <span className="gdrive-breadcrumb-sep">/</span>}
+                          <button
+                            className={`gdrive-breadcrumb-item ${i === gdriveBreadcrumb.length - 1 ? 'current' : ''}`}
+                            onClick={() => gdriveNavigateTo(i)}
+                          >
+                            {c.name}
+                          </button>
+                        </React.Fragment>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* ── ファイル一覧 ── */}
+                  {gdriveLoading ? (
+                    <div className="gdrive-loading">読み込み中...</div>
+                  ) : gdriveFiles.length === 0 ? (
+                    <div className="files-empty">
+                      <div className="docs-empty-icon">☁️</div>
+                      <div>{gdriveQuery ? '該当するファイルがありません' : 'このフォルダは空です'}</div>
+                    </div>
+                  ) : (
+                    gdriveFiles.map(f => (
+                      <div key={f.id} className="gdrive-file-item">
+                        <div
+                          className="gdrive-file-main"
+                          onClick={() => { if (f.isFolder) openGdriveFolder(f); }}
+                          title={f.isFolder ? 'クリックで開く' : f.name}
+                          style={{ cursor: f.isFolder ? 'pointer' : 'default' }}
+                        >
+                          <span className="gdrive-file-icon">
+                            {f.isFolder ? '📁'
+                              : f.mimeType?.includes('spreadsheet') ? '📊'
+                              : f.mimeType?.includes('presentation') ? '📽️'
+                              : f.mimeType?.includes('document') ? '📝'
+                              : f.mimeType?.startsWith('image/') ? '🖼️'
+                              : f.mimeType === 'application/pdf' ? '📕'
+                              : '📄'}
+                          </span>
+                          <div className="gdrive-file-info">
+                            <div className="gdrive-file-name">{f.name}</div>
+                            <div className="gdrive-file-meta">
+                              {f.size ? formatBytes(f.size) : (f.isFolder ? 'フォルダ' : '—')}
+                              {f.modifiedTime && ` · ${new Date(f.modifiedTime).toLocaleDateString('ja-JP')}`}
+                            </div>
+                          </div>
+                        </div>
+                        {!f.isFolder && (
+                          <div className="gdrive-file-actions">
+                            <button
+                              className="gdrive-icon-btn"
+                              disabled={gdriveBusy}
+                              title="サーバー (uploads) に取り込む"
+                              onClick={() => importGdriveFile(f)}
+                            >⬇️</button>
+                            <button
+                              className="gdrive-icon-btn"
+                              title="ダウンロード"
+                              onClick={() => downloadGdriveFile(f)}
+                            >💾</button>
+                            {f.webViewLink && (
+                              <a
+                                className="gdrive-icon-btn"
+                                href={f.webViewLink}
+                                target="_blank"
+                                rel="noreferrer"
+                                title="GDrive で開く"
+                              >↗️</a>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    ))
+                  )}
+
+                  {/* ── uploads → GDrive アップロード ── */}
+                  {gdriveStatus.allowWrite && fileList.length > 0 && (
+                    <div className="gdrive-upload-section">
+                      <div className="gdrive-section-title">サーバーのファイルをこのフォルダにアップロード</div>
+                      <select
+                        className="gdrive-upload-select"
+                        defaultValue=""
+                        disabled={gdriveBusy}
+                        onChange={e => {
+                          const v = e.target.value;
+                          e.target.value = '';
+                          if (v) uploadToGdrive(v);
+                        }}
+                      >
+                        <option value="">-- uploads からファイルを選択 --</option>
+                        {fileList.map(f => (
+                          <option key={f.path} value={f.path}>{f.path} ({formatBytes(f.size)})</option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
           {rightPanelTab === 'api' && (
             <div className="api-panel-body">
               <div className="api-section">
@@ -5908,6 +6865,13 @@ ${conversationText}
                           disabled: !apiEmbeddingAvailable,
                           disabledReason: apiEmbeddingReason,
                         },
+                        {
+                          id: 'gdrive',
+                          label: '☁️ GDrive (gdrive_* ツール)',
+                          disabled: !apiGdriveAvailable,
+                          disabledReason: apiGdriveReason,
+                          warnLabel: 'GDrive未接続のため利用不可',
+                        },
                       ].map(t => (
                         <label key={t.id} className="api-form-checkbox-label" style={{
                           fontSize: 12,
@@ -5927,7 +6891,7 @@ ${conversationText}
                           <span>
                             {t.label}
                             {t.disabled && <span style={{ color: 'var(--orange)', marginLeft: 6, fontSize: 10 }}>
-                              ⚠️ embedding未設定のため利用不可
+                              ⚠️ {t.warnLabel || 'embedding未設定のため利用不可'}
                             </span>}
                           </span>
                         </label>
