@@ -45,6 +45,18 @@ function formatDuration(ms) {
 
 const isActive = (job) => job.status === 'running' || job.status === 'queued';
 
+// 同時に張るSSEの上限。ブラウザのHTTP/1.1同時接続上限(6本)を使い切ると、
+// アップロードやポーリングが接続待ちでハングするため、余裕を持って絞る。
+const MAX_SSE = 3;
+
+/** 進捗欄のテキスト。ページ数が判明していない時に状態を取り違えないようにする */
+function progressText(job) {
+  if (job.totalPages > 0) return `p${job.donePages}/${job.totalPages}`;
+  if (job.status === 'running') return 'ページ数を確認中...';
+  if (job.status === 'queued') return '順番待ち';
+  return 'ページ数未取得';
+}
+
 // ─── ルート ───────────────────────────────────────────────
 
 function App() {
@@ -100,11 +112,18 @@ function App() {
   }, [authenticated, loadJobs, loadStatus]);
 
   // ─── 実行中ジョブの進捗を SSE で受ける ───
-  // 実行中のジョブIDが変わった時だけ張り直す (毎回の再描画で繋ぎ直さない)
-  const activeIds = jobs.filter(isActive).map(j => j.jobId).sort().join(',');
+  // 張るのは status === 'running' のジョブだけ。順番待ち(queued)にも張ると、
+  // HTTP/1.1 のブラウザ同時接続上限(1オリジン6本)をSSEが食い潰し、
+  // アップロードのXHRやポーリングが接続を取れずハングする。
+  // 順番待ちのジョブは進捗が動かないので5秒ポーリングで十分。
+  // MAX_SSE は maxConcurrentJobs を上げた構成でも枠を残すための安全弁。
+  // アップロード中はSSEを一旦畳む。大量のPDFをまとめて投入する時に、
+  // 接続枠をアップロードへ優先的に回すため (その間もポーリングで一覧は更新される)
+  const streamIds = uploading.length > 0 ? '' : jobs.filter(j => j.status === 'running')
+    .map(j => j.jobId).sort().slice(0, MAX_SSE).join(',');
   useEffect(() => {
-    if (!authenticated || !activeIds) return;
-    const sources = activeIds.split(',').map(id => {
+    if (!authenticated || !streamIds) return;
+    const sources = streamIds.split(',').map(id => {
       const es = new EventSource(`/ocr/jobs/${id}/stream`);
       es.onmessage = (ev) => {
         let data;
@@ -119,7 +138,7 @@ function App() {
       return es;
     });
     return () => sources.forEach(es => es.close());
-  }, [authenticated, activeIds, loadJobs]);
+  }, [authenticated, streamIds, loadJobs]);
 
   function showToast(msg, type = 'info') {
     setToast({ msg, type });
@@ -441,7 +460,7 @@ function JobCard({ job, onStart, onCancel, onDelete }) {
       </div>
       <div className="ocr-progress-row">
         <span className="ocr-progress-pages">
-          {total > 0 ? `p${job.donePages}/${total}` : 'ページ数を確認中...'}
+          {progressText(job)}
           {total > 0 && <span className="ocr-progress-pct">　{pct}%</span>}
         </span>
         <span className="ocr-progress-time">
