@@ -11,6 +11,7 @@ const { startAgentServer } = require('./agent_proxy');
 const { createLlmPool } = require('./llm_pool');
 const { createOrchestrator, validateWorkflow } = require('./orchestrator');
 const { createGoogleDrive } = require('./google_drive');
+const { createOcrManager } = require('./ocr');
 
 // systemd等で起動された際、カレントディレクトリをserver.jsと同じに固定する
 // これにより相対パスでアクセスされるリソース(モデルキャッシュ等)も安定動作する
@@ -168,6 +169,31 @@ const DEFAULT_CONFIG = {
     sharedDrives: true,             // 共有ドライブ(旧チームドライブ)も対象に含める
     tokenFile: 'gdrive_token.json', // リフレッシュトークンの保存先
   },
+  // ─── OCR (PDF → Markdown → RAG) 設定 ───
+  // アップロードされたPDFを1ページずつ画像化し、Vision LLM (Qwen2.5-VL 等の
+  // OpenAI互換サーバー) に投げて Markdown 化する。完了後は既存のRAGに自動登録され、
+  // チャットの search_documents から参照できるようになる。
+  // 必要な外部コマンド: poppler-utils (pdftoppm / pdfinfo)
+  //   Ubuntu/Debian: sudo apt install poppler-utils
+  ocr: {
+    enabled: true,
+    vlmEndpoint: 'http://localhost:8090/v1/chat/completions', // Vision LLM (OpenAI互換)
+    vlmModel: 'qwen2.5vl',      // リクエストの model フィールド
+    dpi: 300,                   // ページ画像化の解像度
+    maxTokens: 6144,            // 1ページあたりの生成上限
+    temperature: 0.1,
+    pageTimeoutSec: 600,        // 1ページのOCRタイムアウト(秒)
+    pageRetries: 1,             // 失敗時のリトライ回数。使い切ったらそのページはスキップ
+    maxConcurrentJobs: 1,       // 同時実行ジョブ数。単一GPU前提なら1 (将来のマルチGPU用)
+    maxUploadMB: 300,           // 1ファイルのアップロード上限(MB)
+    cacheDir: 'ml/ocr/cache',   // ページ単位のMarkdownキャッシュ (中断ジョブの再開用)
+    jobsFile: 'ml/ocr/jobs.json', // ジョブ状態の永続化先
+    pdfToImageCmd: 'pdftoppm',  // PDF→PNG 変換コマンド (poppler-utils)
+    pdfInfoCmd: 'pdfinfo',      // ページ数取得コマンド (poppler-utils)
+    autoRegisterToRag: true,    // 完了後に自動でRAG登録するか
+    keepPdf: true,              // 完了後もアップロードしたPDFを uploads に残すか
+    prompt: 'この画像は書籍のスキャンページです。以下の形式で出力してください:\n1. 本文はレイアウトを保ちつつ Markdown で出力\n2. 見出しは # / ## / ### を使う\n3. 表は Markdown テーブルで出力\n4. 数式は $ ... $ (インライン) / $$ ... $$ (ブロック) の LaTeX で出力\n5. 図・写真がある場合は [図: 説明] のように記載\n6. ヘッダ・フッタ・ノンブル (ページ番号) は無視してよい\n余計な前置きや解説は一切不要、本文のみ出力してください。',
+  },
   ragTopK: 10,
   ragMode: 'agentic',
   systemPrompts: {
@@ -213,7 +239,7 @@ function loadConfig() {
     if (fs.existsSync(CONFIG_FILE)) {
       const userConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
       const merged = { ...DEFAULT_CONFIG, ...userConfig };
-      ['systemPrompts', 'agentContext', 'transcribe', 'llamaServer', 'embeddingModel', 'ml', 'irodoriTts', 'orchestration', 'googleDrive'].forEach(key => {
+      ['systemPrompts', 'agentContext', 'transcribe', 'llamaServer', 'embeddingModel', 'ml', 'irodoriTts', 'orchestration', 'googleDrive', 'ocr'].forEach(key => {
         if (DEFAULT_CONFIG[key] && typeof DEFAULT_CONFIG[key] === 'object') {
           merged[key] = { ...DEFAULT_CONFIG[key], ...(userConfig[key] || {}) };
         }
@@ -3817,13 +3843,19 @@ function requirePermission(perm) {
 app.get('/config', (req, res) => {
   // 公開しない: password, llamaServer内のbinPath, embeddingModelの実体パス, ml.apiTokens(機密),
   //             googleDrive の clientId/clientSecret/サービスアカウント鍵(機密)
-  const { password, llamaServer, embeddingModel, ml, irodoriTts, googleDrive, ...rest } = appConfig;
+  const { password, llamaServer, embeddingModel, ml, irodoriTts, googleDrive, ocr: ocrCfg, ...rest } = appConfig;
   const safeConfig = {
     ...rest,
     // llamaServer情報は最小限のみ
     llamaServer: { chatPort: llamaServer.chatPort, embeddingPort: llamaServer.embeddingPort },
     // ml は enabled のみ公開、apiTokens(機密)は出さない
     ml: { enabled: !!(ml?.enabled) },
+    // OCR は UI の出し分けに要るぶんだけ (エンドポイントやプロンプトは出さない)
+    ocr: {
+      enabled: ocrCfg ? ocrCfg.enabled !== false : false,
+      maxUploadMB: parseInt(ocrCfg?.maxUploadMB) || 300,
+      autoRegisterToRag: ocrCfg ? ocrCfg.autoRegisterToRag !== false : true,
+    },
   };
   // Google Drive は「使えるか / 書けるか」だけ公開。認証情報は一切出さない
   if (googleDrive) {
@@ -8947,6 +8979,157 @@ app.post('/rag/search', requireAuth, requirePermission('ml:read'), requireEmbedd
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ════════════════════════════════════════════════
+// OCR (PDF → Vision LLM → Markdown → RAG登録)
+// ════════════════════════════════════════════════
+// PDFをアップロードするだけで、Vision LLM (Qwen2.5-VL 等) が1ページずつ Markdown 化し、
+// 完了後は既存のRAGへ自動登録される。チャット側は追加実装なしで search_documents から参照できる。
+// 実処理は ocr.js (ジョブキュー・ページキャッシュ・pdftoppm 連携) に閉じ込めてある。
+
+// RAGドキュメントの削除 (OCRジョブ削除時に、登録済みのRAGも一緒に片付ける)
+function ragDeleteDocById(docId) {
+  if (!docId || !/^[a-f0-9]{16}$/.test(docId)) return;
+  const docPath = path.join(RAG_DIR, `${docId}.json`);
+  if (fs.existsSync(docPath)) fs.unlinkSync(docPath);
+  const idx = loadRagIndex();
+  idx.documents = idx.documents.filter(d => d.docId !== docId);
+  saveRagIndex(idx);
+}
+
+const ocr = createOcrManager({
+  getConfig: () => appConfig.ocr,
+  baseDir: __dirname,
+  uploadsDir: UPLOADS_DIR,
+  log: (ip, msg) => log(ip, msg),
+  ragIngestFile: (filename) => ragIngestFile(filename),
+  ragDeleteDoc: (docId) => ragDeleteDocById(docId),
+  ensureEmbedding: () => ensureEmbeddingLoaded(),
+});
+
+// 起動時: 実行中のまま落ちたジョブを「待機中」に戻す (ページキャッシュから再開できる)
+ocr.restoreOnBoot();
+
+// OCR機能が無効なら以降に進ませないゲート
+function requireOcr(req, res, next) {
+  if (!ocr.isEnabled()) {
+    return res.status(503).json({ error: 'OCR機能が無効です (config.json の ocr.enabled を true にしてください)' });
+  }
+  next();
+}
+
+// jobId の形式チェック (パス要素としてそのまま使うので厳格に)
+function validJobId(id) {
+  return typeof id === 'string' && /^ocr_\d+_[a-z0-9]+$/.test(id);
+}
+
+// エラーを ocr.js が付けた status で返す
+function ocrError(res, e) {
+  res.status(e.status || 500).json({ error: e.message || String(e) });
+}
+
+// 機能の状態 (依存コマンド・Vision LLM の生死)。UIが事前に警告を出すために使う
+app.get('/ocr/status', requireAuth, requirePermission('ml:read'), async (req, res) => {
+  try { res.json(await ocr.health()); }
+  catch (e) { ocrError(res, e); }
+});
+
+// PDF アップロード → ジョブ登録
+// multipart/form-data (name は任意) か、Content-Type: application/pdf の生ボディ。
+// 生ボディの場合はファイル名を ?name= か X-Filename ヘッダーで渡す。
+// autostart=0 を付けない限り、登録後そのまま実行キューに載せる。
+app.post('/ocr/upload', requireAuth, requirePermission('ml:write'), requireOcr, async (req, res) => {
+  const ip = getIP(req);
+  let job;
+  try {
+    job = await ocr.receiveUpload(req, { ip });
+  } catch (e) {
+    return ocrError(res, e);
+  }
+  // 自動開始 (Vision LLM 停止中などで開始できない場合も、アップロード自体は成功として返す)
+  if (req.query.autostart !== '0') {
+    try {
+      job = await ocr.startJob(job.jobId);
+    } catch (e) {
+      return res.status(202).json({ job, started: false, warning: e.message });
+    }
+    return res.json({ job, started: true });
+  }
+  res.json({ job, started: false });
+});
+
+// ジョブ一覧
+app.get('/ocr/jobs', requireAuth, requirePermission('ml:read'), (req, res) => {
+  res.json({ jobs: ocr.listJobs() });
+});
+
+// 個別ジョブ
+app.get('/ocr/jobs/:jobId', requireAuth, requirePermission('ml:read'), (req, res) => {
+  if (!validJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const job = ocr.getJob(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'ジョブが見つかりません' });
+  res.json({ job });
+});
+
+// 進捗のリアルタイム配信 (SSE)。ページ完了ごとに progress イベントが飛ぶ
+app.get('/ocr/jobs/:jobId/stream', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const jobId = req.params.jobId;
+  if (!validJobId(jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const job = ocr.getJob(jobId);
+  if (!job) return res.status(404).json({ error: 'ジョブが見つかりません' });
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',  // nginx 経由でもバッファさせない
+  });
+
+  const send = (event) => {
+    if (!res.writableEnded) res.write(`data: ${JSON.stringify(event)}\n\n`);
+  };
+  // 接続直後に現在の状態を1回流す (再接続時に取りこぼさないため)
+  send({ type: 'status', job });
+
+  const unsubscribe = ocr.subscribe(jobId, send);
+  // プロキシに切られないための keep-alive
+  const ping = setInterval(() => { if (!res.writableEnded) res.write(': ping\n\n'); }, 15000);
+
+  req.on('close', () => {
+    clearInterval(ping);
+    unsubscribe();
+  });
+});
+
+// ジョブ開始 (中断・失敗したジョブの再開もこれ。キャッシュ済みページはスキップされる)
+app.post('/ocr/jobs/:jobId/start', requireAuth, requirePermission('ml:write'), requireOcr, async (req, res) => {
+  if (!validJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  try { res.json({ job: await ocr.startJob(req.params.jobId) }); }
+  catch (e) { ocrError(res, e); }
+});
+
+// 実行中ジョブの中断 (ページキャッシュは残すので、開始し直せば続きから)
+app.post('/ocr/jobs/:jobId/cancel', requireAuth, requirePermission('ml:write'), (req, res) => {
+  if (!validJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const ip = getIP(req);
+  try {
+    const job = ocr.cancelJob(req.params.jobId);
+    log(ip, `[OCR] キャンセル要求: ${job.filename}`);
+    res.json({ job });
+  } catch (e) { ocrError(res, e); }
+});
+
+// ジョブ削除 (キャッシュ・元PDF・生成Markdown・RAG登録をまとめて削除)
+// ?keepFiles=1 でジョブ記録だけ消してファイルは残す
+app.delete('/ocr/jobs/:jobId', requireAuth, requirePermission('ml:write'), (req, res) => {
+  if (!validJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const ip = getIP(req);
+  try {
+    const r = ocr.deleteJob(req.params.jobId, { keepFiles: req.query.keepFiles === '1' });
+    log(ip, `[OCR] ジョブ削除: ${req.params.jobId}`);
+    res.json(r);
+  } catch (e) { ocrError(res, e); }
 });
 
 // ─── フォールバック ───
