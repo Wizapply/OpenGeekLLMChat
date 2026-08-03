@@ -361,8 +361,10 @@ function createOcrManager({
   function jobView(job) {
     if (!job) return null;
     const ctl = running.get(job.jobId);
+    // 経過時間は「今の実行ぶん」。中断→再開したジョブで、止まっていた時間まで
+    // 積み上がって見えないよう、startedAt は実行開始のたびにリセットしている
     const elapsedMs = job.startedAt
-      ? ((job.finishedAt || Date.now()) - job.startedAt)
+      ? ((job.status === 'running' ? Date.now() : (job.finishedAt || job.startedAt)) - job.startedAt)
       : 0;
     // 残り時間は「今回の実行で実際にOCRしたページ」の平均から出す
     // (キャッシュヒットしたページを混ぜると極端に短く見積もってしまう)
@@ -609,7 +611,9 @@ function createOcrManager({
       fs.mkdirSync(cacheDir, { recursive: true });
       if (!fs.existsSync(pdfPath)) throw new Error(`PDFが見つかりません: ${job.filename}`);
 
-      job.startedAt = job.startedAt || Date.now();
+      // 前回実行の終了時刻が残っていると経過時間の計算が壊れるので必ず消す
+      job.startedAt = Date.now();
+      job.finishedAt = null;
       job.interrupted = false;
       job.error = null;
       setStatus(job, 'running', { phase: 'analyze' });
@@ -990,6 +994,9 @@ function createOcrManager({
         job.phase = null;
         job.interrupted = true;
         job.currentPage = 0;
+        // 中断された実行の計測は捨てる (次の開始時に測り直す)
+        job.startedAt = null;
+        job.finishedAt = null;
         job.donePages = countCachedPages(job.jobId, job.totalPages);
         n++;
       }

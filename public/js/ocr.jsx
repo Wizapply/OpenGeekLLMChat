@@ -416,7 +416,10 @@ function JobCard({ job, onStart, onCancel, onDelete }) {
 
   const total = job.totalPages || 0;
   const pct = total > 0 ? Math.min(100, Math.round((job.donePages / total) * 100)) : 0;
-  const elapsed = job.startedAt ? (job.finishedAt || Date.now()) - job.startedAt : 0;
+  // 実行中だけ毎秒進める。終了後はサーバーが確定させた値をそのまま使う
+  const elapsed = (job.status === 'running' && job.startedAt)
+    ? Date.now() - job.startedAt
+    : (job.elapsedMs || 0);
 
   let fillClass = 'idle';
   if (job.status === 'completed') fillClass = job.failedPages.length ? 'done' : 'done';
@@ -442,7 +445,7 @@ function JobCard({ job, onStart, onCancel, onDelete }) {
           {total > 0 && <span className="ocr-progress-pct">　{pct}%</span>}
         </span>
         <span className="ocr-progress-time">
-          {job.startedAt ? `経過 ${formatDuration(elapsed)}` : '未開始'}
+          {elapsed > 0 || job.status === 'running' ? `経過 ${formatDuration(elapsed)}` : '未開始'}
           {job.status === 'running' && job.etaMs != null && ` / 残り約 ${formatDuration(job.etaMs)}`}
         </span>
       </div>
