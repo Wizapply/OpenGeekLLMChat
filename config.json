@@ -461,6 +461,25 @@
     "sharedDrives": true,
     "tokenFile": "gdrive_token.json"
   },
+  "ocr": {
+    "enabled": true,
+    "vlmEndpoint": "http://localhost:8090/v1/chat/completions",
+    "vlmModel": "qwen2.5vl",
+    "dpi": 300,
+    "maxTokens": 6144,
+    "temperature": 0.1,
+    "pageTimeoutSec": 600,
+    "pageRetries": 1,
+    "maxConcurrentJobs": 1,
+    "maxUploadMB": 300,
+    "cacheDir": "ml/ocr/cache",
+    "jobsFile": "ml/ocr/jobs.json",
+    "pdfToImageCmd": "pdftoppm",
+    "pdfInfoCmd": "pdfinfo",
+    "autoRegisterToRag": true,
+    "keepPdf": true,
+    "prompt": "この画像は書籍のスキャンページです。以下の形式で出力してください:\n1. 本文はレイアウトを保ちつつ Markdown で出力\n2. 見出しは # / ## / ### を使う\n3. 表は Markdown テーブルで出力\n4. 数式は $ ... $ (インライン) / $$ ... $$ (ブロック) の LaTeX で出力\n5. 図・写真がある場合は [図: 説明] のように記載\n6. ヘッダ・フッタ・ノンブル (ページ番号) は無視してよい\n余計な前置きや解説は一切不要、本文のみ出力してください。"
+  },
   "ragTopK": 30,
   "ragMode": "agentic",
   "systemPrompts": {
