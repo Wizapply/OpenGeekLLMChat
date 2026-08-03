@@ -27,6 +27,21 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 
+/**
+ * poppler-utils の入れ方の案内。OSごとに手順が違うので、エラーメッセージには
+ * 実行中のプラットフォームに合ったものだけを出す。
+ * (Windows は apt が無いので「sudo apt install」と言われても何もできない)
+ */
+function popplerInstallHint() {
+  if (process.platform === 'win32') {
+    return 'Windows: poppler-windows (https://github.com/oschwartz10612/poppler-windows/releases) の ZIP を展開し、'
+      + 'Library\\bin を PATH に追加してください。PATH を通さない場合は config.json の '
+      + 'ocr.pdfToImageCmd / ocr.pdfInfoCmd にフルパス (例: "C:/poppler/Library/bin/pdftoppm.exe") を指定します';
+  }
+  if (process.platform === 'darwin') return 'macOS: brew install poppler';
+  return 'Ubuntu/Debian: sudo apt install poppler-utils';
+}
+
 // ジョブ状態
 //   pending    … アップロード済み、開始待ち (再起動で中断されたジョブもここに戻る)
 //   queued     … 開始要求済み、実行スロットの空き待ち
@@ -448,7 +463,7 @@ function createOcrManager({
         ok: false,
         missing,
         message: `OCR に必要なコマンドが見つかりません: ${missing.join(', ')}。`
-          + ' poppler-utils をインストールしてください (Ubuntu/Debian: sudo apt install poppler-utils)',
+          + ` poppler-utils をインストールしてください。${popplerInstallHint()}`,
       };
     }
     return { ok: true, missing: [] };
@@ -482,7 +497,7 @@ function createOcrManager({
     const c = cfg();
     const r = await runCmd(c.pdfInfoCmd || 'pdfinfo', [pdfPath], { timeoutMs: 30000 });
     if (r.spawnError) {
-      throw new Error(`pdfinfo を実行できません (${r.spawnError})。poppler-utils をインストールしてください: sudo apt install poppler-utils`);
+      throw new Error(`pdfinfo を実行できません (${r.spawnError})。${popplerInstallHint()}`);
     }
     if (!r.ok) {
       const detail = (r.stderr || r.stdout || '').trim().slice(0, 200);
@@ -507,7 +522,7 @@ function createOcrManager({
     });
     if (ctl) ctl.proc = null;
     if (r.spawnError) {
-      throw new Error(`pdftoppm を実行できません (${r.spawnError})。poppler-utils をインストールしてください: sudo apt install poppler-utils`);
+      throw new Error(`pdftoppm を実行できません (${r.spawnError})。${popplerInstallHint()}`);
     }
     const out = `${outPrefix}.png`;
     if (!r.ok || !fs.existsSync(out)) {

@@ -88,9 +88,15 @@ PDF アップロード
 
 **必要なもの**
 
-```bash
-sudo apt install poppler-utils     # pdftoppm / pdfinfo
-```
+poppler-utils（`pdftoppm` / `pdfinfo`）。npm の依存追加はありません。
+
+| OS | 導入方法 |
+|---|---|
+| Ubuntu / Debian | `sudo apt install poppler-utils` |
+| macOS | `brew install poppler` |
+| Windows | [poppler-windows](https://github.com/oschwartz10612/poppler-windows/releases) のZIPを展開し `Library\bin` を PATH に追加。PATHを通さない場合は `ocr.pdfToImageCmd` / `ocr.pdfInfoCmd` にフルパスを指定（例 `"C:/poppler/Library/bin/pdftoppm.exe"`） |
+
+未導入のまま `/ocr.html` を開くと、**動作中のOSに合わせた導入手順**が画面上部に警告として出ます。
 
 加えて、Vision対応モデルの llama-server を別ポートで起動しておきます（`config.ocr.vlmEndpoint` の指す先）。
 
@@ -729,6 +735,10 @@ Visual Studio C++ ビルドツールが必要、設定は少し手間ですがWS
 - **Git for Windows**: https://git-scm.com/download/win
 - **Node.js LTS**: https://nodejs.org/ja
 - **Python 3.12**: https://www.python.org/downloads/
+- **poppler for Windows**（PDF OCR機能を使う場合のみ）: https://github.com/oschwartz10612/poppler-windows/releases
+  - ZIPを展開して `Library\bin` を PATH に追加（`pdftoppm.exe` / `pdfinfo.exe` が入っています）
+  - PATHを通さない場合は `config.json` の `ocr.pdfToImageCmd` / `ocr.pdfInfoCmd` にフルパスを指定
+    （JSONなのでバックスラッシュは `\\` にエスケープするか、`"C:/poppler/Library/bin/pdftoppm.exe"` のように `/` で書きます）
 
 #### 2. llama.cpp ビルド
 
@@ -1167,7 +1177,7 @@ opengeek-llm-chat/
 | `ocr.maxConcurrentJobs` | 同時実行ジョブ数（既定1＝単一GPU前提。マルチGPUなら増やせる） |
 | `ocr.maxUploadMB` | PDF 1ファイルのアップロード上限（既定300MB） |
 | `ocr.cacheDir` / `jobsFile` | ページキャッシュとジョブ状態の保存先（中断ジョブの再開・再起動復元に使う） |
-| `ocr.pdfToImageCmd` / `pdfInfoCmd` | poppler-utils のコマンド名（PATHが通っていなければ絶対パスを指定） |
+| `ocr.pdfToImageCmd` / `pdfInfoCmd` | poppler-utils のコマンド名。PATHが通っていなければ絶対パスを指定（Windows は `"C:/poppler/Library/bin/pdftoppm.exe"` のように `/` 区切りが書きやすい） |
 | `ocr.autoRegisterToRag` | 完了後に生成Markdownを自動でRAG登録するか（既定true） |
 | `ocr.keepPdf` | 完了後もアップロードしたPDFを `uploads/` に残すか（既定true） |
 | `ocr.prompt` | Vision LLM に渡すOCR指示。表・数式・図の扱いをここで調整する |
