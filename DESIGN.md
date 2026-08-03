@@ -54,6 +54,7 @@
 | `generate-cert.sh` | 自己署名SSL生成 | openssl |
 | `transcribe-server.py` | Gemma4音声認識（参考実装） | transformers, torch |
 | `google_drive.js` | Google Drive 連携（OAuth2/JWT + Drive API v3） | Node標準のみ（`https`, `crypto`） |
+| `ocr.js` | PDF OCR パイプライン（ジョブキュー + Vision LLM + ページキャッシュ） | Node標準のみ + `pdftoppm`/`pdfinfo` |
 | `opengeek-llm-chat.service` | systemdテンプレート | - |
 
 ---
@@ -5715,5 +5716,160 @@ evict とアイドルアンロードの両方が同じ判定を使う。
   経路では動かない。ツールが要る質問は 🎼 をOFFにする
 - **チャット履歴への保存**: 進捗パネル（`msg.orchestra`）も履歴JSONに保存されるため、
   過去のチャットを開き直しても各モデルの出力を確認できる
+
+---
+
+## 📄 PDF OCR パイプライン (ocr.js)
+
+スキャンPDFを Vision LLM で Markdown 化し、そのまま永続RAGに載せるまでを1本の
+ジョブとして扱う機構。UI は `/ocr.html`、実処理は `ocr.js` に閉じ込め、`server.js`
+には HTTP エンドポイントだけを置く（`google_drive.js` / `llm_pool.js` と同じ構成）。
+
+### なぜこの構成なのか
+
+| 判断 | 理由 |
+|:--|:--|
+| PDF→画像を **poppler-utils の外部コマンド**で行う | Node の PDF ライブラリはネイティブビルドや巨大な依存を持ち込む。`pdftoppm` は Linux/macOS どちらでも1コマンドで入り、`child_process` で叩くだけで済む（プロジェクト方針「依存は最小」） |
+| **1ページずつ**画像化して即消す | 300ページを 300dpi で一括変換すると数GBになる。1枚ずつ作って捨てれば、ピーク時のディスク使用量は常に1ページぶん |
+| ページ単位で **Markdown をキャッシュ** | 1ページのOCRに数秒〜十数秒かかるため、300ページなら1時間規模。途中で落ちたら全部やり直し、では実運用にならない |
+| ジョブは **既定1本ずつ**順次実行 | 単一GPUに Vision LLM (Qwen2.5-VL 7B ≒ 9GB) と embedding (≒1.5GB) を同居させる前提。並列にすると OOM する。`maxConcurrentJobs` で将来のマルチGPUに開けてある |
+| 1ページ失敗しても **ジョブは止めない** | 300ページ中1ページが崩れただけで全部無駄になるのは損。リトライ後スキップし、失敗ページを記録する |
+| RAG登録は **内部関数呼び出し** | `ragIngestFile()` を直接呼ぶ。自分自身に HTTP を投げると認証・タイムアウト・多重プロキシの面倒が増えるだけで得がない |
+
+### 処理の流れ
+
+```
+POST /ocr/upload (multipart or 生PDFボディ)
+  ↓ ストリームのままディスクへ (300MBをメモリに載せない)
+  ↓ 拡張子 / MIME / 先頭5バイト "%PDF-" の三重チェック → uploads/<sanitized>.pdf
+  ↓ ジョブ登録 (status: pending) → 既定でそのまま start
+  ↓
+[worker]  pdfinfo でページ数取得 (phase: analyze)
+  ↓
+  for page in 1..N:                                    (phase: ocr)
+      ml/ocr/cache/<jobId>/pXXXX.md があればスキップ   ← 再開はここで効く
+      pdftoppm -png -r 300 -f N -l N -singlefile → page.png
+      POST <vlmEndpoint> { messages:[{text: prompt}, {image_url: data:image/png;base64,...}] }
+      choices[0].message.content → pXXXX.md に保存, page.png は削除
+      SSE で progress を push
+  ↓
+  全ページ結合 → uploads/<title>.md                     (phase: merge)
+  ↓
+  ensureEmbeddingLoaded() → ragIngestFile(<title>.md)   (phase: rag)
+  ↓
+status: completed / ragDocId 記録
+```
+
+### ジョブ状態
+
+`ml/ocr/jobs.json` に永続化（最大100件）。プロセス内の `running` Map には
+`AbortController` と子プロセス参照だけを持ち、これは永続化しない。
+
+| status | 意味 |
+|:--|:--|
+| `pending` | アップロード済み・開始待ち。**再起動で中断されたジョブもここに戻る** |
+| `queued` | 開始要求済み、実行スロットの空き待ち |
+| `running` | 実行中。`phase` が `analyze` / `ocr` / `merge` / `rag` と遷移する |
+| `completed` / `failed` / `cancelled` | 終了 |
+
+起動時に `restoreOnBoot()` が `queued`/`running` のまま残っているジョブを `pending`
+に戻し、`interrupted: true` を立てる。進捗はキャッシュディレクトリを数え直して
+復元するので、UI には「中断 (再開可) / p100/120」と正しく出る。
+
+### 再開の仕組み
+
+キャッシュファイルの**存在そのもの**が「そのページは済んだ」という状態になっている。
+別途チェックポイントを持たないので、状態が二重管理にならない。
+
+```javascript
+const cacheFile = path.join(cacheDir, `p${String(page).padStart(4,'0')}.md`);
+if (fs.existsSync(cacheFile)) continue;   // 再開: 済んだページは飛ばす
+```
+
+失敗したページも `[OCR失敗: 理由]` という本文でキャッシュに書き込む。こうしないと
+再開のたびに同じページで延々リトライしてしまう。失敗ページ番号は `job.failedPages`
+に記録し、結合後の Markdown には `<!-- page=12 failed=1 -->` として残す。
+
+### キャンセル
+
+`running` Map の制御情報に対して、
+1. `ctl.cancelled = true`
+2. 実行中の fetch を `AbortController.abort()`
+3. 実行中の `pdftoppm` を `SIGKILL`
+
+ページループの各所で `ctl.cancelled` を見て `__CANCELLED__` を投げ、catch 側で
+`cancelled` として確定させる。**キャッシュは消さない**ので、再開すれば続きから走る。
+
+### 進捗配信 (SSE)
+
+`GET /ocr/jobs/:id/stream` は `ocr.subscribe(jobId, fn)` でリスナーを登録し、
+`req.on('close')` で解除する。接続直後に現在の状態を1回流すので、再接続しても
+取りこぼさない。15秒ごとに `: ping` を送ってプロキシに切られるのを防ぐ。
+
+```
+data: {"type":"progress","pageNo":42,"total":258,"done":42,"elapsed":91234,
+       "chunkChars":1832,"job":{...}}
+```
+
+残り時間 (`etaMs`) は **今回の実行で実際にOCRしたページ数**だけで平均を取る。
+キャッシュヒットしたページを混ぜると、再開直後に「残り3秒」のような嘘が出る。
+
+### multipart のストリーミング受信
+
+`server.js` の既存 `parseMultipart()` はボディ全体を `Buffer.concat` する実装で、
+300MB のPDFには使えない。`ocr.js` 側に、ファイルパートだけを
+`fs.createWriteStream` へ直接流す簡易パーサーを持たせた。
+
+- バウンダリがチャンク境界をまたぐケースに対応するため、末尾 `boundary長 + 2` バイトを
+  常に手元に残してから残りを書き出す
+- 終端が `--`（最終パート）か `CRLF`（次パート）か判別できるまで処理を進めない
+- `ws.write()` が false を返したら `req.pause()`、`drain` で `resume()`（背圧）
+
+結果、6MB のPDFをランダムな細切れで送っても sha256 が一致し、RSSは90MB程度に収まる。
+
+### セキュリティ
+
+| 対策 | 実装 |
+|:--|:--|
+| パストラバーサル | `path.basename()` → 危険文字を `_` へ → 先頭ドット除去。`uploads` 直下に固定（サブディレクトリを作らせない） |
+| 拡張子偽装 | 拡張子・`Content-Type`・ファイル先頭 `%PDF-` の三重チェック |
+| サイズ | `Content-Length` で事前に弾き、受信中も累積バイトで打ち切る（既定300MB） |
+| ディスク枯渇 | `fs.statfsSync()` で空き容量を見て、`Content-Length + 512MB` を下回れば 507 |
+| jobId | `/^ocr_\d+_[a-z0-9]+$/` にマッチしないものは 400。ディレクトリ名にそのまま使うため |
+| 権限 | 参照系 `ml:read` / 更新系 `ml:write`（既存の `requirePermission` を流用） |
+
+### 実装時の罠
+
+- **`pdftoppm -singlefile`**: これを付けないと出力名に `-01` のようなゼロ埋め連番が
+  付き、桁数が総ページ数で変わる。`-f N -l N -singlefile` なら常に `<prefix>.png`
+- **VLM出力のコードフェンス**: 「Markdownで出して」と指示すると、全体を
+  ` ```markdown ` で包んで返す個体がいる。**全体が1つのフェンスの時だけ**剥がす
+  （本文中のコードブロックまで壊さないため、正規表現は先頭と末尾に固定する）
+- **`content` が配列で返るサーバー**: マルチモーダル形式のまま返す実装があるので、
+  文字列と配列の両方を受け付ける
+- **RAG登録の失敗はジョブの失敗にしない**: embedding サーバーが落ちていても
+  Markdown は完成している。`ragError` に記録して `completed` にし、UI では
+  「⚠️ RAG未登録」バッジを出す（Markdownは手動で `/rag/documents` に登録できる）
+- **ページごとのログは出さない**: 300ページで300行流れるとログが実用にならない。
+  10ページごとに `p120/300 (40%)` の形で集約する
+
+### 設定
+
+| キー | 既定 | 説明 |
+|:--|:--|:--|
+| `enabled` | `true` | 機能のON/OFF |
+| `vlmEndpoint` | `http://localhost:8090/v1/chat/completions` | Vision LLM (OpenAI互換) |
+| `vlmModel` | `qwen2.5vl` | リクエストの `model` |
+| `dpi` | `300` | ページ画像化の解像度 (72〜600にクランプ) |
+| `maxTokens` / `temperature` | `6144` / `0.1` | 1ページあたりの生成設定 |
+| `pageTimeoutSec` | `600` | 1ページのタイムアウト |
+| `pageRetries` | `1` | 失敗時のリトライ回数 |
+| `maxConcurrentJobs` | `1` | 同時実行ジョブ数 |
+| `maxUploadMB` | `300` | アップロード上限 |
+| `cacheDir` / `jobsFile` | `ml/ocr/cache` / `ml/ocr/jobs.json` | 永続化先 |
+| `pdfToImageCmd` / `pdfInfoCmd` | `pdftoppm` / `pdfinfo` | poppler-utils のコマンド |
+| `autoRegisterToRag` | `true` | 完了後に自動でRAG登録 |
+| `keepPdf` | `true` | 完了後も元PDFを残す |
+| `prompt` | (書籍スキャン向け) | 表→Markdownテーブル、数式→LaTeX、図→`[図: 説明]` |
 
 ---
