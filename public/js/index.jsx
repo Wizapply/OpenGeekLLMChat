@@ -5767,6 +5767,11 @@ ${conversationText}
                   🤖 機械学習
                 </a>
               )}
+              {appConfig.ocr?.enabled && (
+                <a className="tuning-link" href="/ocr.html" title="PDFをOCRしてRAGに登録する画面を開く">
+                  📄 OCR
+                </a>
+              )}
             </div>
           </div>
         </div>

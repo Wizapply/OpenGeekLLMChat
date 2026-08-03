@@ -85,6 +85,7 @@ function App() {
         <div className="nav-links">
           <a className="nav-link" href="/">💬 チャット</a>
           <a className="nav-link" href="/ml.html">🤖 機械学習</a>
+          <a className="nav-link" href="/ocr.html">📄 OCR</a>
         </div>
         <div className="sidebar-section">
           <div className="section-title">統計</div>

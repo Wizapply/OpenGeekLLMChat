@@ -222,9 +222,11 @@
     display: flex;
     gap: 6px;
     margin-top: 6px;
+    /* リンクが3つ以上になっても潰れないよう折り返す (2つの時の見た目は変わらない) */
+    flex-wrap: wrap;
   }
   .nav-link-row .tuning-link {
-    flex: 1;
+    flex: 1 1 calc(50% - 3px);
     margin-top: 0;
     min-width: 0;  /* flex 子要素のテキストを折り返し可能に */
     padding: 7px 6px;
