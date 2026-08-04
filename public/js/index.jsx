@@ -2877,12 +2877,24 @@ function App() {
               } else if (ragResults.length === 0) {
                 ragResultText = 'サーバー登録ドキュメントから関連する情報は見つかりませんでした。';
               } else {
-                // 出典にページ番号を含める。これが無いとモデルが章番号を推測で書いてしまう
+                // 出典にページ番号を含める。これが無いとモデルが章番号を推測で書いてしまう。
+                // 見出しの角括弧だけだとメタ情報として読み飛ばされるため、本文の後ろにも
+                // 同じ出典を置き、末尾に「どう引用するか」を検索結果の中で直接指示する。
+                // (システムプロンプトでの指示だけでは従わないモデルがあるため)
+                const citations = [];
                 ragResultText = ragResults.map((r, i) => {
                   const pg = r.pageRange ? ` p.${r.pageRange[0]}-${r.pageRange[1]}`
                     : (r.page != null ? ` p.${r.page}` : '');
-                  return `[サーバー資料${i + 1}: ${r.filename}${pg} (スコア: ${r.score.toFixed(3)})]\n${r.text}`;
+                  const cite = `${r.filename}${pg}`;
+                  citations.push(cite);
+                  return `[資料${i + 1}] 出典: (${cite})  類似度: ${r.score.toFixed(3)}\n`
+                    + `${r.text}\n`
+                    + `↑ ここまでが (${cite}) の内容`;
                 }).join('\n\n');
+                ragResultText += '\n\n───\n'
+                  + '上記を回答に使うときは、各記述の末尾に出典を (ファイル名 p.ページ番号) の形式で必ず書いてください。\n'
+                  + '使用できる出典: ' + citations.map(c => `(${c})`).join(' / ') + '\n'
+                  + 'ここに無い出典を書いてはいけません。章や節の番号を推測で書くことも禁止です。';
               }
               apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: ragResultText });
 
