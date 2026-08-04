@@ -1170,6 +1170,47 @@ function App() {
   // 「によると」のような一般的な言い回しは入れない（雑談で誤爆するため）
   const CITATION_SHAPE_RE = /【\s*S\d+\s*】|[^\s「」『』()（）]+\.md\b|出典|参考文献|原典|に記載され|に書かれて|p\.\s?\d+/;
 
+  // 直前の検索で読んだ資料を、次のターンにも持ち越すための「出典台帳」。
+  // ツール結果そのものを残せれば一番いいが、1回の検索で約19,000トークンあり
+  // 64K のコンテキストでは2〜3ターンで溢れる。「どの資料の何ページを読んだか」
+  // と短い抜粋だけなら数千トークンで収まり、これだけあれば
+  // 「この式はどこに出てきますか」には再検索なしで答えられる。
+  // 本文の続きが要る質問は、従来どおり検索し直させる。
+  function buildSourceLedger(msgs) {
+    const turns = Math.max(0, parseInt(appConfig.ragLedgerTurns) ?? 1);
+    if (!turns) return null;
+    const excerpt = Math.max(0, parseInt(appConfig.ragLedgerChars) ?? 400);
+    // 新しい順に、出典対応表を持つアシスタント発言を turns 件ぶん拾う
+    const picked = [];
+    for (let i = msgs.length - 1; i >= 0 && picked.length < turns; i--) {
+      if (msgs[i].role === 'assistant' && msgs[i].ragSources?.length) picked.push(msgs[i]);
+    }
+    if (!picked.length) return null;
+    const seen = new Set();
+    const lines = [];
+    for (const m of picked) {
+      for (const s of m.ragSources) {
+        const id = `${s.filename}#${s.pageText}`;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        // 本文中では短い呼び名で書かれているので、実ファイル名との対応も出す
+        const head = `── ${s.label}（${s.filename}）${s.pageText ? ` p.${s.pageText}` : ''} ──`;
+        const full = String(s.text || '');
+        const body = excerpt ? full.replace(/\s+/g, ' ').slice(0, excerpt) : '';
+        lines.push(body ? `${head}\n${body}${full.length > excerpt ? ' …(以下略)' : ''}` : head);
+      }
+    }
+    if (!lines.length) return null;
+    return {
+      role: 'system',
+      content: '【前のターンで実際に読んだ資料】\n'
+        + 'これは直前の検索で取得した範囲です。「どの資料の何ページか」を問われたら、この一覧に基づいて答えてください。\n'
+        + '本文は抜粋です。続きや細部が要る場合は search_persistent_documents で取り直してください。\n'
+        + 'ここに無い資料名・ページ・人名・ファイル名を、読んだかのように書いてはいけません。\n\n'
+        + lines.join('\n\n'),
+    };
+  }
+
   // 本文に出てくる .md ファイル名を拾う（登録済みかどうかの照合用）
   function mdNamesIn(text) {
     return [...new Set((String(text || '').match(/[^\s「」『』()（）\[\]【】、,]+\.md\b/g) || []))];
@@ -1917,6 +1958,16 @@ function App() {
         }
         history.push(h);
       });
+
+      // 直前に読んだ資料の台帳を、今回の質問の直前に差し込む。
+      // ツール結果は履歴に残らないので、これが無いとモデルは
+      // 出典キーだけを頼りに中身を思い出そうとして作文する
+      const ledger = buildSourceLedger(allMessages);
+      if (ledger) {
+        history.splice(Math.max(0, history.length - 1), 0, ledger);
+        console.log(`[出典台帳] ${ledger.content.length}文字を履歴に追加`);
+      }
+
       // OpenAI互換パラメータ（llama-server）
       // num_ctxはサーバー起動時に固定されるためリクエスト時は不要
       const llamaCommonOptions = {

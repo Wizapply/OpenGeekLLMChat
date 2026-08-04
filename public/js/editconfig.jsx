@@ -1620,6 +1620,8 @@ const CONFIG_HINTS = {
   'ragChunkSize': '1チャンクの文字数。embeddingModel.ctx（BERT系は512トークン上限）を超えないこと。日本語は約1文字=1トークン',
   'ragChunkOverlap': 'チャンク間の重なり文字数。変更したらドキュメントの再登録が必要',
   'ragNeighborChunks': 'ヒットの前後何チャンクを一緒にLLMへ渡すか。数式と記号定義が分断されるのを防ぐ（0で無効）',
+  'ragLedgerTurns': '直近いくつの回答ぶんの出典（資料名・ページ・抜粋）を次のターンへ持ち越すか。0で無効にすると、出典を問われた時にモデルが中身を作文しやすくなる',
+  'ragLedgerChars': '持ち越す1出典あたりの抜粋文字数。0ならページ対応表だけ持ち越す。増やすほど正確になるがコンテキストを消費する',
   'systemPrompts': 'LLMに渡すシステムプロンプト群',
   'systemPrompts.base': '全フェーズ共通の土台（{date} が展開される）',
   'systemPrompts.documents': 'ドキュメント添付時の追記（{docList}）',

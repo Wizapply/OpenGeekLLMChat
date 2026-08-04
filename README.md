@@ -1230,6 +1230,10 @@ opengeek-llm-chat/
 | `orchestration.workflows[]` | ワークフロー定義。**ブラウザのワークフローエディタから編集・保存される**（手書き不要） |
 | `ragTopK` | RAG検索チャンク数 |
 | `ragMode` | `agentic` / `always` |
+| `ragChunkSize` / `ragChunkOverlap` | 分割の粒度と重なり。embedding の ctx（BERT系は512トークン）を超えないこと。変更したら再登録が必要 |
+| `ragNeighborChunks` | ヒットの前後何チャンクを一緒に渡すか。数式と記号定義が分断されるのを防ぐ（0で無効） |
+| `ragLedgerTurns` | 直近いくつの回答ぶんの出典（資料名・ページ・抜粋）を次のターンへ持ち越すか、デフォルト1（0で無効） |
+| `ragLedgerChars` | 持ち越す1出典あたりの抜粋文字数、デフォルト400（0ならページ対応表のみ） |
 | `agentContext.smallPredict` | ツール判断時のmax_tokens（短文モード）デフォルト512 |
 | `agentContext.largePredict` | ツール判断時のmax_tokens（長文モード）+ continueGen時、デフォルト8192 |
 | `agentContext.judgeHistoryCount` | ツール判断時に送る直近メッセージ件数、デフォルト3 |
