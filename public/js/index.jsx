@@ -2440,6 +2440,25 @@ function App() {
         // 実行済みツール呼び出し (fnName + 引数) の記録。同じ呼び出しの繰り返しを防ぐ
         const executedToolCalls = new Set();
         let searchQueries = [];
+        // 永続RAGの出典レジストリ。ターン内で S1, S2, … の通し番号を維持する。
+        // モデルには ASCII の短いキーだけを書かせ、実際のファイル名は
+        // 画面側がこのデータから描く。日本語の資料名を転写させると
+        // 「テラメカニックス」が毎回違う形に崩れるため (Qwen3.6 で確認)。
+        const ragSourceRegistry = [];   // [{ key, filename, label, page, pageRange }]
+        const ragSourceKey = (r) => {
+          const pg = r.pageRange ? `${r.pageRange[0]}-${r.pageRange[1]}`
+            : (r.page != null ? String(r.page) : '');
+          const found = ragSourceRegistry.find(s => s.filename === r.filename && s.pageText === pg);
+          if (found) return found;
+          const entry = {
+            key: `S${ragSourceRegistry.length + 1}`,
+            filename: r.filename,
+            label: shortSourceLabel(r.filename),
+            pageText: pg,
+          };
+          ragSourceRegistry.push(entry);
+          return entry;
+        };
         // ツールが実際に生成したメディアの本物URL。
         // LLMが [[gen_audio:...]]/[[gen_image:...]] のファイル名を改変して出力する
         // ことがあるため、最終応答でこの実URLでマーカーを確定させる。
@@ -2912,47 +2931,40 @@ function App() {
               } else if (ragResults.length === 0) {
                 ragResultText = 'サーバー登録ドキュメントから関連する情報は見つかりませんでした。';
               } else {
-                // 出典にページ番号を含める。これが無いとモデルが章番号を推測で書いてしまう。
-                // 見出しの角括弧だけだとメタ情報として読み飛ばされるため、本文の後ろにも
-                // 同じ出典を置き、末尾に「どう引用するか」を検索結果の中で直接指示する。
-                // (システムプロンプトでの指示だけでは従わないモデルがあるため)
-                // 引用には短い呼び名を使わせる。長い日本語ファイル名をそのまま
-                // 何度も書き写させると、モデルが毎回違う形に崩す
-                // (「テラメカニクックス」「テラメカノックス」等) ため。
-                // 同じ資料の別ページは同じ呼び名を使う。連番を足すのは
-                // 「別のファイルが同じ呼び名になった」時だけ
-                const labelByFile = new Map();
+                // 出典は ASCII の短いキー (S1, S2, …) で書かせる。
+                // 日本語の資料名を転写させると「テラメカニックス」が
+                // 「テラメカニンクス」「テラメカロニク ス」等に毎回崩れるため
+                // (Qwen3.6 で確認)。実際のファイル名とページは画面側が
+                // ragSources から描くので、モデルを経由しない。
                 const citations = [];
                 ragResultText = ragResults.map((r, i) => {
-                  const pg = r.pageRange ? ` p.${r.pageRange[0]}-${r.pageRange[1]}`
-                    : (r.page != null ? ` p.${r.page}` : '');
-                  let label;
-                  if (labelByFile.has(r.filename)) {
-                    label = labelByFile.get(r.filename);
-                  } else {
-                    label = shortSourceLabel(r.filename);
-                    const taken = new Set(labelByFile.values());
-                    let n = 2;
-                    while (taken.has(label)) { label = `${shortSourceLabel(r.filename)}${n}`; n++; }
-                    labelByFile.set(r.filename, label);
-                  }
-                  // 出典は【】で囲む。[...] と (...) を使うと Markdown のリンク記法
-                  // [表示テキスト](URL) と同じ並びになり、モデルが出典をリンクとして
-                  // 書き出してしまう (marked がそれをレンダリングして壊れる) ため。
-                  const cite = `【${label}${pg}】`;
+                  const s = ragSourceKey(r);
+                  const cite = `【${s.key}】`;
                   citations.push(cite);
-                  return `── 資料${i + 1} ──\n`
-                    + `出典: ${cite}   元ファイル: ${r.filename}   類似度: ${r.score.toFixed(3)}\n`
+                  return `── 資料 ${s.key} ──\n`
+                    + `出典キー: ${s.key}   (${s.label}${s.pageText ? ' p.' + s.pageText : ''})   類似度: ${r.score.toFixed(3)}\n`
                     + `${r.text}\n`
-                    + `── ここまでが ${cite} の内容 ──`;
+                    + `── ここまでが ${s.key} の内容 ──`;
                 }).join('\n\n');
                 ragResultText += '\n\n════\n'
-                  + '上記を回答に使うときは、各記述の末尾に出典を書いてください。\n'
-                  + '使用できる出典（この通りにコピーしてください）: ' + citations.join(' / ') + '\n'
-                  + '出典は必ず【】で囲んだ上の形式のみを使ってください。'
+                  + '上記を回答に使うときは、各記述の末尾に出典キーを書いてください。\n'
+                  + '使用できる出典キー: ' + citations.join(' / ') + '\n'
+                  + '【S1】のように、キーだけを【】で囲んで書いてください。'
+                  + '資料名やページ番号を自分で書き足さないでください（画面側が対応表を表示します）。\n'
                   + '角括弧と丸括弧を並べたリンク記法（[...](...)）で書いてはいけません。\n'
-                  + '「元ファイル」の長い名前は書き写さないでください。\n'
-                  + 'ここに無い出典を書いてはいけません。章や節の番号を推測で書くことも禁止です。';
+                  + 'ここに無いキーを書いてはいけません。章や節の番号を推測で書くことも禁止です。';
+              }
+              // 出典の対応表をメッセージに持たせる。表示はモデルの出力ではなく
+              // このデータから描くので、資料名が書き崩されることがない
+              if (ragSourceRegistry.length > 0) {
+                setMessages(prev => {
+                  const copy = [...prev];
+                  copy[copy.length - 1] = {
+                    ...copy[copy.length - 1],
+                    ragSources: ragSourceRegistry.map(s => ({ ...s })),
+                  };
+                  return copy;
+                });
               }
               apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: ragResultText });
 
@@ -6204,6 +6216,21 @@ ${conversationText}
                           {sq.resultCount != null && (
                             <span className="agent-search-result">{sq.resultCount}件</span>
                           )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {/* 永続RAGの出典対応表。回答中の【S1】がどの資料の何ページかを示す。
+                      モデルの出力ではなく検索結果のデータから描くので、
+                      資料名が書き崩されることがない */}
+                  {msg.ragSources?.length > 0 && (
+                    <div className="rag-sources">
+                      <div className="rag-sources-title">📚 出典</div>
+                      {msg.ragSources.map(s => (
+                        <div key={s.key} className="rag-source-item">
+                          <span className="rag-source-key">{s.key}</span>
+                          <span className="rag-source-name" title={s.filename}>{s.filename.replace(/\.md$/, '')}</span>
+                          {s.pageText && <span className="rag-source-page">p.{s.pageText}</span>}
                         </div>
                       ))}
                     </div>

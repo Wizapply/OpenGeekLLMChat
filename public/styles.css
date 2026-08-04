@@ -2288,6 +2288,52 @@
   }
 
   /* ── Agent Search Activity ── */
+  /* ─── 永続RAGの出典対応表 ───
+     回答中の【S1】がどの資料の何ページかを示す。モデルの出力ではなく
+     検索結果のデータから描くので、資料名が書き崩されることがない。 */
+  .rag-sources {
+    margin: 8px 0 10px;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius-sm);
+    background: var(--bg-tertiary);
+    padding: 8px 12px;
+  }
+  .rag-sources-title {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-bottom: 5px;
+  }
+  .rag-source-item {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 12px;
+    line-height: 1.7;
+    min-width: 0;
+  }
+  .rag-source-key {
+    flex-shrink: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent);
+    background: var(--accent-dim, rgba(52,211,153,0.12));
+    border-radius: 4px;
+    padding: 1px 6px;
+  }
+  .rag-source-name {
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .rag-source-page {
+    flex-shrink: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
   .agent-activity {
     margin-bottom: 8px;
     border: 1px solid var(--border);
