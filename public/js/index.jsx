@@ -3695,6 +3695,8 @@ function App() {
         const contextInfo = uniqueContexts.length > 0 ? uniqueContexts : null;
 
         // ステップ3: 最終ストリーミング応答（toolsなしで即座にストリーム）
+        // ragSources はツール実行中に付けた出典対応表。ここで作り直すと
+        // 消えてしまうので明示的に引き継ぐ（回答本文だけをクリアする）
         setMessages(prev => {
           const copy = [...prev];
           copy[copy.length - 1] = {
@@ -3702,6 +3704,7 @@ function App() {
             contexts: contextInfo,
             agentStatus: searchQueries.length > 0 ? '回答生成中...' : null,
             searchQueries: searchQueries,
+            ragSources: copy[copy.length - 1]?.ragSources,
           };
           return copy;
         });
@@ -3879,6 +3882,7 @@ function App() {
           searchQueries[searchQueries.length - 1].resultCount = webResults.length;
 
           // 既存の最終応答メッセージをクリアして再ストリーミング
+          // (ragSources は引き継ぐ。作り直すと出典対応表が消えるため)
           setMessages(prev => {
             const copy = [...prev];
             copy[copy.length - 1] = {
@@ -3886,6 +3890,7 @@ function App() {
               contexts: contextInfo,
               agentStatus: '回答生成中...',
               searchQueries: [...searchQueries],
+              ragSources: copy[copy.length - 1]?.ragSources,
             };
             return copy;
           });
