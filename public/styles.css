@@ -2327,6 +2327,15 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .rag-source-warn {
+    margin-top: 6px;
+    padding: 6px 8px;
+    border-radius: 4px;
+    background: var(--orange-dim, rgba(251,146,60,0.12));
+    color: var(--orange, #fb923c);
+    font-size: 11px;
+    line-height: 1.6;
+  }
   .rag-source-page {
     flex-shrink: 0;
     font-family: var(--font-mono);

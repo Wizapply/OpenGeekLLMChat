@@ -6228,18 +6228,34 @@ ${conversationText}
                   {/* 永続RAGの出典対応表。回答中の【S1】がどの資料の何ページかを示す。
                       モデルの出力ではなく検索結果のデータから描くので、
                       資料名が書き崩されることがない */}
-                  {msg.ragSources?.length > 0 && (
-                    <div className="rag-sources">
-                      <div className="rag-sources-title">📚 出典</div>
-                      {msg.ragSources.map(s => (
-                        <div key={s.key} className="rag-source-item">
-                          <span className="rag-source-key">{s.key}</span>
-                          <span className="rag-source-name" title={s.filename}>{s.filename.replace(/\.md$/, '')}</span>
-                          {s.pageText && <span className="rag-source-page">p.{s.pageText}</span>}
-                        </div>
-                      ))}
-                    </div>
-                  )}
+                  {(() => {
+                    // 本文が使っている出典キーを拾い、対応表に無いものを警告する。
+                    // 検索していないのにモデルが【S5】等を捏造することがあり、
+                    // 出典が付いているぶん却って信頼できるように見えてしまうため。
+                    const known = new Set((msg.ragSources || []).map(s => s.key));
+                    const used = new Set((String(msg.content || '').match(/【\s*(S\d+)\s*】/g) || [])
+                      .map(m => m.replace(/[【】\s]/g, '')));
+                    const unknown = [...used].filter(k => !known.has(k));
+                    if (!msg.ragSources?.length && unknown.length === 0) return null;
+                    return (
+                      <div className="rag-sources">
+                        <div className="rag-sources-title">📚 出典</div>
+                        {(msg.ragSources || []).map(s => (
+                          <div key={s.key} className="rag-source-item">
+                            <span className="rag-source-key">{s.key}</span>
+                            <span className="rag-source-name" title={s.filename}>{s.filename.replace(/\.md$/, '')}</span>
+                            {s.pageText && <span className="rag-source-page">p.{s.pageText}</span>}
+                          </div>
+                        ))}
+                        {unknown.length > 0 && (
+                          <div className="rag-source-warn">
+                            ⚠️ 本文に、検索結果に無い出典キー（{unknown.join(', ')}）が使われています。
+                            該当箇所は資料の裏付けが無く、モデルの知識で書かれた可能性があります。
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
                   {msg.orchestra && <OrchestraPanel orch={msg.orchestra} />}
                   {msg.role === 'assistant' ? (
                     <div className="msg-bubble">
