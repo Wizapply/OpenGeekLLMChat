@@ -196,6 +196,18 @@ const DEFAULT_CONFIG = {
   },
   ragTopK: 10,
   ragMode: 'agentic',
+  // ─── 永続RAG のチャンク分割 / 文脈拡張 ───
+  // chunkSize は「embeddingモデルのコンテキスト長」が上限になる点に注意。
+  // mxbai-embed-large 等の BERT 系は 512 トークンが構造上の上限で、config で
+  // embeddingModel.ctx を上げても伸びない。日本語はおおむね1文字≒1トークンなので、
+  // 500文字でもう上限付近。ここを大きくすると埋め込みが切り捨てられ精度が落ちる。
+  //
+  // そこで「埋め込む単位」と「LLMに見せる単位」を分ける。検索は小さいチャンクで行い、
+  // ヒットしたチャンクの前後 ragNeighborChunks 個を連結して渡す。こうすると
+  // 数式とその記号定義のように離れた記述が、埋め込みの制約を侵さずに一緒に届く。
+  ragChunkSize: 500,        // 1チャンクの文字数 (embeddingのctxを超えないこと)
+  ragChunkOverlap: 100,     // チャンク間の重なり
+  ragNeighborChunks: 2,     // ヒットの前後何チャンクを一緒にLLMへ渡すか (0で無効)
   systemPrompts: {
     base: 'あなたは親切で知識豊富なAIアシスタントです。日本語で簡潔に回答してください。今日の日付は{date}です。\n\n重要な指示:\n- 思考は手短に済ませ、ユーザーへの回答を必ず出力してください。\n- ツールから取得した情報は信頼し、そのまま使ってください（妥当性を過度に疑わないこと）。\n- 日付に関する自己矛盾を感じても、与えられた{date}を真として処理してください。過去の学習データとの整合性を気にする必要はありません。\n- 天気・ニュース・株価など現在情報は、ツールの結果をそのまま引用してください。',
     documents: '【参照可能なドキュメント】(チャットに添付されたファイル): {docList}\nユーザーの質問が「ドキュメントについて」「資料を見て」「添付ファイル」などを示唆する場合、必ず最初に search_documents ツールを使ってください。\nこれらは添付ドキュメントであり、サーバーファイル（uploads配下）とは別物です。',
@@ -203,6 +215,10 @@ const DEFAULT_CONFIG = {
     fileAccess: '【サーバーファイル操作】(uploads配下、ドキュメントとは別物)\n- list_files: uploadsフォルダの一覧を取得\n- read_file(path): uploadsフォルダのファイル読み込み\n- write_file(path, content): uploadsフォルダにファイル書き込み\n重要: pathには"uploads/"プレフィックスを付けずにファイル名のみを指定してください（例: "hello.py"、"data/config.json"）。\nユーザーが明確に「サーバーファイル」「uploadsフォルダ」「ファイルを保存して」など、サーバー側のファイルシステム操作を依頼した場合のみ使用してください。\nチャットに添付されたドキュメントについての質問では list_files/read_file/write_file は使わず、search_documents を使ってください。',
     python: 'Pythonコード実行について:\n- 応答に ```python ... ``` のコードブロックを含めると、ユーザー側で実行ボタンが表示されます。\n- グラフ・図の作成依頼には matplotlib を使ったPythonコードを提示してください（matplotlib.use(\'Agg\')の指定は不要、plt.show()で自動的にチャットに画像表示されます）。\n- データ処理・計算・可視化の依頼では、迷わずPythonコードブロックを返してください。それだけで完結します。ツール呼び出しは不要です。\n- 大量データ・CSV/Parquet/JSON処理・複雑な集計には DuckDB を使ってください。SQLでpandasより高速かつメモリ効率良く処理できます。\n  使い方: import duckdb; con = duckdb.connect(); df = con.execute("SELECT ... FROM \'data.csv\'").df()\n  CSVやParquetを直接 FROM で参照可能。pandasのDataFrameもテーブルとして使えます（con.execute("SELECT ... FROM df")）。',
     googleDrive: '【Google Drive】(サーバーのuploadsフォルダとも、チャット添付ドキュメントとも別物)\n- gdrive_search_files(query): Drive 全体からファイル名・本文で検索\n- gdrive_list_files(folderId): フォルダの中身を一覧 (folderId は省略可、フォルダ名やパスでも指定できる)\n- gdrive_read_file(fileId): ファイルの中身をテキストで読む (Google ドキュメント/スプレッドシートは自動でテキスト/CSVに変換される)\n- gdrive_import_to_server(fileId): Drive のファイルをサーバーの uploads に取り込む (Pythonで処理したい時やバイナリの時)\n- gdrive_write_file(name, content): Drive にファイルを作成/更新\n- gdrive_upload_from_server(path): uploads のファイルを Drive にアップロード\n- gdrive_create_folder(name): フォルダ作成\n- gdrive_delete_file(fileId): ゴミ箱に移動\n使い方の指針: まず gdrive_search_files か gdrive_list_files で目的のファイルを特定し、返ってきた id を gdrive_read_file に渡すこと。IDが分からないうちに読もうとしないこと。\nIDは長くて写し間違えやすいので、自信が無ければ一覧の【通し番号 (1, 2, 3...)】か【ファイル名】を fileId に渡してもよい。読み込みに失敗しても、同じIDで何度も試さず、候補の番号か名前で指定し直すこと。\nユーザーが「ドライブ」「Google Drive」「グーグルドライブ」「クラウドのファイル」等に言及した場合に使ってください。',
+    // 永続RAG (サーバー登録ドキュメント) が使える時に追記される。
+    // OCRした技術書などを扱う際、モデルが取得した原文を「一般的な形」に
+    // 書き換えてしまう（数式の記号を勝手に置き換える等）のを抑えるための指示。
+    rag: '【サーバー登録ドキュメントの引用について】\n- 数式・記号・変数名・数値は、search_persistent_documents で取得した原文の表記をそのまま使ってください。一般的に知られた形に書き直したり、記号を置き換えたりしないでください。\n- 検索結果に無い項・係数・条件を、自分の知識で補って書き足さないでください。原文に載っていない部分は「取得した範囲には記載がありません」と述べてください。\n- 引用した箇所には、検索結果に付いている出典 (ファイル名とページ番号) を必ず添えてください。ページ番号が示されていない場合は、章や節を推測で書かないでください。\n- 検索結果が断片的で式の全体が読み取れない時は、無理に完成させず、読み取れた範囲を示したうえで原典の確認を促してください。',
     meta: '重要な指示:\n- 内部的な推論・検索戦略・計画・メタ的な説明は一切出力しないでください。\n- "I need to...", "The user wants...", "I should..." のような独り言を書かないでください。\n- ツールを呼び出すと決めたら、即座にツールを呼び出してください。テキスト応答と併用しないでください。\n- 検索結果が得られなかった場合は、その旨を簡潔に伝え、自分の知識で回答してください。',
     judge: '以下の中から必要なツールを呼び出してください。通常の質問に答えられる場合はツールを使わずそのまま応答してください。\n{toolList}\n注意: チャット添付ドキュメントとサーバーuploadsファイルは別物。ドキュメント関連は search_documents、サーバーファイル関連は list_files/read_file/write_file。\nグラフ・計算・データ処理はツール不要。```python ... ``` コードブロックを応答に含めれば自動実行されます（matplotlibで画像表示、DuckDBで高速SQL処理可能）。\n内部推論は書かず、ツールを呼ぶか直接短く応答するかのみ。',
   },
@@ -8789,6 +8805,46 @@ function ragChunkText(text, chunkSize = 500, overlap = 100) {
   return chunks;
 }
 
+// チャンク分割 (開始オフセット付き)。ページ番号を引き当てるために位置が要る。
+// 分割ロジックそのものは ragChunkText と同一。
+function ragChunkTextWithOffsets(text, chunkSize, overlap) {
+  const out = [];
+  if (!text) return out;
+  const safeOverlap = Math.min(overlap, Math.floor(chunkSize / 2));
+  let start = 0;
+  while (start < text.length) {
+    const end = Math.min(start + chunkSize, text.length);
+    out.push({ text: text.slice(start, end), start });
+    if (end >= text.length) break;
+    start += chunkSize - safeOverlap;
+  }
+  return out;
+}
+
+// OCR が埋めた `<!-- page=N -->` を拾って [{offset, page}] を作る。
+// これで各チャンクが原典の何ページ由来かを言えるようになり、
+// LLM が「第何章あたり」を推測で答えるのを防げる。
+function ragPageMarkers(text) {
+  const markers = [];
+  const re = /<!--\s*page=(\d+)[^>]*-->/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    markers.push({ offset: m.index, page: parseInt(m[1], 10) });
+  }
+  return markers;
+}
+
+// オフセットに対応するページ番号 (直前のマーカー)。マーカーが無い資料では null
+function ragPageAt(markers, offset) {
+  if (!markers.length) return null;
+  let page = null;
+  for (const mk of markers) {
+    if (mk.offset > offset) break;
+    page = mk.page;
+  }
+  return page;
+}
+
 // cosine類似度
 // ブラウザ側 cosineSim と完全に同じロジック
 function ragCosineSim(a, b) {
@@ -8863,7 +8919,16 @@ async function ragIngestFile(filename) {
   if (!text.trim()) throw new Error('ファイルが空です');
 
   // チャンク分割 + embedding
-  const chunks = ragChunkText(text);
+  // チャンクサイズは embedding の ctx を超えないこと (config のコメント参照)
+  const chunkSize = Math.max(100, parseInt(appConfig.ragChunkSize) || 500);
+  const rawOverlap = Math.max(0, parseInt(appConfig.ragChunkOverlap) ?? 100);
+  // 実際に使われる重なり (分割ロジックが chunkSize/2 で頭打ちにする)。
+  // 検索時に連結する際、この値ぶんを差し引かないと同じ文章が二重に入る。
+  const overlap = Math.min(rawOverlap, Math.floor(chunkSize / 2));
+  const pieces = ragChunkTextWithOffsets(text, chunkSize, rawOverlap);
+  const markers = ragPageMarkers(text);
+  const chunks = pieces.map(p => p.text);
+  const pages = pieces.map(p => ragPageAt(markers, p.start));
   const embeddings = [];
   for (const chunk of chunks) {
     const vec = await ragGetEmbedding(chunk);
@@ -8875,6 +8940,8 @@ async function ragIngestFile(filename) {
   const docData = {
     docId, filename, chunkCount: chunks.length,
     chunks, embeddings,
+    pages,                    // 各チャンクの由来ページ (OCR以外の資料では null 埋め)
+    chunkSize, overlap,       // 再現・デバッグ用に分割条件も残す
     ingestedAt: Date.now(),
   };
   fs.writeFileSync(path.join(RAG_DIR, `${docId}.json`), JSON.stringify(docData), 'utf-8');
@@ -8891,25 +8958,102 @@ async function ragIngestFile(filename) {
 }
 
 // RAG検索 (全ドキュメントのチャンクから cosine 類似度 top-k)
-async function ragSearch(query, topK = 5) {
+//
+// 検索はチャンク単位で行うが、LLM に渡すのはヒットしたチャンクの前後 neighbors 個を
+// 連結したもの。embedding の ctx (BERT系は512トークン固定) を侵さずに、
+// 数式とその記号定義のように離れた記述を一緒に届けるための仕組み。
+// neighbors に null を渡すと config.ragNeighborChunks を使う。
+async function ragSearch(query, topK = 5, neighbors = null) {
   const idx = loadRagIndex();
   if (idx.documents.length === 0) return { results: [], note: 'RAGドキュメントが登録されていません' };
 
+  const n = neighbors === null
+    ? Math.max(0, parseInt(appConfig.ragNeighborChunks) || 0)
+    : Math.max(0, parseInt(neighbors) || 0);
+
   const qVec = await ragGetEmbedding(query);
+  const docs = new Map();   // docId -> ドキュメント本体 (連結時に再読み込みしないため)
   const scored = [];
   for (const doc of idx.documents) {
     const docPath = path.join(RAG_DIR, `${doc.docId}.json`);
     if (!fs.existsSync(docPath)) continue;
     try {
       const data = JSON.parse(fs.readFileSync(docPath, 'utf-8'));
+      docs.set(doc.docId, data);
       for (let i = 0; i < data.chunks.length; i++) {
         const sim = ragCosineSim(qVec, data.embeddings[i]);
-        scored.push({ filename: data.filename, chunkIndex: i, text: data.chunks[i], score: sim });
+        scored.push({ docId: doc.docId, filename: data.filename, chunkIndex: i, score: sim });
       }
     } catch {}
   }
   scored.sort((a, b) => b.score - a.score);
-  return { results: scored.slice(0, topK) };
+  const top = scored.slice(0, topK);
+
+  const pageOf = (data, i) => (Array.isArray(data.pages) ? (data.pages[i] ?? null) : null);
+
+  if (n === 0) {
+    return {
+      results: top.map(h => {
+        const data = docs.get(h.docId);
+        return {
+          filename: h.filename, chunkIndex: h.chunkIndex,
+          page: pageOf(data, h.chunkIndex),
+          text: data.chunks[h.chunkIndex], score: h.score,
+        };
+      }),
+    };
+  }
+
+  // 前後に広げ、同じ資料内で重なった範囲は1つにまとめる
+  // (隣接するチャンクが2件ヒットすると、同じ文章を二重に渡してしまうため)
+  const byDoc = new Map();
+  for (const h of top) {
+    const data = docs.get(h.docId);
+    if (!byDoc.has(h.docId)) byDoc.set(h.docId, []);
+    byDoc.get(h.docId).push({
+      from: Math.max(0, h.chunkIndex - n),
+      to: Math.min(data.chunks.length - 1, h.chunkIndex + n),
+      score: h.score, hit: h.chunkIndex,
+    });
+  }
+
+  const results = [];
+  for (const [docId, ranges] of byDoc) {
+    const data = docs.get(docId);
+    // 旧フォーマット (pages/overlap 未保存) は当時の既定値 100 で連結する
+    const ov = Number.isFinite(data.overlap) ? data.overlap : 100;
+    ranges.sort((a, b) => a.from - b.from);
+    const merged = [];
+    for (const r of ranges) {
+      const last = merged[merged.length - 1];
+      if (last && r.from <= last.to + 1) {
+        last.to = Math.max(last.to, r.to);
+        last.score = Math.max(last.score, r.score);
+        last.hits.push(r.hit);
+      } else {
+        merged.push({ from: r.from, to: r.to, score: r.score, hits: [r.hit] });
+      }
+    }
+    for (const m of merged) {
+      // 連結時は重なりぶんを削る (チャンクは overlap 文字ずつ重複しているため)
+      let text = data.chunks[m.from];
+      for (let i = m.from + 1; i <= m.to; i++) {
+        text += ov > 0 ? data.chunks[i].slice(ov) : data.chunks[i];
+      }
+      const pFrom = pageOf(data, m.from);
+      const pTo = pageOf(data, m.to);
+      results.push({
+        filename: data.filename,
+        chunkIndex: m.hits[0],
+        chunkRange: [m.from, m.to],
+        page: pFrom,
+        pageRange: (pFrom !== null && pTo !== null && pFrom !== pTo) ? [pFrom, pTo] : null,
+        text, score: m.score,
+      });
+    }
+  }
+  results.sort((a, b) => b.score - a.score);
+  return { results };
 }
 
 // ─── RAG API エンドポイント (要 ml:read / ml:write 権限) ───
@@ -8970,11 +9114,16 @@ app.delete('/rag/documents/:docId', requireAuth, requirePermission('ml:write'), 
 });
 
 // RAG 検索 (テスト用、agent_proxy も内部でこれと同じ ragSearch を使う)
+// body: { query, topK?, neighbors? }
+//   topK      … 拾うチャンク数 (省略時 config.ragTopK)
+//   neighbors … ヒットの前後何チャンクを連結して返すか (省略時 config.ragNeighborChunks)
 app.post('/rag/search', requireAuth, requirePermission('ml:read'), requireEmbedding, jsonParser, async (req, res) => {
-  const { query, topK } = req.body || {};
+  const { query, topK, neighbors } = req.body || {};
   if (!query) return res.status(400).json({ error: 'query が必要です' });
   try {
-    const result = await ragSearch(query, Math.min(topK || 5, 20));
+    const k = Math.min(parseInt(topK) || appConfig.ragTopK || 10, 50);
+    const n = (neighbors === undefined || neighbors === null) ? null : Math.min(parseInt(neighbors) || 0, 10);
+    const result = await ragSearch(query, k, n);
     res.json(result);
   } catch (e) {
     res.status(500).json({ error: e.message });

@@ -2386,6 +2386,11 @@ function App() {
         if (gdriveActive && sp.googleDrive) {
           agentSystem += '\n\n' + sp.googleDrive;
         }
+        // 永続RAGが使える時だけ、引用の忠実性に関する指示を足す
+        // (原文の数式・記号を一般形に書き換えるのを抑え、出典ページを添えさせる)
+        if (persistentRagAvailable && persistentRagDocCount > 0 && sp.rag) {
+          agentSystem += '\n\n' + sp.rag;
+        }
         if (sp.python) {
           agentSystem += '\n\n' + sp.python;
         }
@@ -2840,7 +2845,9 @@ function App() {
                 const res = await fetch('/rag/search', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ query, topK: 5 }),
+                  // topK は config.ragTopK を尊重する (以前は 5 固定で設定が効いていなかった)。
+                  // neighbors は省略してサーバー側の config.ragNeighborChunks に委ねる。
+                  body: JSON.stringify({ query, topK: appConfig.ragTopK || 10 }),
                 });
                 if (res.ok) {
                   const data = await res.json();
@@ -2870,9 +2877,12 @@ function App() {
               } else if (ragResults.length === 0) {
                 ragResultText = 'サーバー登録ドキュメントから関連する情報は見つかりませんでした。';
               } else {
-                ragResultText = ragResults.map((r, i) =>
-                  `[サーバー資料${i + 1}: ${r.filename} (スコア: ${r.score.toFixed(3)})]\n${r.text}`
-                ).join('\n\n');
+                // 出典にページ番号を含める。これが無いとモデルが章番号を推測で書いてしまう
+                ragResultText = ragResults.map((r, i) => {
+                  const pg = r.pageRange ? ` p.${r.pageRange[0]}-${r.pageRange[1]}`
+                    : (r.page != null ? ` p.${r.page}` : '');
+                  return `[サーバー資料${i + 1}: ${r.filename}${pg} (スコア: ${r.score.toFixed(3)})]\n${r.text}`;
+                }).join('\n\n');
               }
               apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: ragResultText });
 
