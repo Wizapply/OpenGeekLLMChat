@@ -1092,6 +1092,8 @@ function App() {
   // 永続RAG (サーバー側 ml/rag/) の状態
   // embedding 利用可能 + 登録ドキュメント数 > 0 のとき、通常チャットでも自動的に
   // search_persistent_documents ツールが追加される
+  // 出典ビューア (【S1】をクリックすると、渡された本文と元PDFの該当ページを表示)
+  const [sourceViewer, setSourceViewer] = useState(null);
   const [persistentRagAvailable, setPersistentRagAvailable] = useState(false);
   const [persistentRagDocCount, setPersistentRagDocCount] = useState(0);
   const [persistentRagDocNames, setPersistentRagDocNames] = useState([]);
@@ -2455,6 +2457,13 @@ function App() {
             filename: r.filename,
             label: shortSourceLabel(r.filename),
             pageText: pg,
+            // 出典をクリックした時に見せる「実際に渡された本文」。
+            // 履歴JSONが肥大しないよう上限を設ける
+            text: String(r.text || '').slice(0, 4000),
+            // OCR由来の資料なら同名のPDFが uploads にある (foo.md → foo.pdf)。
+            // PDFの物理ページ番号は <!-- page=N --> と一致するので #page= で直接開ける
+            pdf: /\.md$/i.test(r.filename) ? r.filename.replace(/\.md$/i, '.pdf') : null,
+            pdfPage: r.pageRange ? r.pageRange[0] : (r.page != null ? r.page : null),
           };
           ragSourceRegistry.push(entry);
           return entry;
@@ -6139,6 +6148,55 @@ ${conversationText}
               </div>
             </div>
           )}
+          {/* 出典ビューア: LLMに実際に渡された本文と、元PDFの該当ページを並べて出す。
+              モデルの要約ではなく生の引用元を見せるので、原典との突き合わせがその場でできる */}
+          {sourceViewer && (
+            <div className="role-modal-overlay" onClick={() => setSourceViewer(null)}>
+              <div className="src-modal" onClick={e => e.stopPropagation()}>
+                <div className="role-modal-header">
+                  <span>
+                    <span className="rag-source-key">{sourceViewer.key}</span>
+                    {' '}{sourceViewer.filename.replace(/\.md$/, '')}
+                    {sourceViewer.pageText && ` p.${sourceViewer.pageText}`}
+                  </span>
+                  <button className="role-modal-close" onClick={() => setSourceViewer(null)}>×</button>
+                </div>
+                <div className="src-modal-body">
+                  <div className="src-pane">
+                    <div className="src-pane-title">
+                      LLMに渡された本文
+                      <button className="src-copy-btn"
+                        onClick={() => navigator.clipboard?.writeText(sourceViewer.text || '')}>コピー</button>
+                    </div>
+                    <div className="src-text">{sourceViewer.text || '(本文が保存されていません)'}</div>
+                  </div>
+                  <div className="src-pane">
+                    <div className="src-pane-title">
+                      元のPDF
+                      {sourceViewer.pdf && (
+                        <a className="src-copy-btn"
+                          href={`/uploads/${encodeURIComponent(sourceViewer.pdf)}${sourceViewer.pdfPage ? `#page=${sourceViewer.pdfPage}` : ''}`}
+                          target="_blank" rel="noreferrer noopener">別タブで開く</a>
+                      )}
+                    </div>
+                    {sourceViewer.pdf ? (
+                      <iframe
+                        className="src-pdf"
+                        title="出典PDF"
+                        src={`/uploads/${encodeURIComponent(sourceViewer.pdf)}${sourceViewer.pdfPage ? `#page=${sourceViewer.pdfPage}&view=FitH` : ''}`}
+                      />
+                    ) : (
+                      <div className="src-text">この資料には対応するPDFがありません。</div>
+                    )}
+                  </div>
+                </div>
+                <div className="role-editor-hint">
+                  💡 ページ番号はPDFの物理ページです（本に印刷されたノンブルとずれることがあります）。
+                  PDFが表示されない場合は、元ファイルが uploads から削除されています。
+                </div>
+              </div>
+            </div>
+          )}
           {messages.length === 0 ? (
             <div className="welcome-screen">
               <div className="welcome-icon"></div>
@@ -6241,11 +6299,17 @@ ${conversationText}
                       <div className="rag-sources">
                         <div className="rag-sources-title">📚 出典</div>
                         {(msg.ragSources || []).map(s => (
-                          <div key={s.key} className="rag-source-item">
+                          <button
+                            key={s.key}
+                            className="rag-source-item"
+                            onClick={() => setSourceViewer(s)}
+                            title="クリックで引用元の本文とPDFを表示"
+                          >
                             <span className="rag-source-key">{s.key}</span>
                             <span className="rag-source-name" title={s.filename}>{s.filename.replace(/\.md$/, '')}</span>
                             {s.pageText && <span className="rag-source-page">p.{s.pageText}</span>}
-                          </div>
+                            <span className="rag-source-open">🔍</span>
+                          </button>
                         ))}
                         {unknown.length > 0 && (
                           <div className="rag-source-warn">
