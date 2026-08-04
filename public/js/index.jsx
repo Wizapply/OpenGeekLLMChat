@@ -2011,8 +2011,12 @@ function App() {
       // ツール判断ループ(agentic)に入る条件。
       // ドキュメント添付 or Web検索ON に加え、画像生成/音声合成/Google Drive が有効なら
       // 「描いて」「音声にして」「ドライブの資料見て」等を検出できるよう常にツール判断を通す。
+      // 永続RAGに資料があるならツール判断は必要。これが条件から漏れていると、
+      // Web検索も画像生成も切った「資料を読むだけ」の構成で
+      // search_persistent_documents に一生たどり着けない
       const useAgentic = appConfig.ragMode === 'agentic'
-        && (documents.length > 0 || webSearchActive || appConfig.imageGen || appConfig.ttsGen || gdriveActive);
+        && (documents.length > 0 || webSearchActive || appConfig.imageGen || appConfig.ttsGen || gdriveActive
+            || (persistentRagAvailable && persistentRagDocCount > 0));
 
       if (useAgentic) {
         // ─── Agentic RAG + Web検索: LLMがツールで検索を判断 ───
@@ -2702,7 +2706,13 @@ function App() {
         }
         if (persistentRagAvailable && persistentRagDocCount > 0) {
           const persistentSummary = summarizePersistentRagDocs(5);
-          toolListLines.push(`- search_persistent_documents: サーバー登録済みドキュメント (${persistentSummary}) から検索 ★社内文書・マニュアル・FAQ等の参照に使う`);
+          // 「社内文書・マニュアル・FAQ」とだけ書くと、専門書が登録されていても
+          // 判断モデルが対象外と見なして web_search に流れる。資料名を前に出す
+          toolListLines.push(
+            `- search_persistent_documents: サーバーに登録済みの資料 (${persistentSummary}) から検索。` +
+            `★これらの資料で扱っていそうな話題なら、web_search より先に必ずこれを使う。` +
+            `専門書・技術資料・社内文書・マニュアル等が登録されている`
+          );
         }
         if (webSearchActive) {
           toolListLines.push('- web_search: インターネット検索（最新情報が必要な場合）');
@@ -2747,18 +2757,30 @@ function App() {
         const judgeNumPredict = needsLargeGen ? largePredict : smallPredict;
         console.log(`[ツール判断] max_tokens=${judgeNumPredict}, history=${judgeHistory.length}件 (needsLargeGen=${needsLargeGen})`);
 
-        // ─── 出典を問い直された時は、判断を待たずに検索し直す ───
-        // ツール結果は次のターンの履歴に残らない。にもかかわらず判断モデルは
-        // 「さっき答えたばかり」と見て検索を省くので、モデルの手元には
-        // 資料が無いまま出典だけを聞かれる状態になり、人名・文献名・
-        // ファイル名を作文してしまう（実際に「中村」や存在しない .md が出た）。
-        // この形の問い直しでは検索を必ず1回挟んでから答えさせる。
-        if (persistentRagAvailable && persistentRagDocCount > 0 && SOURCE_QUESTION_RE.test(text)) {
-          // 「ソースは?」だけでは検索語として弱い。直前の質問を軸に据える
-          const prevUser = [...messages].reverse()
-            .find(m => m.role === 'user' && typeof m.content === 'string' && m.content);
-          const forcedQuery = [prevUser?.content, text].filter(Boolean).join(' ').slice(0, 400);
-          console.log(`[出典要求を検出] 永続RAGを強制検索: "${forcedQuery}"`);
+        // ─── 判断モデルを待たずに永続RAGを引く場合 ───
+        //
+        // (a) 出典を問い直された時
+        //     ツール結果は次のターンの履歴に残らない。にもかかわらず判断モデルは
+        //     「さっき答えたばかり」と見て検索を省くので、モデルの手元には
+        //     資料が無いまま出典だけを聞かれる状態になり、人名・文献名・
+        //     ファイル名を作文してしまう（実際に「中村」や存在しない .md が出た）。
+        //
+        // (b) ragAlwaysSearch が true の時
+        //     資料を読むための道具として使うなら、毎回引いた方が確実。
+        //     判断モデル (30B級) は専門書の質問に web_search を選んだり、
+        //     存在しないテーブルへの SQL を書いたりする。信用しない選択肢を残す。
+        const ragUsable = persistentRagAvailable && persistentRagDocCount > 0;
+        const isSourceQuestion = ragUsable && SOURCE_QUESTION_RE.test(text);
+        const alwaysSearchRag = ragUsable && appConfig.ragAlwaysSearch === true;
+        if (isSourceQuestion || alwaysSearchRag) {
+          let forcedQuery = text.slice(0, 400);
+          if (isSourceQuestion) {
+            // 「ソースは?」だけでは検索語として弱い。直前の質問を軸に据える
+            const prevUser = [...messages].reverse()
+              .find(m => m.role === 'user' && typeof m.content === 'string' && m.content);
+            forcedQuery = [prevUser?.content, text].filter(Boolean).join(' ').slice(0, 400);
+          }
+          console.log(`[永続RAGを強制検索] ${isSourceQuestion ? '出典要求を検出' : 'ragAlwaysSearch'}: "${forcedQuery}"`);
           const forcedArgs = JSON.stringify({ query: forcedQuery });
           const forcedCall = {
             id: 'call_forced_rag',

@@ -485,6 +485,7 @@
   "ragChunkSize": 500,
   "ragChunkOverlap": 100,
   "ragNeighborChunks": 2,
+  "ragAlwaysSearch": false,
   "ragLedgerTurns": 1,
   "ragLedgerChars": 400,
   "systemPrompts": {
