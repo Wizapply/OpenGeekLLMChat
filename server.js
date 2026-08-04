@@ -5081,9 +5081,20 @@ app.get('/plots/*', requireAuth, (req, res) => {
 
 // ─── 静的ファイル配信 ───
 // /plots/ は認証付きの専用ルート（上記）で処理するため、静的配信の対象外にする
+//
+// .jsx / .css / .html にはビルド時のハッシュが付かないので、ファイル名が
+// 変わらないまま中身だけが差し替わる。ブラウザが再検証を省くと、更新したのに
+// 古い画面が動き続ける (しかも .jsx は Babel Standalone が XHR で取りに行くため
+// Ctrl+F5 でも取り直されないことがある)。no-cache を明示して毎回 ETag で
+// 確認させる。変わっていなければ 304 が返るだけなので転送量は増えない。
+const NO_CACHE_EXT = /\.(jsx|js|css|html)$/i;
 app.use((req, res, next) => {
   if (req.path.startsWith('/plots/')) return next();
-  express.static(path.join(__dirname, 'public'))(req, res, next);
+  express.static(path.join(__dirname, 'public'), {
+    setHeaders: (res, filePath) => {
+      if (NO_CACHE_EXT.test(filePath)) res.setHeader('Cache-Control', 'no-cache');
+    },
+  })(req, res, next);
 });
 
 // ═══════════════════════════════════════════════════════════════════
