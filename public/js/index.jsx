@@ -1091,6 +1091,21 @@ function App() {
       : shown;
   }
 
+  // 永続RAGの出典に使う「短い呼び名」を作る。
+  // 長い日本語ファイル名 (テラメカニックス-走行力学-.md) をモデルに何度も
+  // 書き写させると毎回違う形に崩れる (テラメカニクックス / テラメカノックス 等) ため、
+  // 拡張子を落とし、最初の区切り記号までを呼び名として使う。
+  //   テラメカニックス-走行力学-.md            → テラメカニックス
+  //   入門シリーズ32 斜面の安定・変形…-.md      → 入門シリーズ32
+  //   S.P.Cウォール工法.md                     → S.P.Cウォール工法
+  function shortSourceLabel(filename) {
+    let s = String(filename || '').replace(/\.[^.]+$/, '');
+    const cut = s.split(/[-–—―~〜_\s　]/).filter(Boolean)[0];
+    if (cut) s = cut;
+    if (s.length > 14) s = s.slice(0, 14);
+    return s.trim() || String(filename || '資料');
+  }
+
   // URLパスからチャットIDを取得（例: /chat/abc123 → "abc123"）
   function getChatIdFromUrl() {
     const m = window.location.pathname.match(/^\/chat\/([a-z0-9]+)$/i);
@@ -2881,19 +2896,29 @@ function App() {
                 // 見出しの角括弧だけだとメタ情報として読み飛ばされるため、本文の後ろにも
                 // 同じ出典を置き、末尾に「どう引用するか」を検索結果の中で直接指示する。
                 // (システムプロンプトでの指示だけでは従わないモデルがあるため)
+                // 引用には短い呼び名を使わせる。長い日本語ファイル名をそのまま
+                // 何度も書き写させると、モデルが毎回違う形に崩す
+                // (「テラメカニクックス」「テラメカノックス」等) ため。
+                const usedLabels = new Set();
                 const citations = [];
                 ragResultText = ragResults.map((r, i) => {
                   const pg = r.pageRange ? ` p.${r.pageRange[0]}-${r.pageRange[1]}`
                     : (r.page != null ? ` p.${r.page}` : '');
-                  const cite = `${r.filename}${pg}`;
-                  citations.push(cite);
-                  return `[資料${i + 1}] 出典: (${cite})  類似度: ${r.score.toFixed(3)}\n`
+                  let label = shortSourceLabel(r.filename);
+                  if (usedLabels.has(label) && !citations.some(c => c.startsWith(`(${label} `))) {
+                    label = `${label}${i + 1}`;  // 別資料が同じ呼び名になった時だけ番号を足す
+                  }
+                  usedLabels.add(label);
+                  const cite = `${label}${pg}`;
+                  citations.push(`(${cite})`);
+                  return `[資料${i + 1}] 出典: (${cite})  元ファイル: ${r.filename}  類似度: ${r.score.toFixed(3)}\n`
                     + `${r.text}\n`
                     + `↑ ここまでが (${cite}) の内容`;
                 }).join('\n\n');
                 ragResultText += '\n\n───\n'
-                  + '上記を回答に使うときは、各記述の末尾に出典を (ファイル名 p.ページ番号) の形式で必ず書いてください。\n'
-                  + '使用できる出典: ' + citations.map(c => `(${c})`).join(' / ') + '\n'
+                  + '上記を回答に使うときは、各記述の末尾に出典を書いてください。\n'
+                  + '使用できる出典（この通りにコピーしてください）: ' + citations.join(' / ') + '\n'
+                  + '「元ファイル」の長い名前は書き写さないでください。上の短い形式だけを使ってください。\n'
                   + 'ここに無い出典を書いてはいけません。章や節の番号を推測で書くことも禁止です。';
               }
               apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: ragResultText });
