@@ -227,6 +227,26 @@ renderer.code = function(arg1, arg2) {
   }
   return '<div class="code-block-wrapper"><div class="code-header"><span>' + (language || 'code') + '</span><div class="code-header-actions">' + actionBtns + '<button class="copy-btn" onclick="copyCode(this, \'' + id + '\')">コピー</button></div></div><pre><code id="' + id + '" class="hljs language-' + language + '">' + highlighted + '</code></pre><div id="output-' + id + '"></div></div>';
 };
+// ─── カスタムRenderer: 飛べないリンクは素のテキストに落とす ───
+// RAG の出典をモデルが Markdown のリンク記法で書き出すことがある。
+// 例: 「[219](テラメカニックス-走行力学-.md)」
+// これは相対パスなので現在のURL (/chat/xxx) に連結され、存在しないページへの
+// リンクになる。しかもファイル名はモデルが書き崩していて手掛かりにもならない。
+// http(s)/mailto/アンカー/絶対パス以外はリンクにせず、文字として表示する。
+renderer.link = function (arg1, title, text) {
+  // marked v12 は (href, title, text)。将来版のオブジェクト形式にも備える
+  const isObj = typeof arg1 === 'object' && arg1 !== null;
+  const href = String(isObj ? (arg1.href || '') : (arg1 || ''));
+  const ttl = String(isObj ? (arg1.title || '') : (title || ''));
+  const label = String(isObj ? (arg1.text || '') : (text || ''));
+  // /chat/<何か>.md は存在しない。モデルがフルURLで出典を捏造した時の形なので弾く
+  const bogusDoc = /\/chat\/[^?#]*\.md$/i.test(href);
+  const navigable = /^(https?:\/\/|mailto:|#|\/)/i.test(href) && !bogusDoc;
+  if (!navigable) return label || href;
+  const q = (s) => s.replace(/"/g, '&quot;');
+  return '<a href="' + q(href) + '"' + (ttl ? ' title="' + q(ttl) + '"' : '')
+    + ' target="_blank" rel="noreferrer noopener">' + label + '</a>';
+};
 marked.use({ renderer });
 
 // ─── コピー関数（グローバル）───
