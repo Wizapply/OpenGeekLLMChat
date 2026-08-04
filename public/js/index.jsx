@@ -2919,16 +2919,23 @@ function App() {
                 // 引用には短い呼び名を使わせる。長い日本語ファイル名をそのまま
                 // 何度も書き写させると、モデルが毎回違う形に崩す
                 // (「テラメカニクックス」「テラメカノックス」等) ため。
-                const usedLabels = new Set();
+                // 同じ資料の別ページは同じ呼び名を使う。連番を足すのは
+                // 「別のファイルが同じ呼び名になった」時だけ
+                const labelByFile = new Map();
                 const citations = [];
                 ragResultText = ragResults.map((r, i) => {
                   const pg = r.pageRange ? ` p.${r.pageRange[0]}-${r.pageRange[1]}`
                     : (r.page != null ? ` p.${r.page}` : '');
-                  let label = shortSourceLabel(r.filename);
-                  if (usedLabels.has(label) && !citations.some(c => c.startsWith(`(${label} `))) {
-                    label = `${label}${i + 1}`;  // 別資料が同じ呼び名になった時だけ番号を足す
+                  let label;
+                  if (labelByFile.has(r.filename)) {
+                    label = labelByFile.get(r.filename);
+                  } else {
+                    label = shortSourceLabel(r.filename);
+                    const taken = new Set(labelByFile.values());
+                    let n = 2;
+                    while (taken.has(label)) { label = `${shortSourceLabel(r.filename)}${n}`; n++; }
+                    labelByFile.set(r.filename, label);
                   }
-                  usedLabels.add(label);
                   // 出典は【】で囲む。[...] と (...) を使うと Markdown のリンク記法
                   // [表示テキスト](URL) と同じ並びになり、モデルが出典をリンクとして
                   // 書き出してしまう (marked がそれをレンダリングして壊れる) ため。
