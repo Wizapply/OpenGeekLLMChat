@@ -1128,6 +1128,49 @@ function App() {
     return s.trim() || String(filename || '資料');
   }
 
+  // ─── 出典の捏造対策 ─────────────────────────────────────
+  // ツール結果は次のターンの履歴に載らない。にもかかわらず履歴の中の
+  // 回答本文には【S3】のような出典キーが残るので、モデルは手元に無い
+  // 資料をキーだけ見て思い出そうとし、「S9 は Bekker の文献」のように
+  // 意味を作り出してしまう。履歴に渡す時点でキーを実際の資料名に開き、
+  // 対応表に無い（＝捏造された）キーは落としておく。
+  function resolveStaleSourceKeys(m) {
+    const content = String(m.content || '');
+    if (m.role !== 'assistant' || !/【\s*S\d+\s*】/.test(content)) return content;
+    const map = new Map((m.ragSources || []).map(s => [s.key, s]));
+    return content.replace(/【\s*(S\d+)\s*】/g, (_whole, key) => {
+      const s = map.get(key);
+      return s ? `（出典: ${s.label}${s.pageText ? ' p.' + s.pageText : ''}）` : '';
+    });
+  }
+
+  // 「ソースは?」「どこに書いてある?」のような問い直しは、判断モデルに
+  // 任せると「さっき答えたばかり」と見なして検索を省く。だが手元に資料は
+  // 残っていないので、省いた瞬間に出典は作文になる。この形の発話では
+  // 検索を強制する。
+  const SOURCE_QUESTION_RE = new RegExp([
+    '出典', '引用元', '原典', '根拠', '裏付け', 'エビデンス', '参考文献',
+    // 「ソースコード」「リソース」を巻き込まないよう助詞まで見る
+    'ソース\\s*(は|を|が|って|教え|示し|出し|[?？])',
+    'どこに書', 'どこに載', 'どこから', '何ページ', '何頁', 'どのページ',
+    'どの資料', 'どのファイル', 'どの本', 'md\\s?ファイル',
+    '該当(の|する)?(箇所|部分|ページ|ファイル|記述)',
+    '(載って|書いて|記載され)(ない|ません|いない|いません|ますか)',
+    '(存在し|実在し)(ない|ません)',
+    '本当\\s*[?？]', '本当ですか', '確か(なの|ですか)',
+    'S\\d+\\s*(って|とは|は何|は[?？])',
+  ].join('|'));
+
+  // 資料を引いたように読める書きぶり。検索していないのにこれが出ていたら、
+  // 出典そのものがモデルの作文である可能性が高い。
+  // 「によると」のような一般的な言い回しは入れない（雑談で誤爆するため）
+  const CITATION_SHAPE_RE = /【\s*S\d+\s*】|[^\s「」『』()（）]+\.md\b|出典|参考文献|原典|に記載され|に書かれて|p\.\s?\d+/;
+
+  // 本文に出てくる .md ファイル名を拾う（登録済みかどうかの照合用）
+  function mdNamesIn(text) {
+    return [...new Set((String(text || '').match(/[^\s「」『』()（）\[\]【】、,]+\.md\b/g) || []))];
+  }
+
   // URLパスからチャットIDを取得（例: /chat/abc123 → "abc123"）
   function getChatIdFromUrl() {
     const m = window.location.pathname.match(/^\/chat\/([a-z0-9]+)$/i);
@@ -1529,9 +1572,11 @@ function App() {
 
     // 直近履歴（履歴中の画像までは送らない。テキストのみ）
     const RECENT = appConfig.recentMessageCount || 6;
+    // 出典キーは「そのターン限りの通し番号」なので、履歴に渡す前に実際の
+    // 資料名へ開いておく（詳細は resolveStaleSourceKeys のコメント）
     const history = messages.slice(-RECENT)
       .filter(m => typeof m.content === 'string' && m.content)
-      .map(m => ({ role: m.role, content: m.content }));
+      .map(m => ({ role: m.role, content: resolveStaleSourceKeys(m) }));
 
     // 参照ドキュメント: チャット添付分はブラウザ側に埋め込みがあるのでここで検索する。
     // サーバー側の永続RAGは /orchestra/run 内で検索され、両者が統合される。
@@ -1831,7 +1876,7 @@ function App() {
       if (oldMessages.length > 0) {
         const summary = oldMessages.map(m => {
           const role = m.role === 'user' ? 'ユーザー' : 'アシスタント';
-          const content = (m.content || '').slice(0, 500);  // 各500文字に圧縮
+          const content = resolveStaleSourceKeys(m).slice(0, 500);  // 各500文字に圧縮
           return `[${role}] ${content}`;
         }).join('\n\n');
         history.push({
@@ -1844,7 +1889,9 @@ function App() {
       recentMessages.forEach((m, i) => {
         const isLast = i === recentMessages.length - 1;
         const hasImages = m.images && m.images.length > 0;
-        let textContent = m.content || '';
+        // 出典キーは「そのターン限りの通し番号」なので、履歴に渡す前に
+        // 実際の資料名へ開いておく（詳細は resolveStaleSourceKeys のコメント）
+        let textContent = resolveStaleSourceKeys(m);
         if (isLast && m.role === 'user' && textContent) {
           textContent = `【今この質問に回答してください】\n${textContent}`;
         }
@@ -2468,6 +2515,94 @@ function App() {
           ragSourceRegistry.push(entry);
           return entry;
         };
+
+        // 永続RAG検索の実体。ツール呼び出しからも、出典を問われた時の強制検索からも
+        // ここを通す。結果の整形と出典レジストリの更新を二重に持ちたくないため。
+        const searchPersistentRag = async (query) => {
+          searchQueries.push({ query: `永続RAG検索: ${query}`, resultCount: null, type: 'rag' });
+          setMessages(prev => {
+            const copy = [...prev];
+            copy[copy.length - 1] = {
+              ...copy[copy.length - 1],
+              agentStatus: `📚 永続RAG検索「${query}」中...`,
+              searchQueries: [...searchQueries],
+            };
+            return copy;
+          });
+
+          let ragResults = [];
+          let ragError = null;
+          try {
+            const res = await fetch('/rag/search', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              // topK は config.ragTopK を尊重する (以前は 5 固定で設定が効いていなかった)。
+              // neighbors は省略してサーバー側の config.ragNeighborChunks に委ねる。
+              body: JSON.stringify({ query, topK: appConfig.ragTopK || 10 }),
+            });
+            if (res.ok) {
+              const data = await res.json();
+              ragResults = data.results || [];
+            } else {
+              const data = await res.json().catch(() => ({}));
+              ragError = data.error || `HTTP ${res.status}`;
+            }
+          } catch (e) {
+            ragError = e.message;
+          }
+          searchQueries[searchQueries.length - 1].resultCount = ragResults.length;
+
+          let ragResultText;
+          if (ragError) {
+            ragResultText = `永続RAG検索エラー: ${ragError}`;
+          } else if (ragResults.length === 0) {
+            ragResultText = 'サーバー登録ドキュメントから関連する情報は見つかりませんでした。'
+              + '\n見つからなかったのだから、資料名・ページ・著者名を書いてはいけません。'
+              + '「登録資料には該当する記述が見つかりませんでした」とだけ答えてください。';
+          } else {
+            // 出典は ASCII の短いキー (S1, S2, …) で書かせる。
+            // 日本語の資料名を転写させると「テラメカニックス」が
+            // 「テラメカニンクス」「テラメカロニク ス」等に毎回崩れるため
+            // (Qwen3.6 で確認)。実際のファイル名とページは画面側が
+            // ragSources から描くので、モデルを経由しない。
+            const citations = [];
+            ragResultText = ragResults.map((r) => {
+              const s = ragSourceKey(r);
+              citations.push(`【${s.key}】`);
+              return `── 資料 ${s.key} ──\n`
+                + `出典キー: ${s.key}   (${s.label}${s.pageText ? ' p.' + s.pageText : ''})   類似度: ${r.score.toFixed(3)}\n`
+                + `${r.text}\n`
+                + `── ここまでが ${s.key} の内容 ──`;
+            }).join('\n\n');
+            ragResultText += '\n\n════\n'
+              + '上記を回答に使うときは、各記述の末尾に出典キーを書いてください。\n'
+              + '使用できる出典キー: ' + citations.join(' / ') + '\n'
+              + '【S1】のように、キーだけを【】で囲んで書いてください。'
+              + '資料名やページ番号を自分で書き足さないでください（画面側が対応表を表示します）。\n'
+              + '角括弧と丸括弧を並べたリンク記法（[...](...)）で書いてはいけません。\n'
+              + 'ここに無いキーを書いてはいけません。章や節の番号を推測で書くことも禁止です。\n'
+              + '上に載っていない人名・著者名・文献名・ファイル名を書いてはいけません。'
+              + '聞かれても「取得した範囲には出てきません」と答えてください。';
+          }
+
+          setMessages(prev => {
+            const copy = [...prev];
+            copy[copy.length - 1] = {
+              ...copy[copy.length - 1],
+              agentStatus: null,
+              searchQueries: [...searchQueries],
+              // 「このターンで実際に検索したか」を残す。検索していないのに
+              // 出典めいた書きぶりをしていたら画面側で警告するため
+              ragSearched: true,
+              // 出典の対応表をメッセージに持たせる。表示はモデルの出力ではなく
+              // このデータから描くので、資料名が書き崩されることがない
+              ...(ragSourceRegistry.length > 0 ? { ragSources: ragSourceRegistry.map(s => ({ ...s })) } : {}),
+            };
+            return copy;
+          });
+          return ragResultText;
+        };
+
         // ツールが実際に生成したメディアの本物URL。
         // LLMが [[gen_audio:...]]/[[gen_image:...]] のファイル名を改変して出力する
         // ことがあるため、最終応答でこの実URLでマーカーを確定させる。
@@ -2548,6 +2683,31 @@ function App() {
 
         const judgeNumPredict = needsLargeGen ? largePredict : smallPredict;
         console.log(`[ツール判断] max_tokens=${judgeNumPredict}, history=${judgeHistory.length}件 (needsLargeGen=${needsLargeGen})`);
+
+        // ─── 出典を問い直された時は、判断を待たずに検索し直す ───
+        // ツール結果は次のターンの履歴に残らない。にもかかわらず判断モデルは
+        // 「さっき答えたばかり」と見て検索を省くので、モデルの手元には
+        // 資料が無いまま出典だけを聞かれる状態になり、人名・文献名・
+        // ファイル名を作文してしまう（実際に「中村」や存在しない .md が出た）。
+        // この形の問い直しでは検索を必ず1回挟んでから答えさせる。
+        if (persistentRagAvailable && persistentRagDocCount > 0 && SOURCE_QUESTION_RE.test(text)) {
+          // 「ソースは?」だけでは検索語として弱い。直前の質問を軸に据える
+          const prevUser = [...messages].reverse()
+            .find(m => m.role === 'user' && typeof m.content === 'string' && m.content);
+          const forcedQuery = [prevUser?.content, text].filter(Boolean).join(' ').slice(0, 400);
+          console.log(`[出典要求を検出] 永続RAGを強制検索: "${forcedQuery}"`);
+          const forcedArgs = JSON.stringify({ query: forcedQuery });
+          const forcedCall = {
+            id: 'call_forced_rag',
+            type: 'function',
+            function: { name: 'search_persistent_documents', arguments: forcedArgs },
+          };
+          const forcedText = await searchPersistentRag(forcedQuery);
+          apiMessages.push({ role: 'assistant', content: '', tool_calls: [forcedCall] });
+          apiMessages.push({ role: 'tool', tool_call_id: forcedCall.id, content: forcedText });
+          // 同じ引数での再検索は無駄なので実行済みにしておく
+          executedToolCalls.add(`search_persistent_documents:${forcedArgs}`);
+        }
 
         // ─── ツール実行ループ ───
         // Gemma系モデルはマルチターンのツール呼び出しが不安定（テキスト形式の<|tool_call|>を出力することがある）
@@ -2889,92 +3049,7 @@ function App() {
 
             } else if (fnName === 'search_persistent_documents') {
               // 永続RAG: サーバー側 ml/rag/ に登録済みのドキュメントから embedding 検索
-              const query = fnArgs.query || text;
-              searchQueries.push({ query: `永続RAG検索: ${query}`, resultCount: null, type: 'rag' });
-
-              setMessages(prev => {
-                const copy = [...prev];
-                copy[copy.length - 1] = {
-                  ...copy[copy.length - 1],
-                  agentStatus: `📚 永続RAG検索「${query}」中...`,
-                  searchQueries: [...searchQueries],
-                };
-                return copy;
-              });
-
-              let ragResults = [];
-              let ragError = null;
-              try {
-                const res = await fetch('/rag/search', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  // topK は config.ragTopK を尊重する (以前は 5 固定で設定が効いていなかった)。
-                  // neighbors は省略してサーバー側の config.ragNeighborChunks に委ねる。
-                  body: JSON.stringify({ query, topK: appConfig.ragTopK || 10 }),
-                });
-                if (res.ok) {
-                  const data = await res.json();
-                  ragResults = data.results || [];
-                } else {
-                  const data = await res.json().catch(() => ({}));
-                  ragError = data.error || `HTTP ${res.status}`;
-                }
-              } catch (e) {
-                ragError = e.message;
-              }
-              searchQueries[searchQueries.length - 1].resultCount = ragResults.length;
-
-              setMessages(prev => {
-                const copy = [...prev];
-                copy[copy.length - 1] = {
-                  ...copy[copy.length - 1],
-                  agentStatus: null,
-                  searchQueries: [...searchQueries],
-                };
-                return copy;
-              });
-
-              let ragResultText;
-              if (ragError) {
-                ragResultText = `永続RAG検索エラー: ${ragError}`;
-              } else if (ragResults.length === 0) {
-                ragResultText = 'サーバー登録ドキュメントから関連する情報は見つかりませんでした。';
-              } else {
-                // 出典は ASCII の短いキー (S1, S2, …) で書かせる。
-                // 日本語の資料名を転写させると「テラメカニックス」が
-                // 「テラメカニンクス」「テラメカロニク ス」等に毎回崩れるため
-                // (Qwen3.6 で確認)。実際のファイル名とページは画面側が
-                // ragSources から描くので、モデルを経由しない。
-                const citations = [];
-                ragResultText = ragResults.map((r, i) => {
-                  const s = ragSourceKey(r);
-                  const cite = `【${s.key}】`;
-                  citations.push(cite);
-                  return `── 資料 ${s.key} ──\n`
-                    + `出典キー: ${s.key}   (${s.label}${s.pageText ? ' p.' + s.pageText : ''})   類似度: ${r.score.toFixed(3)}\n`
-                    + `${r.text}\n`
-                    + `── ここまでが ${s.key} の内容 ──`;
-                }).join('\n\n');
-                ragResultText += '\n\n════\n'
-                  + '上記を回答に使うときは、各記述の末尾に出典キーを書いてください。\n'
-                  + '使用できる出典キー: ' + citations.join(' / ') + '\n'
-                  + '【S1】のように、キーだけを【】で囲んで書いてください。'
-                  + '資料名やページ番号を自分で書き足さないでください（画面側が対応表を表示します）。\n'
-                  + '角括弧と丸括弧を並べたリンク記法（[...](...)）で書いてはいけません。\n'
-                  + 'ここに無いキーを書いてはいけません。章や節の番号を推測で書くことも禁止です。';
-              }
-              // 出典の対応表をメッセージに持たせる。表示はモデルの出力ではなく
-              // このデータから描くので、資料名が書き崩されることがない
-              if (ragSourceRegistry.length > 0) {
-                setMessages(prev => {
-                  const copy = [...prev];
-                  copy[copy.length - 1] = {
-                    ...copy[copy.length - 1],
-                    ragSources: ragSourceRegistry.map(s => ({ ...s })),
-                  };
-                  return copy;
-                });
-              }
+              const ragResultText = await searchPersistentRag(fnArgs.query || text);
               apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: ragResultText });
 
             } else if (fnName === 'detect_objects') {
@@ -3714,6 +3789,7 @@ function App() {
             agentStatus: searchQueries.length > 0 ? '回答生成中...' : null,
             searchQueries: searchQueries,
             ragSources: copy[copy.length - 1]?.ragSources,
+            ragSearched: copy[copy.length - 1]?.ragSearched,
           };
           return copy;
         });
@@ -3900,6 +3976,7 @@ function App() {
               agentStatus: '回答生成中...',
               searchQueries: [...searchQueries],
               ragSources: copy[copy.length - 1]?.ragSources,
+              ragSearched: copy[copy.length - 1]?.ragSearched,
             };
             return copy;
           });
@@ -6287,14 +6364,37 @@ ${conversationText}
                       モデルの出力ではなく検索結果のデータから描くので、
                       資料名が書き崩されることがない */}
                   {(() => {
+                    if (msg.role !== 'assistant') return null;
+                    const body = String(msg.content || '');
                     // 本文が使っている出典キーを拾い、対応表に無いものを警告する。
                     // 検索していないのにモデルが【S5】等を捏造することがあり、
                     // 出典が付いているぶん却って信頼できるように見えてしまうため。
                     const known = new Set((msg.ragSources || []).map(s => s.key));
-                    const used = new Set((String(msg.content || '').match(/【\s*(S\d+)\s*】/g) || [])
+                    const used = new Set((body.match(/【\s*(S\d+)\s*】/g) || [])
                       .map(m => m.replace(/[【】\s]/g, '')));
                     const unknown = [...used].filter(k => !known.has(k));
-                    if (!msg.ragSources?.length && unknown.length === 0) return null;
+                    // 本文に出てくる .md のうち、登録されていないファイル名。
+                    // 「テラメカクス/走行力学.md」のような、それらしいだけの
+                    // 存在しないファイル名を名指しで潰す
+                    const knownMd = new Set(persistentRagDocNames);
+                    const fakeMd = mdNamesIn(body).filter(n => !knownMd.has(n));
+                    // 検索していないのに資料を引いたような書きぶりをしている
+                    // ragSearched が付く前に保存されたチャットもあるので、
+                    // 出典対応表が付いていれば検索済みとみなす
+                    const searched = !!msg.ragSearched || !!msg.ragSources?.length;
+                    const notSearched =
+                      persistentRagAvailable && persistentRagDocCount > 0 &&
+                      !searched && !(isLoading && i === messages.length - 1);
+                    const citeyWithoutSearch = notSearched && CITATION_SHAPE_RE.test(body);
+                    // 出典めいた語が無くても内容を作ることはある。まとまった長さの
+                    // 回答には「検索したのか」を必ず出す。短い相槌までは出さない
+                    const quietNotSearched = notSearched && !citeyWithoutSearch && body.length >= 120;
+                    const hasWarn = unknown.length > 0 || fakeMd.length > 0 || citeyWithoutSearch;
+                    if (!msg.ragSources?.length && !hasWarn) {
+                      return quietNotSearched
+                        ? <div className="rag-nosearch">🔍 登録資料は未検索 — この回答はモデルの知識だけで書かれています</div>
+                        : null;
+                    }
                     return (
                       <div className="rag-sources">
                         <div className="rag-sources-title">📚 出典</div>
@@ -6311,10 +6411,23 @@ ${conversationText}
                             <span className="rag-source-open">🔍</span>
                           </button>
                         ))}
+                        {citeyWithoutSearch && (
+                          <div className="rag-source-warn">
+                            ⚠️ この回答はサーバー登録資料を<strong>検索していません</strong>。
+                            資料名・ページ・著者名が書かれていても裏付けはなく、モデルの記憶によるものです。
+                            「◯◯について、登録資料を検索して出典を示してください」と聞き直してください。
+                          </div>
+                        )}
                         {unknown.length > 0 && (
                           <div className="rag-source-warn">
                             ⚠️ 本文に、検索結果に無い出典キー（{unknown.join(', ')}）が使われています。
                             該当箇所は資料の裏付けが無く、モデルの知識で書かれた可能性があります。
+                          </div>
+                        )}
+                        {fakeMd.length > 0 && (
+                          <div className="rag-source-warn">
+                            ⚠️ 本文に、登録されていないファイル名（{fakeMd.join(', ')}）が書かれています。
+                            このファイルは存在しません。
                           </div>
                         )}
                       </div>
