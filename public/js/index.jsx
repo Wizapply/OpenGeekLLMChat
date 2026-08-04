@@ -2909,16 +2909,22 @@ function App() {
                     label = `${label}${i + 1}`;  // 別資料が同じ呼び名になった時だけ番号を足す
                   }
                   usedLabels.add(label);
-                  const cite = `${label}${pg}`;
-                  citations.push(`(${cite})`);
-                  return `[資料${i + 1}] 出典: (${cite})  元ファイル: ${r.filename}  類似度: ${r.score.toFixed(3)}\n`
+                  // 出典は【】で囲む。[...] と (...) を使うと Markdown のリンク記法
+                  // [表示テキスト](URL) と同じ並びになり、モデルが出典をリンクとして
+                  // 書き出してしまう (marked がそれをレンダリングして壊れる) ため。
+                  const cite = `【${label}${pg}】`;
+                  citations.push(cite);
+                  return `── 資料${i + 1} ──\n`
+                    + `出典: ${cite}   元ファイル: ${r.filename}   類似度: ${r.score.toFixed(3)}\n`
                     + `${r.text}\n`
-                    + `↑ ここまでが (${cite}) の内容`;
+                    + `── ここまでが ${cite} の内容 ──`;
                 }).join('\n\n');
-                ragResultText += '\n\n───\n'
+                ragResultText += '\n\n════\n'
                   + '上記を回答に使うときは、各記述の末尾に出典を書いてください。\n'
                   + '使用できる出典（この通りにコピーしてください）: ' + citations.join(' / ') + '\n'
-                  + '「元ファイル」の長い名前は書き写さないでください。上の短い形式だけを使ってください。\n'
+                  + '出典は必ず【】で囲んだ上の形式のみを使ってください。'
+                  + '角括弧と丸括弧を並べたリンク記法（[...](...)）で書いてはいけません。\n'
+                  + '「元ファイル」の長い名前は書き写さないでください。\n'
                   + 'ここに無い出典を書いてはいけません。章や節の番号を推測で書くことも禁止です。';
               }
               apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: ragResultText });
