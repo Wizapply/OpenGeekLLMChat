@@ -645,7 +645,10 @@ function createOcrManager({
       setStatus(job, 'running', { phase: 'ocr' });
       log('-', `[OCR] 開始: ${job.filename} (${job.totalPages}ページ${job.donePages ? `、${job.donePages}ページはキャッシュから再開` : ''})`);
 
-      const retries = Math.max(0, parseInt(c.pageRetries) ?? 1);
+      // parseInt(undefined) は NaN で、NaN は ?? をすり抜ける。素通しすると
+      // attempt <= NaN が常に false になり、1ページも読まずに全滅する
+      const rt = parseInt(c.pageRetries);
+      const retries = Number.isFinite(rt) ? Math.max(0, rt) : 1;
 
       for (let page = 1; page <= job.totalPages; page++) {
         if (ctl.cancelled) throw new Error('__CANCELLED__');

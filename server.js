@@ -8941,7 +8941,9 @@ async function ragIngestFile(filename) {
   // チャンク分割 + embedding
   // チャンクサイズは embedding の ctx を超えないこと (config のコメント参照)
   const chunkSize = Math.max(100, parseInt(appConfig.ragChunkSize) || 500);
-  const rawOverlap = Math.max(0, parseInt(appConfig.ragChunkOverlap) ?? 100);
+  // parseInt(undefined) は NaN で、NaN は ?? をすり抜ける (?? が拾うのは null/undefined だけ)
+  const rawOv = parseInt(appConfig.ragChunkOverlap);
+  const rawOverlap = Number.isFinite(rawOv) ? Math.max(0, rawOv) : 100;
   // 実際に使われる重なり (分割ロジックが chunkSize/2 で頭打ちにする)。
   // 検索時に連結する際、この値ぶんを差し引かないと同じ文章が二重に入る。
   const overlap = Math.min(rawOverlap, Math.floor(chunkSize / 2));

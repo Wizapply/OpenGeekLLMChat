@@ -1177,9 +1177,12 @@ function App() {
   // 「この式はどこに出てきますか」には再検索なしで答えられる。
   // 本文の続きが要る質問は、従来どおり検索し直させる。
   function buildSourceLedger(msgs) {
-    const turns = Math.max(0, parseInt(appConfig.ragLedgerTurns) ?? 1);
+    // parseInt(undefined) は NaN。NaN は ?? をすり抜けるので Number.isFinite で見る
+    // (?? が拾うのは null/undefined だけ)。設定が無いと台帳ごと消えていた
+    const num = (v, dflt) => { const n = parseInt(v); return Number.isFinite(n) ? Math.max(0, n) : dflt; };
+    const turns = num(appConfig.ragLedgerTurns, 1);
     if (!turns) return null;
-    const excerpt = Math.max(0, parseInt(appConfig.ragLedgerChars) ?? 400);
+    const excerpt = num(appConfig.ragLedgerChars, 400);
     // 新しい順に、出典対応表を持つアシスタント発言を turns 件ぶん拾う
     const picked = [];
     for (let i = msgs.length - 1; i >= 0 && picked.length < turns; i--) {
@@ -1966,6 +1969,11 @@ function App() {
       if (ledger) {
         history.splice(Math.max(0, history.length - 1), 0, ledger);
         console.log(`[出典台帳] ${ledger.content.length}文字を履歴に追加`);
+      } else {
+        // 乗らなかった時こそ理由が要る。台帳は黙って消えると気づけない
+        const withSrc = allMessages.filter(m => m.role === 'assistant' && m.ragSources?.length).length;
+        console.log(`[出典台帳] 追加なし (ragLedgerTurns=${appConfig.ragLedgerTurns}, `
+          + `ragLedgerChars=${appConfig.ragLedgerChars}, 出典付きの過去回答=${withSrc}件)`);
       }
 
       // OpenAI互換パラメータ（llama-server）
