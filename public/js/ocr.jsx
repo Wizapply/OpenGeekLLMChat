@@ -193,6 +193,32 @@ function App() {
     }
   }
 
+  // 完了済みジョブの引き直し。ページを指定するとそのページのキャッシュだけ捨てる
+  async function redoJob(job) {
+    const spec = prompt(
+      `「${job.filename}」を再OCRします。\n\n` +
+      `ページ番号を入れると、そのページだけ引き直します (例: 240 / 133, 240 / 10-12)。\n` +
+      `空欄のままOKを押すと全${job.totalPages || '?'}ページを最初からやり直します。`,
+      ''
+    );
+    if (spec === null) return;                       // プロンプトのキャンセル
+    const pages = spec.trim();
+    if (!pages && !confirm(`全${job.totalPages || '?'}ページをOCRし直します。時間がかかりますがよろしいですか?`)) return;
+    try {
+      const r = await fetch(`/ocr/jobs/${job.jobId}/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ redo: true, pages: pages || null }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      showToast(pages ? `指定ページを再OCRします (${pages})` : '全ページを再OCRします', 'success');
+      loadJobs();
+    } catch (e) {
+      showToast(e.message, 'error');
+    }
+  }
+
   async function deleteJob(job) {
     const parts = ['アップロードしたPDF', '生成したMarkdown', 'ページキャッシュ'];
     if (job.ragDocId) parts.push('RAG登録');
@@ -310,6 +336,7 @@ function App() {
                   job={job}
                   onStart={() => jobAction(job.jobId, 'start')}
                   onCancel={() => jobAction(job.jobId, 'cancel')}
+                  onRedo={() => redoJob(job)}
                   onDelete={() => deleteJob(job)}
                 />
               ))}
@@ -424,7 +451,7 @@ function DropZone({ onFiles, disabled, maxMB }) {
   );
 }
 
-function JobCard({ job, onStart, onCancel, onDelete }) {
+function JobCard({ job, onStart, onCancel, onRedo, onDelete }) {
   // 実行中は経過時間を毎秒動かす (サーバーからのpushはページ完了時だけなので)
   const [, tick] = useState(0);
   useEffect(() => {
@@ -502,6 +529,11 @@ function JobCard({ job, onStart, onCancel, onDelete }) {
           </button>
         )}
         {isActive(job) && <button className="btn danger small" onClick={onCancel}>■ キャンセル</button>}
+        {job.status === 'completed' && (
+          <button className="btn small" onClick={onRedo} title="ページを指定して引き直せます">
+            🔄 再OCR
+          </button>
+        )}
         {job.status === 'completed' && job.mdFilename && (
           <>
             <a className="btn small" href={`/files/${encodeURIComponent(job.mdFilename)}?raw=1`} download={job.mdFilename}>

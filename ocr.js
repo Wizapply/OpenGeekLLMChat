@@ -935,21 +935,66 @@ function createOcrManager({
     return jobView(findJob(jobId));
   }
 
-  /** ジョブを実行キューに載せる */
-  async function startJob(jobId) {
+  /**
+   * "12, 30-33, 240" のようなページ指定をページ番号の配列にする。
+   * 空文字・null は「全ページ」を意味する null を返す。
+   */
+  function parsePageSpec(spec, totalPages) {
+    if (spec == null || String(spec).trim() === '') return null;
+    const bad = (s) => { const e = new Error(`ページ指定が不正です: ${s}`); e.status = 400; throw e; };
+    const out = new Set();
+    for (const part of String(spec).split(',')) {
+      const s = part.trim();
+      if (!s) continue;
+      const m = /^(\d+)\s*(?:-\s*(\d+))?$/.exec(s);
+      if (!m) bad(s);
+      const from = parseInt(m[1], 10);
+      const to = m[2] ? parseInt(m[2], 10) : from;
+      if (from < 1 || to < from) bad(s);
+      if (totalPages && to > totalPages) {
+        const e = new Error(`ページ番号が範囲外です: ${to} (全${totalPages}ページ)`); e.status = 400; throw e;
+      }
+      for (let p = from; p <= to; p++) out.add(p);
+    }
+    return out.size ? [...out].sort((a, b) => a - b) : null;
+  }
+
+  /**
+   * ジョブを実行キューに載せる。
+   * redo=true なら完了済みジョブでも走らせる (OCR結果を作り直したい時)。
+   * pages を渡すとそのページのキャッシュだけ捨てるので、指定ページだけ引き直せる。
+   */
+  async function startJob(jobId, { redo = false, pages = null } = {}) {
     const job = findJob(jobId);
     if (!job) { const e = new Error('ジョブが見つかりません'); e.status = 404; throw e; }
     if (ACTIVE_STATUSES.includes(job.status)) {
       const e = new Error('このジョブは既に実行中です'); e.status = 409; throw e;
     }
-    if (job.status === 'completed') {
-      const e = new Error('このジョブは完了済みです'); e.status = 409; throw e;
+    if (job.status === 'completed' && !redo) {
+      const e = new Error('このジョブは完了済みです。作り直す場合は「再OCR」を使ってください'); e.status = 409; throw e;
     }
+    // ページ指定の検証は依存チェックより先に (打ち間違いは即座に返したい)
+    const redoPages = redo ? parsePageSpec(pages, job.totalPages) : null;
+
     // 依存と Vision LLM の生存確認は「開始時」に行う (アップロード自体は通しておく)
     const deps = await checkDeps();
     if (!deps.ok) { const e = new Error(deps.message); e.status = 503; throw e; }
     const vlm = await checkVlm();
     if (!vlm.ok) { const e = new Error(vlm.message); e.status = 503; throw e; }
+
+    if (redo) {
+      // キャッシュを捨てた分だけ processJob が引き直す。失敗マークも一緒に外す
+      const dir = jobCacheDir(jobId);
+      if (redoPages) {
+        for (const p of redoPages) { try { fs.unlinkSync(path.join(dir, pageCacheName(p))); } catch {} }
+        job.failedPages = (job.failedPages || []).filter(p => !redoPages.includes(p));
+      } else {
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+        job.failedPages = [];
+      }
+      job.donePages = countCachedPages(jobId, job.totalPages);
+      log('-', `[OCR] 再OCR: ${job.filename} (${redoPages ? redoPages.map(p => `p${p}`).join(', ') : '全ページ'})`);
+    }
 
     setStatus(job, 'queued', { error: null, interrupted: false });
     pump();

@@ -82,6 +82,7 @@ PDF アップロード
 - **ページ単位でリアルタイム進捗**: SSE (`/ocr/jobs/:id/stream`) で `p42/258 (16%)` のように表示。経過時間と残り時間の推定も出る
 - **中断しても続きから**: ページごとに Markdown をキャッシュしているので、キャンセル・サーバー再起動のあと「▶ 再開」を押せば未処理ページだけを処理します。300ページのPDFで250ページ目に落ちても、やり直しは50ページぶんだけ
 - **1ページ失敗してもジョブは止まらない**: リトライ後スキップして次ページへ進み、失敗ページを記録します（結合後のMarkdownにも `<!-- page=12 failed=1 -->` として残る）
+- **完了後でもページ単位で引き直せる**: 完了ジョブの「🔄 再OCR」でページ番号（`240` / `133, 240` / `10-12`）を指定すると、そのページのキャッシュだけ捨てて取り直し、Markdownの再結合とRAG再登録まで自動で走ります。空欄なら全ページやり直し
 - **依存パッケージ追加なし**: PDF→画像は poppler-utils の `pdftoppm` を `child_process` で呼ぶだけ。npm 依存は増えません
 - **単一GPUを前提に1ジョブずつ順次処理**: Qwen2.5-VL 7B (~9GB) と embedding (~1.5GB) は同じGPUに同居できます。`maxConcurrentJobs` を上げれば将来のマルチGPUにも対応
 - **数式・表・図に対応したプロンプト**: 表は Markdown テーブル、数式は LaTeX (`$...$` / `$$...$$`)、図は `[図: 説明]` で出力させます（`ocr.prompt` で変更可）
@@ -114,7 +115,7 @@ llama-server -m /models/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf \
 | `GET` | `/ocr/jobs` | 全ジョブの状態一覧 |
 | `GET` | `/ocr/jobs/:jobId` | 個別ジョブの詳細 |
 | `GET` | `/ocr/jobs/:jobId/stream` | SSE でリアルタイム進捗配信 |
-| `POST` | `/ocr/jobs/:jobId/start` | 開始 / 中断ジョブの再開 |
+| `POST` | `/ocr/jobs/:jobId/start` | 開始 / 中断ジョブの再開。ボディ `{"redo":true}` で完了済みの引き直し、`{"redo":true,"pages":"133, 240"}` で指定ページだけ |
 | `POST` | `/ocr/jobs/:jobId/cancel` | 実行中ジョブの中断 |
 | `DELETE` | `/ocr/jobs/:jobId` | ジョブ削除（キャッシュ・PDF・Markdown・RAG登録もまとめて） |
 | `GET` | `/ocr/status` | 依存コマンドと Vision LLM の生存確認 |
@@ -1305,6 +1306,7 @@ LLMへの指示文を `config.json` の `systemPrompts` キーで完全カスタ
 | `python` | Python実行案内（常時） | - |
 | `meta` | メタ抑制指示（常時） | - |
 | `judge` | ツール判断専用（軽量） | `{toolList}` |
+| `rag` | サーバー登録ドキュメント（RAG）の引用ルール。原文どおりの数式・記号の書き写し、出典キー `【S1】` の付与、記憶に頼った引用の禁止など | - |
 
 ---
 
