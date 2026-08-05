@@ -578,8 +578,12 @@ function normalizeMath(s) {
     .replace(/[{}\s]/g, '');
 }
 
-// 短い式 ($W$ など) は何にでも一致してしまい情報量が無いので対象外にする
-const MATH_MIN_LEN = 25;
+// 短い式は何にでも一致してしまい情報量が無いので対象外にする。
+// ただしブロック数式 ($$…$$) は「これが式です」という主張なので、
+// 文中で記号に触れているだけのインラインより短くても判定する。
+// p_m = \frac{W}{2BD} は正規化して14字。25字では取りこぼしていた
+const MATH_MIN_LEN = 25;          // インライン数式
+const MATH_MIN_LEN_DISPLAY = 10;  // ブロック数式
 
 // 2文字組の重なりで似ている度合いを測る (Dice係数)。外部ライブラリ不要で、
 // 記号の並びのような短い文字列でも素直に効く
@@ -624,12 +628,12 @@ function checkMathAgainstSources(content, ragSources) {
   for (const s of sources) {
     for (const { raw } of extractMathSpans(s.text)) {
       const key = normalizeMath(raw);
-      if (key.length >= MATH_MIN_LEN) srcSpans.push({ raw, key, src: s });
+      if (key.length >= MATH_MIN_LEN_DISPLAY) srcSpans.push({ raw, key, src: s });
     }
   }
   const spans = extractMathSpans(content)
     .map(f => ({ ...f, key: normalizeMath(f.raw) }))
-    .filter(f => f.key.length >= MATH_MIN_LEN);
+    .filter(f => f.key.length >= (f.display ? MATH_MIN_LEN_DISPLAY : MATH_MIN_LEN));
   if (!spans.length) return null;
 
   const matched = [];
