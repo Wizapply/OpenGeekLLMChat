@@ -2416,13 +2416,47 @@
     line-height: 1.6;
   }
   .rag-math-note { color: var(--text-muted); }
-  /* 一致しなかった式の一覧。長い LaTeX は折り返さず横スクロールさせる */
-  .rag-math-list {
-    margin: 6px 0 0;
-    padding-left: 18px;
+  /* ─── 数式の照合バッジ (本文中の数式そのものに付ける) ───
+     出典欄にまとめて出すと、どの式のことか本文と突き合わせないと分からない */
+  .math-chk { display: inline-block; position: relative; }
+  .math-chk.ok  { border-bottom: 1px dotted var(--accent, #34d399); }
+  .math-chk.ng  { border-bottom: 1px dashed var(--orange, #fb923c); }
+  .math-chk-badge {
+    margin-left: 6px;
+    font-size: 10px;
+    line-height: 1.7;
+    padding: 0 5px;
+    border-radius: 3px;
+    white-space: nowrap;
+    vertical-align: middle;
   }
-  .rag-math-list li { margin-top: 8px; }
-  .rag-math-list code {
+  .math-chk.ok .math-chk-badge {
+    background: var(--accent-dim, rgba(52,211,153,0.16));
+    color: var(--accent, #34d399);
+  }
+  .math-chk.ng .math-chk-badge {
+    background: var(--orange-dim, rgba(251,146,60,0.18));
+    color: var(--orange, #fb923c);
+  }
+  /* 一致しなかった式の下に出す、資料側との並記 */
+  .math-chk-diff {
+    display: block;              /* span だが塊として置く (下のコメント参照) */
+    margin: 6px 0 10px;
+    padding: 6px 8px;
+    border-left: 2px solid var(--orange, #fb923c);
+    background: var(--orange-dim, rgba(251,146,60,0.07));
+    border-radius: 0 4px 4px 0;
+  }
+  .math-chk-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    margin-top: 2px;
+    min-width: 0;
+  }
+  .math-chk-row code {
+    flex: 1;
+    min-width: 0;
     display: block;
     overflow-x: auto;
     white-space: pre;
@@ -2433,48 +2467,23 @@
     background: var(--bg-primary);
     color: var(--text-primary);
   }
-  /* 回答と資料を上下に並べる。ラベル幅を揃えて食い違いを見比べやすくする */
-  .rag-math-row {
-    display: flex;
-    align-items: flex-start;
-    gap: 6px;
-    margin-top: 2px;
-    min-width: 0;
-  }
-  .rag-math-row code { flex: 1; min-width: 0; }
-  .rag-math-tag {
-    flex-shrink: 0;
-    width: 2.6em;
-    text-align: center;
-    font-size: 10px;
-    line-height: 1.7;
-    border-radius: 3px;
-    background: var(--orange-dim, rgba(251,146,60,0.18));
-    color: var(--orange, #fb923c);
-  }
-  .rag-math-tag.src {
-    background: var(--accent-dim, rgba(52,211,153,0.16));
-    color: var(--accent);
-  }
-  /* 食い違っている部分だけを強調する */
-  .rag-math-list mark {
-    background: var(--orange-dim, rgba(251,146,60,0.30));
+  .math-chk-row mark {
+    background: var(--orange-dim, rgba(251,146,60,0.35));
     color: inherit;
     border-radius: 2px;
     padding: 0 1px;
   }
-  .rag-math-open {
-    margin-top: 4px;
-    font-size: 11px;
-    padding: 2px 8px;
-    border-radius: 4px;
-    border: 1px solid var(--border);
-    background: var(--surface);
-    color: var(--text-secondary);
-    cursor: pointer;
-    font-family: inherit;
+  .math-chk-tag {
+    flex-shrink: 0;
+    width: 2.6em;
+    text-align: center;
+    font-size: 10px;
+    line-height: 1.9;
+    border-radius: 3px;
   }
-  .rag-math-open:hover { background: var(--bg-hover); color: var(--text-primary); }
+  .math-chk-tag.ans { background: var(--orange-dim, rgba(251,146,60,0.18)); color: var(--orange, #fb923c); }
+  .math-chk-tag.src { background: var(--accent-dim, rgba(52,211,153,0.16)); color: var(--accent, #34d399); }
+  .math-chk-note { display: block; margin-top: 4px; font-size: 10px; color: var(--text-muted); }
   /* 検索していないことを静かに知らせる一行。警告ではないので目立たせない */
   .rag-nosearch {
     margin: 6px 0 2px;

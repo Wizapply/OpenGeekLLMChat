@@ -547,8 +547,139 @@ function escapeHtml(str) {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+// ─── 数式の照合 ─────────────────────────────────────────
+// 資料の本文は ragSources[].text として手元にあるので、回答に書かれた数式が
+// 本当にそこから写されたものかを、モデルに聞かずに文字列比較で確かめられる。
+// DRY サンプラーが原因で n が \infty に化けた件は、これで検出できる。
+//
+// 注意: ここで見ているのは「渡した資料どおりに書いたか」であって、
+// 「式が正しいか」ではない。OCR が間違っていれば、忠実に写した時点で一致する。
+function extractMathSpans(text) {
+  // コードブロック内の $ は数式ではないので先に落とす
+  const s = String(text || '').replace(/```[\s\S]*?```/g, '');
+  const re = /\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\$([^$\n]+?)\$|\\\(([\s\S]+?)\\\)/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    const body = (m[1] ?? m[2] ?? m[3] ?? m[4] ?? '').trim();
+    if (body) out.push(body);
+  }
+  return out;
+}
+
+// 表記ゆれの吸収。$ と $$ の違い、\left\right の有無、空白や波括弧の付け方で
+// 不一致にしたくない。両辺に同じ正規化をかけるので、比較としては壊れない
+function normalizeMath(s) {
+  return String(s || '')
+    .replace(/\\left|\\right|\\displaystyle|\\quad|\\qquad|\\cdot|\\[,;:!]/g, '')
+    .replace(/[{}\s]/g, '');
+}
+
+// 短い式 ($W$ など) は何にでも一致してしまい情報量が無いので対象外にする
+const MATH_MIN_LEN = 25;
+
+// 2文字組の重なりで似ている度合いを測る (Dice係数)。外部ライブラリ不要で、
+// 記号の並びのような短い文字列でも素直に効く
+function diceSimilarity(a, b) {
+  if (a === b) return 1;
+  if (a.length < 2 || b.length < 2) return 0;
+  const grams = new Map();
+  for (let i = 0; i < a.length - 1; i++) {
+    const g = a.slice(i, i + 2);
+    grams.set(g, (grams.get(g) || 0) + 1);
+  }
+  let hit = 0;
+  for (let i = 0; i < b.length - 1; i++) {
+    const g = b.slice(i, i + 2);
+    const c = grams.get(g) || 0;
+    if (c > 0) { grams.set(g, c - 1); hit++; }
+  }
+  return (2 * hit) / ((a.length - 1) + (b.length - 1));
+}
+
+// 食い違っている部分だけを切り出す。共通の先頭と末尾を落として真ん中を残す。
+// ε が係数から分母へ移ったような違いは、これで一目で分かる
+function diffMiddle(a, b) {
+  let s = 0;
+  while (s < a.length && s < b.length && a[s] === b[s]) s++;
+  let e = 0;
+  while (e < a.length - s && e < b.length - s && a[a.length - 1 - e] === b[b.length - 1 - e]) e++;
+  return {
+    head: a.slice(0, s),
+    aMid: a.slice(s, a.length - e),
+    bMid: b.slice(s, b.length - e),
+    tail: e ? a.slice(a.length - e) : '',
+  };
+}
+
+function checkMathAgainstSources(content, ragSources) {
+  const sources = ragSources || [];
+  if (!sources.length) return null;
+  const srcNorm = sources.map(s => normalizeMath(s.text));
+  // 資料側の数式も抜いておく。一致しなかった時に「原文はこう」と並べるため
+  const srcSpans = [];
+  for (const s of sources) {
+    for (const raw of extractMathSpans(s.text)) {
+      const key = normalizeMath(raw);
+      if (key.length >= MATH_MIN_LEN) srcSpans.push({ raw, key, src: s });
+    }
+  }
+  const spans = extractMathSpans(content)
+    .map(raw => ({ raw, key: normalizeMath(raw) }))
+    .filter(f => f.key.length >= MATH_MIN_LEN);
+  if (!spans.length) return null;
+
+  const matched = [];
+  const unmatched = [];
+  for (const f of spans) {
+    if (srcNorm.some(src => src.includes(f.key))) { matched.push(f.raw); continue; }
+    // 一番近い資料側の式を探す。無関係な式を並べると却って混乱するので閾値を置く
+    let best = null, bestScore = 0;
+    for (const c of srcSpans) {
+      const sc = diceSimilarity(f.key, c.key);
+      if (sc > bestScore) { bestScore = sc; best = c; }
+    }
+    unmatched.push({ raw: f.raw, near: bestScore >= 0.55 ? best : null });
+  }
+  return { total: spans.length, matched, unmatched };
+}
+
+/**
+ * 照合結果を数式そのものの位置に貼る。
+ * 出典欄にまとめて出すと、どの式のことなのか本文と突き合わせないと分からない。
+ * verdicts は「正規化した式 → 判定」の Map (checkMathAgainstSources が作る)。
+ */
+function mathVerdictMap(check) {
+  if (!check) return null;
+  const m = new Map();
+  for (const raw of check.matched || []) m.set(normalizeMath(raw), { ok: true });
+  for (const u of check.unmatched || []) m.set(normalizeMath(u.raw), { ok: false, near: u.near });
+  return m.size ? m : null;
+}
+
+// 一致しなかった式の下に、資料側の式と食い違い部分を並べる HTML を作る。
+//
+// 要素はすべてインライン (span/code/mark) にすること。数式は marked が作った
+// <p> の中へ後から差し込まれるので、<div> を混ぜるとブラウザが <p> を閉じてしまい、
+// この塊が数式の外へ飛び出す。見た目はCSSの display:block で作る。
+function mathDiffHtml(raw, near) {
+  if (!near) {
+    return '<span class="math-chk-note">取得した資料の本文に、これに近い式が見つかりませんでした</span>';
+  }
+  const d = diffMiddle(raw, near.raw);
+  const row = (label, cls, mid) =>
+    '<span class="math-chk-row"><span class="math-chk-tag ' + cls + '">' + label + '</span>'
+    + '<code>' + escapeHtml(d.head) + '<mark>' + escapeHtml(mid) + '</mark>' + escapeHtml(d.tail) + '</code></span>';
+  return '<span class="math-chk-diff">'
+    + row('回答', 'ans', d.aMid)
+    + row('資料', 'src', d.bMid)
+    + '<span class="math-chk-note">' + escapeHtml(near.src.label)
+    + (near.src.pageText ? ' p.' + escapeHtml(near.src.pageText) : '') + ' より</span>'
+    + '</span>';
+}
+
 // ─── LaTeX レンダリング ───
-function renderLatex(text) {
+function renderLatex(text, verdicts) {
   if (!text || typeof katex === 'undefined') return text;
 
   const placeholders = [];
@@ -561,11 +692,21 @@ function renderLatex(text) {
   }
 
   function renderKatex(expr, displayMode) {
+    let html;
     try {
-      return katex.renderToString(expr, { displayMode, throwOnError: false, trust: true });
+      html = katex.renderToString(expr, { displayMode, throwOnError: false, trust: true });
     } catch {
-      return '<code>' + escapeHtml(expr) + '</code>';
+      html = '<code>' + escapeHtml(expr) + '</code>';
     }
+    const v = verdicts && verdicts.get(normalizeMath(expr));
+    if (!v) return html;
+    if (v.ok) {
+      return '<span class="math-chk ok" title="取得した資料の本文と一致します（資料自体の正しさまでは保証しません）">'
+        + html + '<span class="math-chk-badge">✓ 資料と一致</span></span>';
+    }
+    return '<span class="math-chk ng" title="取得した資料の本文と一致しません">'
+      + html + '<span class="math-chk-badge">⚠ 資料と不一致</span>'
+      + (displayMode ? mathDiffHtml(expr, v.near) : '') + '</span>';
   }
 
   // コードブロック保護: ```...``` をプレースホルダーに退避
@@ -623,8 +764,14 @@ function renderLatex(text) {
 // ─── MarkdownContent コンポーネント ───
 // MarkdownContent: メッセージのcontentをMarkdownレンダリング
 // React.memo でラップして、contentが変わらなければ再レンダリングしない（出力DOMの保持のため重要）
-const MarkdownContent = React.memo(function MarkdownContent({ content }) {
+const MarkdownContent = React.memo(function MarkdownContent({ content, mathSources }) {
   const ref = useRef(null);
+
+  // 数式の照合結果。式そのものの位置にバッジを出すため、ここで作って
+  // renderLatex に渡す。mathSources が null の間 (ストリーミング中) は照合しない
+  const mathVerdicts = React.useMemo(
+    () => mathVerdictMap(mathSources ? checkMathAgainstSources(content, mathSources) : null),
+    [content, mathSources]);
 
   // [[gen_image:URL|encodedPrompt]] / [[gen_audio:URL|encodedText]] マーカーを
   // パースしてセグメントに分割。
@@ -663,7 +810,7 @@ const MarkdownContent = React.memo(function MarkdownContent({ content }) {
   // React.memo で contentが変わらない限りこの関数自体が呼ばれないので、
   // 既に書き込まれた output-* の中身は再レンダリングで消えない
   if (!hasMarkers) {
-    const html = renderLatex(content || '');
+    const html = renderLatex(content || '', mathVerdicts);
     return React.createElement('div', {
       ref,
       dangerouslySetInnerHTML: { __html: html },
@@ -676,7 +823,7 @@ const MarkdownContent = React.memo(function MarkdownContent({ content }) {
       {segments.map((seg, i) => {
         if (seg.type === 'text') {
           if (!seg.value.trim()) return null;
-          const html = renderLatex(seg.value);
+          const html = renderLatex(seg.value, mathVerdicts);
           return <div key={i} dangerouslySetInnerHTML={{ __html: html }} />;
         }
         if (seg.type === 'gen_image') {
@@ -1212,102 +1359,6 @@ function App() {
         + 'ここに無い資料名・ページ・人名・ファイル名を、読んだかのように書いてはいけません。\n\n'
         + lines.join('\n\n'),
     };
-  }
-
-  // ─── 数式の照合 ─────────────────────────────────────────
-  // 資料の本文は ragSources[].text として手元にあるので、回答に書かれた数式が
-  // 本当にそこから写されたものかを、モデルに聞かずに文字列比較で確かめられる。
-  // DRY サンプラーが原因で n が \infty に化けた件は、これで検出できる。
-  //
-  // 注意: ここで見ているのは「渡した資料どおりに書いたか」であって、
-  // 「式が正しいか」ではない。OCR が間違っていれば、忠実に写した時点で一致する。
-  function extractMathSpans(text) {
-    // コードブロック内の $ は数式ではないので先に落とす
-    const s = String(text || '').replace(/```[\s\S]*?```/g, '');
-    const re = /\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\$([^$\n]+?)\$|\\\(([\s\S]+?)\\\)/g;
-    const out = [];
-    let m;
-    while ((m = re.exec(s)) !== null) {
-      const body = (m[1] ?? m[2] ?? m[3] ?? m[4] ?? '').trim();
-      if (body) out.push(body);
-    }
-    return out;
-  }
-
-  // 表記ゆれの吸収。$ と $$ の違い、\left\right の有無、空白や波括弧の付け方で
-  // 不一致にしたくない。両辺に同じ正規化をかけるので、比較としては壊れない
-  function normalizeMath(s) {
-    return String(s || '')
-      .replace(/\\left|\\right|\\displaystyle|\\quad|\\qquad|\\cdot|\\[,;:!]/g, '')
-      .replace(/[{}\s]/g, '');
-  }
-
-  // 短い式 ($W$ など) は何にでも一致してしまい情報量が無いので対象外にする
-  const MATH_MIN_LEN = 25;
-
-  // 2文字組の重なりで似ている度合いを測る (Dice係数)。外部ライブラリ不要で、
-  // 記号の並びのような短い文字列でも素直に効く
-  function diceSimilarity(a, b) {
-    if (a === b) return 1;
-    if (a.length < 2 || b.length < 2) return 0;
-    const grams = new Map();
-    for (let i = 0; i < a.length - 1; i++) {
-      const g = a.slice(i, i + 2);
-      grams.set(g, (grams.get(g) || 0) + 1);
-    }
-    let hit = 0;
-    for (let i = 0; i < b.length - 1; i++) {
-      const g = b.slice(i, i + 2);
-      const c = grams.get(g) || 0;
-      if (c > 0) { grams.set(g, c - 1); hit++; }
-    }
-    return (2 * hit) / ((a.length - 1) + (b.length - 1));
-  }
-
-  // 食い違っている部分だけを切り出す。共通の先頭と末尾を落として真ん中を残す。
-  // ε が係数から分母へ移ったような違いは、これで一目で分かる
-  function diffMiddle(a, b) {
-    let s = 0;
-    while (s < a.length && s < b.length && a[s] === b[s]) s++;
-    let e = 0;
-    while (e < a.length - s && e < b.length - s && a[a.length - 1 - e] === b[b.length - 1 - e]) e++;
-    return {
-      head: a.slice(0, s),
-      aMid: a.slice(s, a.length - e),
-      bMid: b.slice(s, b.length - e),
-      tail: e ? a.slice(a.length - e) : '',
-    };
-  }
-
-  function checkMathAgainstSources(msg) {
-    const sources = msg.ragSources || [];
-    if (!sources.length) return null;
-    const srcNorm = sources.map(s => normalizeMath(s.text));
-    // 資料側の数式も抜いておく。一致しなかった時に「原文はこう」と並べるため
-    const srcSpans = [];
-    for (const s of sources) {
-      for (const raw of extractMathSpans(s.text)) {
-        const key = normalizeMath(raw);
-        if (key.length >= MATH_MIN_LEN) srcSpans.push({ raw, key, src: s });
-      }
-    }
-    const spans = extractMathSpans(msg.content)
-      .map(raw => ({ raw, key: normalizeMath(raw) }))
-      .filter(f => f.key.length >= MATH_MIN_LEN);
-    if (!spans.length) return null;
-
-    const unmatched = [];
-    for (const f of spans) {
-      if (srcNorm.some(src => src.includes(f.key))) continue;
-      // 一番近い資料側の式を探す。無関係な式を並べると却って混乱するので閾値を置く
-      let best = null, bestScore = 0;
-      for (const c of srcSpans) {
-        const sc = diceSimilarity(f.key, c.key);
-        if (sc > bestScore) { bestScore = sc; best = c; }
-      }
-      unmatched.push({ raw: f.raw, near: bestScore >= 0.55 ? best : null });
-    }
-    return { total: spans.length, unmatched };
   }
 
   // 本文に出てくる .md ファイル名を拾う（登録済みかどうかの照合用）
@@ -6597,7 +6648,7 @@ ${conversationText}
                     // 数式の照合。ストリーミング中は毎トークン走ってしまうので、
                     // 書き終わってから一度だけ判定する
                     const mathCheck = (isLoading && i === messages.length - 1)
-                      ? null : checkMathAgainstSources(msg);
+                      ? null : checkMathAgainstSources(body, msg.ragSources);
                     const hasWarn = unknown.length > 0 || fakeMd.length > 0 || citeyWithoutSearch;
                     if (!msg.ragSources?.length && !hasWarn) {
                       return quietNotSearched
@@ -6639,43 +6690,13 @@ ${conversationText}
                             このファイルは存在しません。
                           </div>
                         )}
-                        {mathCheck && mathCheck.unmatched.length === 0 && (
-                          <div className="rag-math-ok">
-                            🧮 数式{mathCheck.total}本は、いずれも取得した資料の本文どおりです
-                            <span className="rag-math-note">（資料自体の正しさまでは保証しません）</span>
-                          </div>
-                        )}
-                        {mathCheck && mathCheck.unmatched.length > 0 && (
-                          <div className="rag-source-warn">
-                            ⚠️ 数式{mathCheck.total}本のうち{mathCheck.unmatched.length}本が、取得した資料の本文と一致しません。
-                            書き換えられている可能性があります（式を変形して答えた場合もここに出ます）。
-                            <ul className="rag-math-list">
-                              {mathCheck.unmatched.map((u, k) => {
-                                // 近い式が見つかったら、食い違う部分だけを強調して並べる
-                                const d = u.near ? diffMiddle(u.raw, u.near.raw) : null;
-                                return (
-                                  <li key={k}>
-                                    <div className="rag-math-row">
-                                      <span className="rag-math-tag">回答</span>
-                                      <code>{d
-                                        ? <>{d.head}<mark>{d.aMid}</mark>{d.tail}</>
-                                        : u.raw}</code>
-                                    </div>
-                                    {d && (
-                                      <div className="rag-math-row">
-                                        <span className="rag-math-tag src">資料</span>
-                                        <code>{d.head}<mark>{d.bMid}</mark>{d.tail}</code>
-                                      </div>
-                                    )}
-                                    {u.near && (
-                                      <button className="rag-math-open" onClick={() => setSourceViewer(u.near.src)}>
-                                        🔍 {u.near.src.label}{u.near.src.pageText ? ` p.${u.near.src.pageText}` : ''} の本文を開く
-                                      </button>
-                                    )}
-                                  </li>
-                                );
-                              })}
-                            </ul>
+                        {mathCheck && (
+                          <div className={mathCheck.unmatched.length ? 'rag-source-warn' : 'rag-math-ok'}>
+                            {mathCheck.unmatched.length
+                              ? <>⚠️ 数式{mathCheck.total}本のうち{mathCheck.unmatched.length}本が、取得した資料の本文と一致しません。
+                                  本文中の該当する式に印を付け、資料側の式と並べています。</>
+                              : <>🧮 数式{mathCheck.total}本は、いずれも取得した資料の本文どおりです
+                                  <span className="rag-math-note">（資料自体の正しさまでは保証しません）</span></>}
                           </div>
                         )}
                       </div>
@@ -6684,7 +6705,10 @@ ${conversationText}
                   {msg.orchestra && <OrchestraPanel orch={msg.orchestra} />}
                   {msg.role === 'assistant' ? (
                     <div className="msg-bubble">
-                      <MarkdownContent content={msg.content} />
+                      <MarkdownContent
+                        content={msg.content}
+                        mathSources={(isLoading && i === messages.length - 1) ? null : msg.ragSources}
+                      />
                     </div>
                   ) : (
                     <React.Fragment>
