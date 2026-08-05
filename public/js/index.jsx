@@ -561,8 +561,11 @@ function extractMathSpans(text) {
   const out = [];
   let m;
   while ((m = re.exec(s)) !== null) {
+    // $$…$$ と \[…\] はブロック数式。「これが式です」と提示している箇所。
+    // インラインは文中で項を取り出して説明していることが多く、扱いを分ける
+    const display = m[1] != null || m[2] != null;
     const body = (m[1] ?? m[2] ?? m[3] ?? m[4] ?? '').trim();
-    if (body) out.push(body);
+    if (body) out.push({ raw: body, display });
   }
   return out;
 }
@@ -619,13 +622,13 @@ function checkMathAgainstSources(content, ragSources) {
   // 資料側の数式も抜いておく。一致しなかった時に「原文はこう」と並べるため
   const srcSpans = [];
   for (const s of sources) {
-    for (const raw of extractMathSpans(s.text)) {
+    for (const { raw } of extractMathSpans(s.text)) {
       const key = normalizeMath(raw);
       if (key.length >= MATH_MIN_LEN) srcSpans.push({ raw, key, src: s });
     }
   }
   const spans = extractMathSpans(content)
-    .map(raw => ({ raw, key: normalizeMath(raw) }))
+    .map(f => ({ ...f, key: normalizeMath(f.raw) }))
     .filter(f => f.key.length >= MATH_MIN_LEN);
   if (!spans.length) return null;
 
@@ -639,9 +642,16 @@ function checkMathAgainstSources(content, ragSources) {
       const sc = diceSimilarity(f.key, c.key);
       if (sc > bestScore) { bestScore = sc; best = c; }
     }
-    unmatched.push({ raw: f.raw, near: bestScore >= 0.55 ? best : null });
+    const near = bestScore >= 0.55 ? best : null;
+    // インライン数式で近い式も見つからないものは黙って見送る。
+    // 文中で式の項を取り出して説明している箇所 (\frac{1}{l}\sum W_i\delta_i など) が
+    // ここに該当し、正しい回答でも必ず引っかかってしまう。
+    // 「元がこれだ」と示せない以上、書き換えなのか導出なのか区別できない。
+    // ブロック数式は「これが式です」という提示なので、示せなくても知らせる。
+    if (!near && !f.display) continue;
+    unmatched.push({ raw: f.raw, near });
   }
-  return { total: spans.length, matched, unmatched };
+  return { total: matched.length + unmatched.length, matched, unmatched };
 }
 
 /**
