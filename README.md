@@ -1232,6 +1232,7 @@ opengeek-llm-chat/
 | `ragMode` | `agentic` / `always` |
 | `ragChunkSize` / `ragChunkOverlap` | 分割の粒度と重なり。embedding の ctx（BERT系は512トークン）を超えないこと。変更したら再登録が必要 |
 | `ragNeighborChunks` | ヒットの前後何チャンクを一緒に渡すか。数式と記号定義が分断されるのを防ぐ（0で無効） |
+| `ragRelaxSamplers` | 検索結果を渡して回答させる時、繰り返しペナルティ（DRY・repeat_penalty）を外す。既定 `true`。**RAG で原文どおりの引用が必要なら切らないこと**（詳細は下記） |
 | `ragAlwaysSearch` | 毎ターン必ず永続RAGを検索する。判断モデルが `web_search` を選んだり検索を省いたりする場合に `true`。既定 `false` |
 | `ragLedgerTurns` | 直近いくつの回答ぶんの出典（資料名・ページ・抜粋）を次のターンへ持ち越すか、デフォルト1（0で無効） |
 | `ragLedgerChars` | 持ち越す1出典あたりの抜粋文字数、デフォルト400（0ならページ対応表のみ） |

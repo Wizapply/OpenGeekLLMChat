@@ -3879,6 +3879,16 @@ function App() {
           return copy;
         });
 
+        // ─── 引用させる回答では繰り返し系サンプラーを外す ───
+        // DRY はコンテキスト内の既出トークン列の再出現を指数関数的に罰する。
+        // 検索結果を渡した状態でこれを効かせると、原文どおりに書き写す行為が
+        // そのまま罰の対象になり、モデルは別の語に逃げるしかなくなる
+        // (数式の n が \infty に化け、日本語も既出の漢字から順に脱落した)。
+        // 暴走ループは streamResponse の findTailRepetition と max_tokens で受ける。
+        const hasSourcesForAnswer = apiMessages.some(m => m.role === 'tool');
+        const relaxSamplers = hasSourcesForAnswer && appConfig.ragRelaxSamplers !== false;
+        if (relaxSamplers) console.log('[サンプラー緩和] 逐語引用のため繰り返しペナルティを無効化');
+
         const finalRes = await fetchWithRetry('/v1/chat/completions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -3888,6 +3898,13 @@ function App() {
             stream: true,
             stream_options: { include_usage: true },
             ...llamaCommonOptions,
+            // llamaCommonOptions より後ろに置くこと。先に書くと上書きされて効かない
+            ...(relaxSamplers ? {
+              repeat_penalty: 1.0,
+              dry_multiplier: 0,
+              presence_penalty: 0,
+              frequency_penalty: 0,
+            } : {}),
           }),
           signal: controller.signal,
         });
@@ -3931,6 +3948,13 @@ function App() {
                 stream: true,
                 stream_options: { include_usage: true },
                 ...llamaCommonOptions,
+                // 本番と同じ条件で引き直す (ここもツール結果を渡した回答なので)
+                ...(relaxSamplers ? {
+                  repeat_penalty: 1.0,
+                  dry_multiplier: 0,
+                  presence_penalty: 0,
+                  frequency_penalty: 0,
+                } : {}),
               }),
               signal: controller.signal,
             });

@@ -516,7 +516,8 @@
   "frequencyPenalty": 0,
   "dryMultiplier": 0.8,
   "dryBase": 1.75,
-  "dryAllowedLength": 2,
-  "dryPenaltyLastN": -1,
+  "dryAllowedLength": 4,
+  "dryPenaltyLastN": 512,
+  "ragRelaxSamplers": true,
   "chatMaxTokens": 8192
 }

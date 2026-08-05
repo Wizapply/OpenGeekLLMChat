@@ -253,10 +253,21 @@ const DEFAULT_CONFIG = {
   presencePenalty: 0,        // OpenAI互換 presence_penalty
   frequencyPenalty: 0,       // OpenAI互換 frequency_penalty
   // DRY サンプラー: 反復ループに非常に有効 (dryMultiplier=0 で無効)
+  //
+  // ただし RAG とは相性が悪い。DRY は「コンテキスト内で既出のトークン列」の
+  // 再出現に指数関数的なペナルティ (multiplier * base^(長さ-allowedLength)) を
+  // かけるので、走査範囲に検索結果を含めると「原文の逐語引用」がそのまま
+  // 罰の対象になる。10トークン引用で 0.8*1.75^8 ≒ 43 と、事実上禁止に等しい。
+  // 実際に、数式の n が \infty に化け、日本語も既出の漢字から順に脱落した。
+  // 監視対象はモデル自身の直近の出力だけでよいので、範囲を絞る。
   dryMultiplier: 0.8,
   dryBase: 1.75,
-  dryAllowedLength: 2,
-  dryPenaltyLastN: -1,       // -1 = コンテキスト全体を対象
+  dryAllowedLength: 4,       // 3トークンの言い回しは日本語では普通に再出現する
+  dryPenaltyLastN: 512,      // -1 (コンテキスト全体) にすると資料の引用を潰す
+  // 検索結果を渡して回答させる時は、繰り返し系サンプラーを外す。
+  // 原文どおりに書き写させたいのに、書き写すことを罰しては噛み合わない。
+  // 暴走ループは画面側の findTailRepetition と max_tokens で受け止める。
+  ragRelaxSamplers: true,
   // 1応答あたりの最大生成トークン (暴走ループの安全網。agentContext.largePredict が優先)
   chatMaxTokens: 8192,
   // ログレベル: 'verbose' (全ログ), 'normal' (デフォルト), 'quiet' (最小限)
