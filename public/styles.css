@@ -2405,6 +2405,34 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* 数式が取得資料どおりだった時。警告ではないので静かに肯定する */
+  .rag-math-ok {
+    margin-top: 6px;
+    padding: 6px 8px;
+    border-radius: 4px;
+    background: var(--accent-dim, rgba(52,211,153,0.10));
+    color: var(--text-secondary);
+    font-size: 11px;
+    line-height: 1.6;
+  }
+  .rag-math-note { color: var(--text-muted); }
+  /* 一致しなかった式の一覧。長い LaTeX は折り返さず横スクロールさせる */
+  .rag-math-list {
+    margin: 6px 0 0;
+    padding-left: 18px;
+  }
+  .rag-math-list li { margin-top: 3px; }
+  .rag-math-list code {
+    display: block;
+    overflow-x: auto;
+    white-space: pre;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    padding: 3px 6px;
+    border-radius: 3px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+  }
   /* 検索していないことを静かに知らせる一行。警告ではないので目立たせない */
   .rag-nosearch {
     margin: 6px 0 2px;

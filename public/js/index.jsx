@@ -1214,6 +1214,48 @@ function App() {
     };
   }
 
+  // ─── 数式の照合 ─────────────────────────────────────────
+  // 資料の本文は ragSources[].text として手元にあるので、回答に書かれた数式が
+  // 本当にそこから写されたものかを、モデルに聞かずに文字列比較で確かめられる。
+  // DRY サンプラーが原因で n が \infty に化けた件は、これで検出できる。
+  //
+  // 注意: ここで見ているのは「渡した資料どおりに書いたか」であって、
+  // 「式が正しいか」ではない。OCR が間違っていれば、忠実に写した時点で一致する。
+  function extractMathSpans(text) {
+    // コードブロック内の $ は数式ではないので先に落とす
+    const s = String(text || '').replace(/```[\s\S]*?```/g, '');
+    const re = /\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\$([^$\n]+?)\$|\\\(([\s\S]+?)\\\)/g;
+    const out = [];
+    let m;
+    while ((m = re.exec(s)) !== null) {
+      const body = (m[1] ?? m[2] ?? m[3] ?? m[4] ?? '').trim();
+      if (body) out.push(body);
+    }
+    return out;
+  }
+
+  // 表記ゆれの吸収。$ と $$ の違い、\left\right の有無、空白や波括弧の付け方で
+  // 不一致にしたくない。両辺に同じ正規化をかけるので、比較としては壊れない
+  function normalizeMath(s) {
+    return String(s || '')
+      .replace(/\\left|\\right|\\displaystyle|\\quad|\\qquad|\\cdot|\\[,;:!]/g, '')
+      .replace(/[{}\s]/g, '');
+  }
+
+  // 短い式 ($W$ など) は何にでも一致してしまい情報量が無いので対象外にする
+  const MATH_MIN_LEN = 25;
+
+  function checkMathAgainstSources(msg) {
+    const srcs = (msg.ragSources || []).map(s => normalizeMath(s.text));
+    if (!srcs.length) return null;
+    const spans = extractMathSpans(msg.content)
+      .map(raw => ({ raw, key: normalizeMath(raw) }))
+      .filter(f => f.key.length >= MATH_MIN_LEN);
+    if (!spans.length) return null;
+    const unmatched = spans.filter(f => !srcs.some(src => src.includes(f.key)));
+    return { total: spans.length, unmatched: unmatched.map(f => f.raw) };
+  }
+
   // 本文に出てくる .md ファイル名を拾う（登録済みかどうかの照合用）
   function mdNamesIn(text) {
     return [...new Set((String(text || '').match(/[^\s「」『』()（）\[\]【】、,]+\.md\b/g) || []))];
@@ -6498,6 +6540,10 @@ ${conversationText}
                     // 出典めいた語が無くても内容を作ることはある。まとまった長さの
                     // 回答には「検索したのか」を必ず出す。短い相槌までは出さない
                     const quietNotSearched = notSearched && !citeyWithoutSearch && body.length >= 120;
+                    // 数式の照合。ストリーミング中は毎トークン走ってしまうので、
+                    // 書き終わってから一度だけ判定する
+                    const mathCheck = (isLoading && i === messages.length - 1)
+                      ? null : checkMathAgainstSources(msg);
                     const hasWarn = unknown.length > 0 || fakeMd.length > 0 || citeyWithoutSearch;
                     if (!msg.ragSources?.length && !hasWarn) {
                       return quietNotSearched
@@ -6537,6 +6583,21 @@ ${conversationText}
                           <div className="rag-source-warn">
                             ⚠️ 本文に、登録されていないファイル名（{fakeMd.join(', ')}）が書かれています。
                             このファイルは存在しません。
+                          </div>
+                        )}
+                        {mathCheck && mathCheck.unmatched.length === 0 && (
+                          <div className="rag-math-ok">
+                            🧮 数式{mathCheck.total}本は、いずれも取得した資料の本文どおりです
+                            <span className="rag-math-note">（資料自体の正しさまでは保証しません）</span>
+                          </div>
+                        )}
+                        {mathCheck && mathCheck.unmatched.length > 0 && (
+                          <div className="rag-source-warn">
+                            ⚠️ 数式{mathCheck.total}本のうち{mathCheck.unmatched.length}本が、取得した資料の本文に見当たりません。
+                            書き換えられている可能性があります（式を変形して答えた場合もここに出ます）。
+                            <ul className="rag-math-list">
+                              {mathCheck.unmatched.map((f, k) => <li key={k}><code>{f}</code></li>)}
+                            </ul>
                           </div>
                         )}
                       </div>
