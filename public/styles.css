@@ -2421,6 +2421,7 @@
   .math-chk { display: inline-block; position: relative; }
   .math-chk.ok  { border-bottom: 1px dotted var(--accent, #34d399); }
   .math-chk.ng  { border-bottom: 1px dashed var(--orange, #fb923c); }
+  .math-chk.unk { border-bottom: 1px dotted var(--text-muted); }
   .math-chk-badge {
     margin-left: 6px;
     font-size: 10px;
@@ -2437,6 +2438,11 @@
   .math-chk.ng .math-chk-badge {
     background: var(--orange-dim, rgba(251,146,60,0.18));
     color: var(--orange, #fb923c);
+  }
+  /* 照合できなかった式。誤りと断定できないので警告色は使わない */
+  .math-chk.unk .math-chk-badge {
+    background: var(--bg-hover, rgba(128,128,128,0.12));
+    color: var(--text-muted);
   }
   /* 一致しなかった式の下に出す、資料側との並記 */
   .math-chk-diff {

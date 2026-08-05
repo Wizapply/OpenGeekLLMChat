@@ -636,8 +636,9 @@ function checkMathAgainstSources(content, ragSources) {
     .filter(f => f.key.length >= (f.display ? MATH_MIN_LEN_DISPLAY : MATH_MIN_LEN));
   if (!spans.length) return null;
 
-  const matched = [];
-  const unmatched = [];
+  const matched = [];    // 資料の本文にそのまま在る
+  const unmatched = [];  // 在らず、かつ「本来こうだ」と示せる
+  const unverified = []; // 在らず、示すものも無い (判定を保留する)
   for (const f of spans) {
     if (srcNorm.some(src => src.includes(f.key))) { matched.push(f.raw); continue; }
     // 一番近い資料側の式を探す。無関係な式を並べると却って混乱するので閾値を置く
@@ -647,17 +648,24 @@ function checkMathAgainstSources(content, ragSources) {
       if (sc > bestScore) { bestScore = sc; best = c; }
     }
     const near = bestScore >= 0.55 ? best : null;
-    // インライン数式で近い式も見つからないものは黙って見送る。
-    // 文中で式の項を取り出して説明している箇所 (\frac{1}{l}\sum W_i\delta_i など) が
-    // ここに該当し、正しい回答でも必ず引っかかってしまう。
-    // 「元がこれだ」と示せない以上、書き換えなのか導出なのか区別できない。
-    // ブロック数式は「これが式です」という提示なので、示せなくても知らせる。
-    if (!near && !f.display) continue;
+    // 対応する式を示せない時は「不一致」と断定しない。理由が3つあり得て、
+    // どれなのか判別できないため:
+    //   ・モデルが書き換えた
+    //   ・モデルが式を変形・分解して説明した (正しい)
+    //   ・資料側の OCR が数式を LaTeX 化できていない (正しい)
+    // 実際、p_m = \frac{W}{2BD} に対して資料は "pm = W2BD" と分数の横線が
+    // 落ちた状態で、意味は同じなのに文字列は一致しない。
+    // ここを警告にすると、正しい回答が毎回警告されて信用されなくなる。
+    if (!near) {
+      // インラインは項の説明であることが多いので黙る。ブロックは中立の印を出す
+      if (f.display) unverified.push(f.raw);
+      continue;
+    }
     unmatched.push({ raw: f.raw, near });
   }
-  // 全部見送りだと 0本 になる。「数式0本は資料どおりです」は意味を成さないので黙る
-  if (!matched.length && !unmatched.length) return null;
-  return { total: matched.length + unmatched.length, matched, unmatched };
+  const total = matched.length + unmatched.length + unverified.length;
+  if (!total) return null;   // 「数式0本は資料どおりです」は意味を成さない
+  return { total, matched, unmatched, unverified };
 }
 
 /**
@@ -670,6 +678,7 @@ function mathVerdictMap(check) {
   const m = new Map();
   for (const raw of check.matched || []) m.set(normalizeMath(raw), { ok: true });
   for (const u of check.unmatched || []) m.set(normalizeMath(u.raw), { ok: false, near: u.near });
+  for (const raw of check.unverified || []) m.set(normalizeMath(raw), { ok: null });
   return m.size ? m : null;
 }
 
@@ -716,9 +725,15 @@ function renderLatex(text, verdicts) {
     }
     const v = verdicts && verdicts.get(normalizeMath(expr));
     if (!v) return html;
-    if (v.ok) {
+    if (v.ok === true) {
       return '<span class="math-chk ok" title="取得した資料の本文と一致します（資料自体の正しさまでは保証しません）">'
         + html + '<span class="math-chk-badge">✓ 資料と一致</span></span>';
+    }
+    if (v.ok === null) {
+      // 資料側に対応する式が見つからない。書き換えなのか、式を変形したのか、
+      // 資料の OCR が数式を LaTeX 化できていないのか、区別できない
+      return '<span class="math-chk unk" title="資料側に対応する式が見つからず、照合できませんでした。誤りとは限りません（資料のOCRが数式を取れていない場合もここに入ります）">'
+        + html + '<span class="math-chk-badge">? 照合できず</span></span>';
     }
     return '<span class="math-chk ng" title="取得した資料の本文と一致しません">'
       + html + '<span class="math-chk-badge">⚠ 資料と不一致</span>'
@@ -6708,11 +6723,20 @@ ${conversationText}
                         )}
                         {mathCheck && (
                           <div className={mathCheck.unmatched.length ? 'rag-source-warn' : 'rag-math-ok'}>
-                            {mathCheck.unmatched.length
-                              ? <>⚠️ 数式{mathCheck.total}本のうち{mathCheck.unmatched.length}本が、取得した資料の本文と一致しません。
-                                  本文中の該当する式に印を付け、資料側の式と並べています。</>
-                              : <>🧮 数式{mathCheck.total}本は、いずれも取得した資料の本文どおりです
-                                  <span className="rag-math-note">（資料自体の正しさまでは保証しません）</span></>}
+                            {mathCheck.unmatched.length > 0 && (
+                              <>⚠️ 数式{mathCheck.total}本のうち{mathCheck.unmatched.length}本が、取得した資料の本文と一致しません。
+                                本文中の該当する式に印を付け、資料側の式と並べています。</>
+                            )}
+                            {mathCheck.unmatched.length === 0 && mathCheck.matched.length > 0 && (
+                              <>🧮 数式{mathCheck.matched.length}本は取得した資料の本文どおりです
+                                <span className="rag-math-note">（資料自体の正しさまでは保証しません）</span></>
+                            )}
+                            {mathCheck.unmatched.length === 0 && mathCheck.unverified.length > 0 && (
+                              <div className="rag-math-note">
+                                {mathCheck.unverified.length}本は資料側に対応する式が見つからず、照合できませんでした。
+                                誤りとは限りません（資料のOCRが数式を取れていない場合もここに入ります）。
+                              </div>
+                            )}
                           </div>
                         )}
                       </div>
