@@ -2421,7 +2421,7 @@
     margin: 6px 0 0;
     padding-left: 18px;
   }
-  .rag-math-list li { margin-top: 3px; }
+  .rag-math-list li { margin-top: 8px; }
   .rag-math-list code {
     display: block;
     overflow-x: auto;
@@ -2433,6 +2433,48 @@
     background: var(--bg-primary);
     color: var(--text-primary);
   }
+  /* 回答と資料を上下に並べる。ラベル幅を揃えて食い違いを見比べやすくする */
+  .rag-math-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    margin-top: 2px;
+    min-width: 0;
+  }
+  .rag-math-row code { flex: 1; min-width: 0; }
+  .rag-math-tag {
+    flex-shrink: 0;
+    width: 2.6em;
+    text-align: center;
+    font-size: 10px;
+    line-height: 1.7;
+    border-radius: 3px;
+    background: var(--orange-dim, rgba(251,146,60,0.18));
+    color: var(--orange, #fb923c);
+  }
+  .rag-math-tag.src {
+    background: var(--accent-dim, rgba(52,211,153,0.16));
+    color: var(--accent);
+  }
+  /* 食い違っている部分だけを強調する */
+  .rag-math-list mark {
+    background: var(--orange-dim, rgba(251,146,60,0.30));
+    color: inherit;
+    border-radius: 2px;
+    padding: 0 1px;
+  }
+  .rag-math-open {
+    margin-top: 4px;
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .rag-math-open:hover { background: var(--bg-hover); color: var(--text-primary); }
   /* 検索していないことを静かに知らせる一行。警告ではないので目立たせない */
   .rag-nosearch {
     margin: 6px 0 2px;

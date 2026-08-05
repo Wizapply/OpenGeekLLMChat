@@ -1245,15 +1245,69 @@ function App() {
   // 短い式 ($W$ など) は何にでも一致してしまい情報量が無いので対象外にする
   const MATH_MIN_LEN = 25;
 
+  // 2文字組の重なりで似ている度合いを測る (Dice係数)。外部ライブラリ不要で、
+  // 記号の並びのような短い文字列でも素直に効く
+  function diceSimilarity(a, b) {
+    if (a === b) return 1;
+    if (a.length < 2 || b.length < 2) return 0;
+    const grams = new Map();
+    for (let i = 0; i < a.length - 1; i++) {
+      const g = a.slice(i, i + 2);
+      grams.set(g, (grams.get(g) || 0) + 1);
+    }
+    let hit = 0;
+    for (let i = 0; i < b.length - 1; i++) {
+      const g = b.slice(i, i + 2);
+      const c = grams.get(g) || 0;
+      if (c > 0) { grams.set(g, c - 1); hit++; }
+    }
+    return (2 * hit) / ((a.length - 1) + (b.length - 1));
+  }
+
+  // 食い違っている部分だけを切り出す。共通の先頭と末尾を落として真ん中を残す。
+  // ε が係数から分母へ移ったような違いは、これで一目で分かる
+  function diffMiddle(a, b) {
+    let s = 0;
+    while (s < a.length && s < b.length && a[s] === b[s]) s++;
+    let e = 0;
+    while (e < a.length - s && e < b.length - s && a[a.length - 1 - e] === b[b.length - 1 - e]) e++;
+    return {
+      head: a.slice(0, s),
+      aMid: a.slice(s, a.length - e),
+      bMid: b.slice(s, b.length - e),
+      tail: e ? a.slice(a.length - e) : '',
+    };
+  }
+
   function checkMathAgainstSources(msg) {
-    const srcs = (msg.ragSources || []).map(s => normalizeMath(s.text));
-    if (!srcs.length) return null;
+    const sources = msg.ragSources || [];
+    if (!sources.length) return null;
+    const srcNorm = sources.map(s => normalizeMath(s.text));
+    // 資料側の数式も抜いておく。一致しなかった時に「原文はこう」と並べるため
+    const srcSpans = [];
+    for (const s of sources) {
+      for (const raw of extractMathSpans(s.text)) {
+        const key = normalizeMath(raw);
+        if (key.length >= MATH_MIN_LEN) srcSpans.push({ raw, key, src: s });
+      }
+    }
     const spans = extractMathSpans(msg.content)
       .map(raw => ({ raw, key: normalizeMath(raw) }))
       .filter(f => f.key.length >= MATH_MIN_LEN);
     if (!spans.length) return null;
-    const unmatched = spans.filter(f => !srcs.some(src => src.includes(f.key)));
-    return { total: spans.length, unmatched: unmatched.map(f => f.raw) };
+
+    const unmatched = [];
+    for (const f of spans) {
+      if (srcNorm.some(src => src.includes(f.key))) continue;
+      // 一番近い資料側の式を探す。無関係な式を並べると却って混乱するので閾値を置く
+      let best = null, bestScore = 0;
+      for (const c of srcSpans) {
+        const sc = diceSimilarity(f.key, c.key);
+        if (sc > bestScore) { bestScore = sc; best = c; }
+      }
+      unmatched.push({ raw: f.raw, near: bestScore >= 0.55 ? best : null });
+    }
+    return { total: spans.length, unmatched };
   }
 
   // 本文に出てくる .md ファイル名を拾う（登録済みかどうかの照合用）
@@ -6593,10 +6647,34 @@ ${conversationText}
                         )}
                         {mathCheck && mathCheck.unmatched.length > 0 && (
                           <div className="rag-source-warn">
-                            ⚠️ 数式{mathCheck.total}本のうち{mathCheck.unmatched.length}本が、取得した資料の本文に見当たりません。
+                            ⚠️ 数式{mathCheck.total}本のうち{mathCheck.unmatched.length}本が、取得した資料の本文と一致しません。
                             書き換えられている可能性があります（式を変形して答えた場合もここに出ます）。
                             <ul className="rag-math-list">
-                              {mathCheck.unmatched.map((f, k) => <li key={k}><code>{f}</code></li>)}
+                              {mathCheck.unmatched.map((u, k) => {
+                                // 近い式が見つかったら、食い違う部分だけを強調して並べる
+                                const d = u.near ? diffMiddle(u.raw, u.near.raw) : null;
+                                return (
+                                  <li key={k}>
+                                    <div className="rag-math-row">
+                                      <span className="rag-math-tag">回答</span>
+                                      <code>{d
+                                        ? <>{d.head}<mark>{d.aMid}</mark>{d.tail}</>
+                                        : u.raw}</code>
+                                    </div>
+                                    {d && (
+                                      <div className="rag-math-row">
+                                        <span className="rag-math-tag src">資料</span>
+                                        <code>{d.head}<mark>{d.bMid}</mark>{d.tail}</code>
+                                      </div>
+                                    )}
+                                    {u.near && (
+                                      <button className="rag-math-open" onClick={() => setSourceViewer(u.near.src)}>
+                                        🔍 {u.near.src.label}{u.near.src.pageText ? ` p.${u.near.src.pageText}` : ''} の本文を開く
+                                      </button>
+                                    )}
+                                  </li>
+                                );
+                              })}
                             </ul>
                           </div>
                         )}
