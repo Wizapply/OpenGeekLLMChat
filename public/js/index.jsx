@@ -651,6 +651,8 @@ function checkMathAgainstSources(content, ragSources) {
     if (!near && !f.display) continue;
     unmatched.push({ raw: f.raw, near });
   }
+  // 全部見送りだと 0本 になる。「数式0本は資料どおりです」は意味を成さないので黙る
+  if (!matched.length && !unmatched.length) return null;
   return { total: matched.length + unmatched.length, matched, unmatched };
 }
 
