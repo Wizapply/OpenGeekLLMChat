@@ -11,6 +11,7 @@ const { startAgentServer } = require('./agent_proxy');
 const { createLlmPool } = require('./llm_pool');
 const { createOrchestrator, validateWorkflow } = require('./orchestrator');
 const { createGoogleDrive } = require('./google_drive');
+const { createOcrManager } = require('./ocr');
 
 // systemd等で起動された際、カレントディレクトリをserver.jsと同じに固定する
 // これにより相対パスでアクセスされるリソース(モデルキャッシュ等)も安定動作する
@@ -168,8 +169,58 @@ const DEFAULT_CONFIG = {
     sharedDrives: true,             // 共有ドライブ(旧チームドライブ)も対象に含める
     tokenFile: 'gdrive_token.json', // リフレッシュトークンの保存先
   },
+  // ─── OCR (PDF → Markdown → RAG) 設定 ───
+  // アップロードされたPDFを1ページずつ画像化し、Vision LLM (Qwen2.5-VL 等の
+  // OpenAI互換サーバー) に投げて Markdown 化する。完了後は既存のRAGに自動登録され、
+  // チャットの search_documents から参照できるようになる。
+  // 必要な外部コマンド: poppler-utils (pdftoppm / pdfinfo)
+  //   Ubuntu/Debian: sudo apt install poppler-utils
+  ocr: {
+    enabled: true,
+    vlmEndpoint: 'http://localhost:8090/v1/chat/completions', // Vision LLM (OpenAI互換)
+    vlmModel: 'qwen2.5vl',      // リクエストの model フィールド
+    dpi: 300,                   // ページ画像化の解像度
+    maxTokens: 6144,            // 1ページあたりの生成上限
+    temperature: 0.1,
+    pageTimeoutSec: 600,        // 1ページのOCRタイムアウト(秒)
+    pageRetries: 1,             // 失敗時のリトライ回数。使い切ったらそのページはスキップ
+    maxConcurrentJobs: 1,       // 同時実行ジョブ数。単一GPU前提なら1 (将来のマルチGPU用)
+    maxUploadMB: 300,           // 1ファイルのアップロード上限(MB)
+    cacheDir: 'ml/ocr/cache',   // ページ単位のMarkdownキャッシュ (中断ジョブの再開用)
+    jobsFile: 'ml/ocr/jobs.json', // ジョブ状態の永続化先
+    pdfToImageCmd: 'pdftoppm',  // PDF→PNG 変換コマンド (poppler-utils)
+    pdfInfoCmd: 'pdfinfo',      // ページ数取得コマンド (poppler-utils)
+    autoRegisterToRag: true,    // 完了後に自動でRAG登録するか
+    keepPdf: true,              // 完了後もアップロードしたPDFを uploads に残すか
+    prompt: 'この画像は書籍のスキャンページです。以下の形式で出力してください:\n1. 本文はレイアウトを保ちつつ Markdown で出力\n2. 見出しは # / ## / ### を使う\n3. 表は Markdown テーブルで出力\n4. 数式は $ ... $ (インライン) / $$ ... $$ (ブロック) の LaTeX で出力\n5. 図・写真がある場合は [図: 説明] のように記載\n6. ヘッダ・フッタ・ノンブル (ページ番号) は無視してよい\n7. 原文の言語と字体をそのまま保つこと。日本語のページは日本語 (日本の漢字) で出力し、簡体字・繁体字に置き換えないでください\n余計な前置きや解説は一切不要、本文のみ出力してください。',
+  },
   ragTopK: 10,
   ragMode: 'agentic',
+  // ─── 永続RAG のチャンク分割 / 文脈拡張 ───
+  // chunkSize は「embeddingモデルのコンテキスト長」が上限になる点に注意。
+  // mxbai-embed-large 等の BERT 系は 512 トークンが構造上の上限で、config で
+  // embeddingModel.ctx を上げても伸びない。日本語はおおむね1文字≒1トークンなので、
+  // 500文字でもう上限付近。ここを大きくすると埋め込みが切り捨てられ精度が落ちる。
+  //
+  // そこで「埋め込む単位」と「LLMに見せる単位」を分ける。検索は小さいチャンクで行い、
+  // ヒットしたチャンクの前後 ragNeighborChunks 個を連結して渡す。こうすると
+  // 数式とその記号定義のように離れた記述が、埋め込みの制約を侵さずに一緒に届く。
+  ragChunkSize: 500,        // 1チャンクの文字数 (embeddingのctxを超えないこと)
+  ragChunkOverlap: 100,     // チャンク間の重なり
+  ragNeighborChunks: 2,     // ヒットの前後何チャンクを一緒にLLMへ渡すか (0で無効)
+  // ─── 出典台帳 (次のターンへの持ち越し) ───
+  // 検索結果そのもの (1回で約19,000トークン) は次のターンの履歴に残せない。
+  // 残すとコンテキストが2〜3ターンで溢れるため。だが全部捨てると、モデルは
+  // 「【S6】という記号の付いた自分の発言」だけを持った状態で出典を問われ、
+  // 中身を作文する。そこで「どの資料の何ページを読んだか」＋短い抜粋だけを
+  // 次のターンに持ち越す。数千トークンで済み、「この式はどこに出てきますか」に
+  // 再検索なしで答えられる。
+  // 判断モデルに任せず、毎ターン必ず永続RAGを引く。資料を読む道具として使うなら true。
+  // 30B級の判断モデルは専門書の質問に web_search を選ぶことがあり、そこが一番の穴になる。
+  // 雑談用途では検索1回ぶんの待ち時間と、結果ぶんのコンテキストが毎ターン乗る点に注意。
+  ragAlwaysSearch: false,
+  ragLedgerTurns: 1,        // 直近いくつの回答ぶんの出典を持ち越すか (0で無効)
+  ragLedgerChars: 400,      // 1出典あたりの抜粋文字数 (0ならページ対応表のみ)
   systemPrompts: {
     base: 'あなたは親切で知識豊富なAIアシスタントです。日本語で簡潔に回答してください。今日の日付は{date}です。\n\n重要な指示:\n- 思考は手短に済ませ、ユーザーへの回答を必ず出力してください。\n- ツールから取得した情報は信頼し、そのまま使ってください（妥当性を過度に疑わないこと）。\n- 日付に関する自己矛盾を感じても、与えられた{date}を真として処理してください。過去の学習データとの整合性を気にする必要はありません。\n- 天気・ニュース・株価など現在情報は、ツールの結果をそのまま引用してください。',
     documents: '【参照可能なドキュメント】(チャットに添付されたファイル): {docList}\nユーザーの質問が「ドキュメントについて」「資料を見て」「添付ファイル」などを示唆する場合、必ず最初に search_documents ツールを使ってください。\nこれらは添付ドキュメントであり、サーバーファイル（uploads配下）とは別物です。',
@@ -177,6 +228,10 @@ const DEFAULT_CONFIG = {
     fileAccess: '【サーバーファイル操作】(uploads配下、ドキュメントとは別物)\n- list_files: uploadsフォルダの一覧を取得\n- read_file(path): uploadsフォルダのファイル読み込み\n- write_file(path, content): uploadsフォルダにファイル書き込み\n重要: pathには"uploads/"プレフィックスを付けずにファイル名のみを指定してください（例: "hello.py"、"data/config.json"）。\nユーザーが明確に「サーバーファイル」「uploadsフォルダ」「ファイルを保存して」など、サーバー側のファイルシステム操作を依頼した場合のみ使用してください。\nチャットに添付されたドキュメントについての質問では list_files/read_file/write_file は使わず、search_documents を使ってください。',
     python: 'Pythonコード実行について:\n- 応答に ```python ... ``` のコードブロックを含めると、ユーザー側で実行ボタンが表示されます。\n- グラフ・図の作成依頼には matplotlib を使ったPythonコードを提示してください（matplotlib.use(\'Agg\')の指定は不要、plt.show()で自動的にチャットに画像表示されます）。\n- データ処理・計算・可視化の依頼では、迷わずPythonコードブロックを返してください。それだけで完結します。ツール呼び出しは不要です。\n- 大量データ・CSV/Parquet/JSON処理・複雑な集計には DuckDB を使ってください。SQLでpandasより高速かつメモリ効率良く処理できます。\n  使い方: import duckdb; con = duckdb.connect(); df = con.execute("SELECT ... FROM \'data.csv\'").df()\n  CSVやParquetを直接 FROM で参照可能。pandasのDataFrameもテーブルとして使えます（con.execute("SELECT ... FROM df")）。',
     googleDrive: '【Google Drive】(サーバーのuploadsフォルダとも、チャット添付ドキュメントとも別物)\n- gdrive_search_files(query): Drive 全体からファイル名・本文で検索\n- gdrive_list_files(folderId): フォルダの中身を一覧 (folderId は省略可、フォルダ名やパスでも指定できる)\n- gdrive_read_file(fileId): ファイルの中身をテキストで読む (Google ドキュメント/スプレッドシートは自動でテキスト/CSVに変換される)\n- gdrive_import_to_server(fileId): Drive のファイルをサーバーの uploads に取り込む (Pythonで処理したい時やバイナリの時)\n- gdrive_write_file(name, content): Drive にファイルを作成/更新\n- gdrive_upload_from_server(path): uploads のファイルを Drive にアップロード\n- gdrive_create_folder(name): フォルダ作成\n- gdrive_delete_file(fileId): ゴミ箱に移動\n使い方の指針: まず gdrive_search_files か gdrive_list_files で目的のファイルを特定し、返ってきた id を gdrive_read_file に渡すこと。IDが分からないうちに読もうとしないこと。\nIDは長くて写し間違えやすいので、自信が無ければ一覧の【通し番号 (1, 2, 3...)】か【ファイル名】を fileId に渡してもよい。読み込みに失敗しても、同じIDで何度も試さず、候補の番号か名前で指定し直すこと。\nユーザーが「ドライブ」「Google Drive」「グーグルドライブ」「クラウドのファイル」等に言及した場合に使ってください。',
+    // 永続RAG (サーバー登録ドキュメント) が使える時に追記される。
+    // OCRした技術書などを扱う際、モデルが取得した原文を「一般的な形」に
+    // 書き換えてしまう（数式の記号を勝手に置き換える等）のを抑えるための指示。
+    rag: '【サーバー登録ドキュメントの引用について】\n- 数式・記号・変数名・数値は、search_persistent_documents で取得した原文の表記をそのまま使ってください。一般的に知られた形に書き直したり、記号を置き換えたりしないでください。1文字も変えてはいけません。\n- 検索結果に無い項・係数・条件を、自分の知識で補って書き足さないでください。原文に載っていない部分は「取得した範囲には記載がありません」と述べてください。\n- 検索結果が断片的で式の全体が読み取れない時は、無理に完成させず、読み取れた範囲を示したうえで原典の確認を促してください。\n- 【最重要】回答の各項目の末尾に、検索結果に示された出典キーを【S1】のように書いてください。キーは S に数字だけです。資料名やページ番号を自分で書き足さないでください（画面が対応表を表示します）。\n- 角括弧と丸括弧を並べたリンク記法で書いてはいけません。\n- 出典キーを付けられない内容は回答に含めないでください。章や節の番号を推測で書くことは禁止です。\n- 変数名は原文の字体をそのまま写してください。l (小文字エル) と I (大文字アイ) と 1 (数字)、r と R、0 と O はそれぞれ別の記号です。判別できない時は推測で決めず、その旨を書いてください。\n- 過去のやり取りで見た検索結果を、記憶に頼って引用してはいけません。出典を問われたら必ず search_persistent_documents を実行し直し、今回の検索結果だけを根拠にしてください。前のターンの出典キーは今回の回答では無効です。',
     meta: '重要な指示:\n- 内部的な推論・検索戦略・計画・メタ的な説明は一切出力しないでください。\n- "I need to...", "The user wants...", "I should..." のような独り言を書かないでください。\n- ツールを呼び出すと決めたら、即座にツールを呼び出してください。テキスト応答と併用しないでください。\n- 検索結果が得られなかった場合は、その旨を簡潔に伝え、自分の知識で回答してください。',
     judge: '以下の中から必要なツールを呼び出してください。通常の質問に答えられる場合はツールを使わずそのまま応答してください。\n{toolList}\n注意: チャット添付ドキュメントとサーバーuploadsファイルは別物。ドキュメント関連は search_documents、サーバーファイル関連は list_files/read_file/write_file。\nグラフ・計算・データ処理はツール不要。```python ... ``` コードブロックを応答に含めれば自動実行されます（matplotlibで画像表示、DuckDBで高速SQL処理可能）。\n内部推論は書かず、ツールを呼ぶか直接短く応答するかのみ。',
   },
@@ -198,10 +253,21 @@ const DEFAULT_CONFIG = {
   presencePenalty: 0,        // OpenAI互換 presence_penalty
   frequencyPenalty: 0,       // OpenAI互換 frequency_penalty
   // DRY サンプラー: 反復ループに非常に有効 (dryMultiplier=0 で無効)
+  //
+  // ただし RAG とは相性が悪い。DRY は「コンテキスト内で既出のトークン列」の
+  // 再出現に指数関数的なペナルティ (multiplier * base^(長さ-allowedLength)) を
+  // かけるので、走査範囲に検索結果を含めると「原文の逐語引用」がそのまま
+  // 罰の対象になる。10トークン引用で 0.8*1.75^8 ≒ 43 と、事実上禁止に等しい。
+  // 実際に、数式の n が \infty に化け、日本語も既出の漢字から順に脱落した。
+  // 監視対象はモデル自身の直近の出力だけでよいので、範囲を絞る。
   dryMultiplier: 0.8,
   dryBase: 1.75,
-  dryAllowedLength: 2,
-  dryPenaltyLastN: -1,       // -1 = コンテキスト全体を対象
+  dryAllowedLength: 4,       // 3トークンの言い回しは日本語では普通に再出現する
+  dryPenaltyLastN: 512,      // -1 (コンテキスト全体) にすると資料の引用を潰す
+  // 検索結果を渡して回答させる時は、繰り返し系サンプラーを外す。
+  // 原文どおりに書き写させたいのに、書き写すことを罰しては噛み合わない。
+  // 暴走ループは画面側の findTailRepetition と max_tokens で受け止める。
+  ragRelaxSamplers: true,
   // 1応答あたりの最大生成トークン (暴走ループの安全網。agentContext.largePredict が優先)
   chatMaxTokens: 8192,
   // ログレベル: 'verbose' (全ログ), 'normal' (デフォルト), 'quiet' (最小限)
@@ -213,7 +279,7 @@ function loadConfig() {
     if (fs.existsSync(CONFIG_FILE)) {
       const userConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
       const merged = { ...DEFAULT_CONFIG, ...userConfig };
-      ['systemPrompts', 'agentContext', 'transcribe', 'llamaServer', 'embeddingModel', 'ml', 'irodoriTts', 'orchestration', 'googleDrive'].forEach(key => {
+      ['systemPrompts', 'agentContext', 'transcribe', 'llamaServer', 'embeddingModel', 'ml', 'irodoriTts', 'orchestration', 'googleDrive', 'ocr'].forEach(key => {
         if (DEFAULT_CONFIG[key] && typeof DEFAULT_CONFIG[key] === 'object') {
           merged[key] = { ...DEFAULT_CONFIG[key], ...(userConfig[key] || {}) };
         }
@@ -3817,13 +3883,19 @@ function requirePermission(perm) {
 app.get('/config', (req, res) => {
   // 公開しない: password, llamaServer内のbinPath, embeddingModelの実体パス, ml.apiTokens(機密),
   //             googleDrive の clientId/clientSecret/サービスアカウント鍵(機密)
-  const { password, llamaServer, embeddingModel, ml, irodoriTts, googleDrive, ...rest } = appConfig;
+  const { password, llamaServer, embeddingModel, ml, irodoriTts, googleDrive, ocr: ocrCfg, ...rest } = appConfig;
   const safeConfig = {
     ...rest,
     // llamaServer情報は最小限のみ
     llamaServer: { chatPort: llamaServer.chatPort, embeddingPort: llamaServer.embeddingPort },
     // ml は enabled のみ公開、apiTokens(機密)は出さない
     ml: { enabled: !!(ml?.enabled) },
+    // OCR は UI の出し分けに要るぶんだけ (エンドポイントやプロンプトは出さない)
+    ocr: {
+      enabled: ocrCfg ? ocrCfg.enabled !== false : false,
+      maxUploadMB: parseInt(ocrCfg?.maxUploadMB) || 300,
+      autoRegisterToRag: ocrCfg ? ocrCfg.autoRegisterToRag !== false : true,
+    },
   };
   // Google Drive は「使えるか / 書けるか」だけ公開。認証情報は一切出さない
   if (googleDrive) {
@@ -5024,9 +5096,20 @@ app.get('/plots/*', requireAuth, (req, res) => {
 
 // ─── 静的ファイル配信 ───
 // /plots/ は認証付きの専用ルート（上記）で処理するため、静的配信の対象外にする
+//
+// .jsx / .css / .html にはビルド時のハッシュが付かないので、ファイル名が
+// 変わらないまま中身だけが差し替わる。ブラウザが再検証を省くと、更新したのに
+// 古い画面が動き続ける (しかも .jsx は Babel Standalone が XHR で取りに行くため
+// Ctrl+F5 でも取り直されないことがある)。no-cache を明示して毎回 ETag で
+// 確認させる。変わっていなければ 304 が返るだけなので転送量は増えない。
+const NO_CACHE_EXT = /\.(jsx|js|css|html)$/i;
 app.use((req, res, next) => {
   if (req.path.startsWith('/plots/')) return next();
-  express.static(path.join(__dirname, 'public'))(req, res, next);
+  express.static(path.join(__dirname, 'public'), {
+    setHeaders: (res, filePath) => {
+      if (NO_CACHE_EXT.test(filePath)) res.setHeader('Cache-Control', 'no-cache');
+    },
+  })(req, res, next);
 });
 
 // ═══════════════════════════════════════════════════════════════════
@@ -8757,6 +8840,46 @@ function ragChunkText(text, chunkSize = 500, overlap = 100) {
   return chunks;
 }
 
+// チャンク分割 (開始オフセット付き)。ページ番号を引き当てるために位置が要る。
+// 分割ロジックそのものは ragChunkText と同一。
+function ragChunkTextWithOffsets(text, chunkSize, overlap) {
+  const out = [];
+  if (!text) return out;
+  const safeOverlap = Math.min(overlap, Math.floor(chunkSize / 2));
+  let start = 0;
+  while (start < text.length) {
+    const end = Math.min(start + chunkSize, text.length);
+    out.push({ text: text.slice(start, end), start });
+    if (end >= text.length) break;
+    start += chunkSize - safeOverlap;
+  }
+  return out;
+}
+
+// OCR が埋めた `<!-- page=N -->` を拾って [{offset, page}] を作る。
+// これで各チャンクが原典の何ページ由来かを言えるようになり、
+// LLM が「第何章あたり」を推測で答えるのを防げる。
+function ragPageMarkers(text) {
+  const markers = [];
+  const re = /<!--\s*page=(\d+)[^>]*-->/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    markers.push({ offset: m.index, page: parseInt(m[1], 10) });
+  }
+  return markers;
+}
+
+// オフセットに対応するページ番号 (直前のマーカー)。マーカーが無い資料では null
+function ragPageAt(markers, offset) {
+  if (!markers.length) return null;
+  let page = null;
+  for (const mk of markers) {
+    if (mk.offset > offset) break;
+    page = mk.page;
+  }
+  return page;
+}
+
 // cosine類似度
 // ブラウザ側 cosineSim と完全に同じロジック
 function ragCosineSim(a, b) {
@@ -8831,7 +8954,18 @@ async function ragIngestFile(filename) {
   if (!text.trim()) throw new Error('ファイルが空です');
 
   // チャンク分割 + embedding
-  const chunks = ragChunkText(text);
+  // チャンクサイズは embedding の ctx を超えないこと (config のコメント参照)
+  const chunkSize = Math.max(100, parseInt(appConfig.ragChunkSize) || 500);
+  // parseInt(undefined) は NaN で、NaN は ?? をすり抜ける (?? が拾うのは null/undefined だけ)
+  const rawOv = parseInt(appConfig.ragChunkOverlap);
+  const rawOverlap = Number.isFinite(rawOv) ? Math.max(0, rawOv) : 100;
+  // 実際に使われる重なり (分割ロジックが chunkSize/2 で頭打ちにする)。
+  // 検索時に連結する際、この値ぶんを差し引かないと同じ文章が二重に入る。
+  const overlap = Math.min(rawOverlap, Math.floor(chunkSize / 2));
+  const pieces = ragChunkTextWithOffsets(text, chunkSize, rawOverlap);
+  const markers = ragPageMarkers(text);
+  const chunks = pieces.map(p => p.text);
+  const pages = pieces.map(p => ragPageAt(markers, p.start));
   const embeddings = [];
   for (const chunk of chunks) {
     const vec = await ragGetEmbedding(chunk);
@@ -8843,6 +8977,8 @@ async function ragIngestFile(filename) {
   const docData = {
     docId, filename, chunkCount: chunks.length,
     chunks, embeddings,
+    pages,                    // 各チャンクの由来ページ (OCR以外の資料では null 埋め)
+    chunkSize, overlap,       // 再現・デバッグ用に分割条件も残す
     ingestedAt: Date.now(),
   };
   fs.writeFileSync(path.join(RAG_DIR, `${docId}.json`), JSON.stringify(docData), 'utf-8');
@@ -8859,25 +8995,102 @@ async function ragIngestFile(filename) {
 }
 
 // RAG検索 (全ドキュメントのチャンクから cosine 類似度 top-k)
-async function ragSearch(query, topK = 5) {
+//
+// 検索はチャンク単位で行うが、LLM に渡すのはヒットしたチャンクの前後 neighbors 個を
+// 連結したもの。embedding の ctx (BERT系は512トークン固定) を侵さずに、
+// 数式とその記号定義のように離れた記述を一緒に届けるための仕組み。
+// neighbors に null を渡すと config.ragNeighborChunks を使う。
+async function ragSearch(query, topK = 5, neighbors = null) {
   const idx = loadRagIndex();
   if (idx.documents.length === 0) return { results: [], note: 'RAGドキュメントが登録されていません' };
 
+  const n = neighbors === null
+    ? Math.max(0, parseInt(appConfig.ragNeighborChunks) || 0)
+    : Math.max(0, parseInt(neighbors) || 0);
+
   const qVec = await ragGetEmbedding(query);
+  const docs = new Map();   // docId -> ドキュメント本体 (連結時に再読み込みしないため)
   const scored = [];
   for (const doc of idx.documents) {
     const docPath = path.join(RAG_DIR, `${doc.docId}.json`);
     if (!fs.existsSync(docPath)) continue;
     try {
       const data = JSON.parse(fs.readFileSync(docPath, 'utf-8'));
+      docs.set(doc.docId, data);
       for (let i = 0; i < data.chunks.length; i++) {
         const sim = ragCosineSim(qVec, data.embeddings[i]);
-        scored.push({ filename: data.filename, chunkIndex: i, text: data.chunks[i], score: sim });
+        scored.push({ docId: doc.docId, filename: data.filename, chunkIndex: i, score: sim });
       }
     } catch {}
   }
   scored.sort((a, b) => b.score - a.score);
-  return { results: scored.slice(0, topK) };
+  const top = scored.slice(0, topK);
+
+  const pageOf = (data, i) => (Array.isArray(data.pages) ? (data.pages[i] ?? null) : null);
+
+  if (n === 0) {
+    return {
+      results: top.map(h => {
+        const data = docs.get(h.docId);
+        return {
+          filename: h.filename, chunkIndex: h.chunkIndex,
+          page: pageOf(data, h.chunkIndex),
+          text: data.chunks[h.chunkIndex], score: h.score,
+        };
+      }),
+    };
+  }
+
+  // 前後に広げ、同じ資料内で重なった範囲は1つにまとめる
+  // (隣接するチャンクが2件ヒットすると、同じ文章を二重に渡してしまうため)
+  const byDoc = new Map();
+  for (const h of top) {
+    const data = docs.get(h.docId);
+    if (!byDoc.has(h.docId)) byDoc.set(h.docId, []);
+    byDoc.get(h.docId).push({
+      from: Math.max(0, h.chunkIndex - n),
+      to: Math.min(data.chunks.length - 1, h.chunkIndex + n),
+      score: h.score, hit: h.chunkIndex,
+    });
+  }
+
+  const results = [];
+  for (const [docId, ranges] of byDoc) {
+    const data = docs.get(docId);
+    // 旧フォーマット (pages/overlap 未保存) は当時の既定値 100 で連結する
+    const ov = Number.isFinite(data.overlap) ? data.overlap : 100;
+    ranges.sort((a, b) => a.from - b.from);
+    const merged = [];
+    for (const r of ranges) {
+      const last = merged[merged.length - 1];
+      if (last && r.from <= last.to + 1) {
+        last.to = Math.max(last.to, r.to);
+        last.score = Math.max(last.score, r.score);
+        last.hits.push(r.hit);
+      } else {
+        merged.push({ from: r.from, to: r.to, score: r.score, hits: [r.hit] });
+      }
+    }
+    for (const m of merged) {
+      // 連結時は重なりぶんを削る (チャンクは overlap 文字ずつ重複しているため)
+      let text = data.chunks[m.from];
+      for (let i = m.from + 1; i <= m.to; i++) {
+        text += ov > 0 ? data.chunks[i].slice(ov) : data.chunks[i];
+      }
+      const pFrom = pageOf(data, m.from);
+      const pTo = pageOf(data, m.to);
+      results.push({
+        filename: data.filename,
+        chunkIndex: m.hits[0],
+        chunkRange: [m.from, m.to],
+        page: pFrom,
+        pageRange: (pFrom !== null && pTo !== null && pFrom !== pTo) ? [pFrom, pTo] : null,
+        text, score: m.score,
+      });
+    }
+  }
+  results.sort((a, b) => b.score - a.score);
+  return { results };
 }
 
 // ─── RAG API エンドポイント (要 ml:read / ml:write 権限) ───
@@ -8938,15 +9151,174 @@ app.delete('/rag/documents/:docId', requireAuth, requirePermission('ml:write'), 
 });
 
 // RAG 検索 (テスト用、agent_proxy も内部でこれと同じ ragSearch を使う)
+// body: { query, topK?, neighbors? }
+//   topK      … 拾うチャンク数 (省略時 config.ragTopK)
+//   neighbors … ヒットの前後何チャンクを連結して返すか (省略時 config.ragNeighborChunks)
 app.post('/rag/search', requireAuth, requirePermission('ml:read'), requireEmbedding, jsonParser, async (req, res) => {
-  const { query, topK } = req.body || {};
+  const { query, topK, neighbors } = req.body || {};
   if (!query) return res.status(400).json({ error: 'query が必要です' });
   try {
-    const result = await ragSearch(query, Math.min(topK || 5, 20));
+    const k = Math.min(parseInt(topK) || appConfig.ragTopK || 10, 50);
+    const n = (neighbors === undefined || neighbors === null) ? null : Math.min(parseInt(neighbors) || 0, 10);
+    const result = await ragSearch(query, k, n);
     res.json(result);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ════════════════════════════════════════════════
+// OCR (PDF → Vision LLM → Markdown → RAG登録)
+// ════════════════════════════════════════════════
+// PDFをアップロードするだけで、Vision LLM (Qwen2.5-VL 等) が1ページずつ Markdown 化し、
+// 完了後は既存のRAGへ自動登録される。チャット側は追加実装なしで search_documents から参照できる。
+// 実処理は ocr.js (ジョブキュー・ページキャッシュ・pdftoppm 連携) に閉じ込めてある。
+
+// RAGドキュメントの削除 (OCRジョブ削除時に、登録済みのRAGも一緒に片付ける)
+function ragDeleteDocById(docId) {
+  if (!docId || !/^[a-f0-9]{16}$/.test(docId)) return;
+  const docPath = path.join(RAG_DIR, `${docId}.json`);
+  if (fs.existsSync(docPath)) fs.unlinkSync(docPath);
+  const idx = loadRagIndex();
+  idx.documents = idx.documents.filter(d => d.docId !== docId);
+  saveRagIndex(idx);
+}
+
+const ocr = createOcrManager({
+  getConfig: () => appConfig.ocr,
+  baseDir: __dirname,
+  uploadsDir: UPLOADS_DIR,
+  log: (ip, msg) => log(ip, msg),
+  ragIngestFile: (filename) => ragIngestFile(filename),
+  ragDeleteDoc: (docId) => ragDeleteDocById(docId),
+  ensureEmbedding: () => ensureEmbeddingLoaded(),
+});
+
+// 起動時: 実行中のまま落ちたジョブを「待機中」に戻す (ページキャッシュから再開できる)
+ocr.restoreOnBoot();
+
+// OCR機能が無効なら以降に進ませないゲート
+function requireOcr(req, res, next) {
+  if (!ocr.isEnabled()) {
+    return res.status(503).json({ error: 'OCR機能が無効です (config.json の ocr.enabled を true にしてください)' });
+  }
+  next();
+}
+
+// jobId の形式チェック (パス要素としてそのまま使うので厳格に)
+function validJobId(id) {
+  return typeof id === 'string' && /^ocr_\d+_[a-z0-9]+$/.test(id);
+}
+
+// エラーを ocr.js が付けた status で返す
+function ocrError(res, e) {
+  res.status(e.status || 500).json({ error: e.message || String(e) });
+}
+
+// 機能の状態 (依存コマンド・Vision LLM の生死)。UIが事前に警告を出すために使う
+app.get('/ocr/status', requireAuth, requirePermission('ml:read'), async (req, res) => {
+  try { res.json(await ocr.health()); }
+  catch (e) { ocrError(res, e); }
+});
+
+// PDF アップロード → ジョブ登録
+// multipart/form-data (name は任意) か、Content-Type: application/pdf の生ボディ。
+// 生ボディの場合はファイル名を ?name= か X-Filename ヘッダーで渡す。
+// autostart=0 を付けない限り、登録後そのまま実行キューに載せる。
+app.post('/ocr/upload', requireAuth, requirePermission('ml:write'), requireOcr, async (req, res) => {
+  const ip = getIP(req);
+  let job;
+  try {
+    job = await ocr.receiveUpload(req, { ip });
+  } catch (e) {
+    return ocrError(res, e);
+  }
+  // 自動開始 (Vision LLM 停止中などで開始できない場合も、アップロード自体は成功として返す)
+  if (req.query.autostart !== '0') {
+    try {
+      job = await ocr.startJob(job.jobId);
+    } catch (e) {
+      return res.status(202).json({ job, started: false, warning: e.message });
+    }
+    return res.json({ job, started: true });
+  }
+  res.json({ job, started: false });
+});
+
+// ジョブ一覧
+app.get('/ocr/jobs', requireAuth, requirePermission('ml:read'), (req, res) => {
+  res.json({ jobs: ocr.listJobs() });
+});
+
+// 個別ジョブ
+app.get('/ocr/jobs/:jobId', requireAuth, requirePermission('ml:read'), (req, res) => {
+  if (!validJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const job = ocr.getJob(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'ジョブが見つかりません' });
+  res.json({ job });
+});
+
+// 進捗のリアルタイム配信 (SSE)。ページ完了ごとに progress イベントが飛ぶ
+app.get('/ocr/jobs/:jobId/stream', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const jobId = req.params.jobId;
+  if (!validJobId(jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const job = ocr.getJob(jobId);
+  if (!job) return res.status(404).json({ error: 'ジョブが見つかりません' });
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',  // nginx 経由でもバッファさせない
+  });
+
+  const send = (event) => {
+    if (!res.writableEnded) res.write(`data: ${JSON.stringify(event)}\n\n`);
+  };
+  // 接続直後に現在の状態を1回流す (再接続時に取りこぼさないため)
+  send({ type: 'status', job });
+
+  const unsubscribe = ocr.subscribe(jobId, send);
+  // プロキシに切られないための keep-alive
+  const ping = setInterval(() => { if (!res.writableEnded) res.write(': ping\n\n'); }, 15000);
+
+  req.on('close', () => {
+    clearInterval(ping);
+    unsubscribe();
+  });
+});
+
+// ジョブ開始 (中断・失敗したジョブの再開もこれ。キャッシュ済みページはスキップされる)
+// 完了済みを作り直す時は {redo: true}。{pages: "133, 240"} でそのページだけ引き直す
+app.post('/ocr/jobs/:jobId/start', requireAuth, requirePermission('ml:write'), requireOcr, jsonParser, async (req, res) => {
+  if (!validJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const body = req.body || {};
+  try {
+    res.json({ job: await ocr.startJob(req.params.jobId, { redo: body.redo === true, pages: body.pages }) });
+  } catch (e) { ocrError(res, e); }
+});
+
+// 実行中ジョブの中断 (ページキャッシュは残すので、開始し直せば続きから)
+app.post('/ocr/jobs/:jobId/cancel', requireAuth, requirePermission('ml:write'), (req, res) => {
+  if (!validJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const ip = getIP(req);
+  try {
+    const job = ocr.cancelJob(req.params.jobId);
+    log(ip, `[OCR] キャンセル要求: ${job.filename}`);
+    res.json({ job });
+  } catch (e) { ocrError(res, e); }
+});
+
+// ジョブ削除 (キャッシュ・元PDF・生成Markdown・RAG登録をまとめて削除)
+// ?keepFiles=1 でジョブ記録だけ消してファイルは残す
+app.delete('/ocr/jobs/:jobId', requireAuth, requirePermission('ml:write'), (req, res) => {
+  if (!validJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const ip = getIP(req);
+  try {
+    const r = ocr.deleteJob(req.params.jobId, { keepFiles: req.query.keepFiles === '1' });
+    log(ip, `[OCR] ジョブ削除: ${req.params.jobId}`);
+    res.json(r);
+  } catch (e) { ocrError(res, e); }
 });
 
 // ─── フォールバック ───

@@ -1,0 +1,212 @@
+  /* ─── OCR 画面固有のスタイル ───
+     レイアウト・ボタン・モーダル等の共通部品は tuning-styles.css を読み込んで使う。
+     ここには「PDFのドロップ領域」と「ジョブカード + 進捗バー」だけを足す。 */
+
+  /* ─── アップロード領域 ─── */
+  .ocr-dropzone {
+    border: 2px dashed var(--border-active);
+    border-radius: var(--radius);
+    background: var(--bg-tertiary);
+    padding: 36px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.15s;
+    margin-bottom: 16px;
+  }
+  .ocr-dropzone:hover { border-color: var(--accent); background: var(--bg-hover); }
+  .ocr-dropzone.dragover {
+    border-color: var(--accent);
+    background: var(--accent-dim);
+    transform: scale(1.005);
+  }
+  .ocr-dropzone.disabled { opacity: 0.5; cursor: not-allowed; }
+  .ocr-dropzone.disabled:hover { border-color: var(--border-active); background: var(--bg-tertiary); }
+  .ocr-dropzone-icon { font-size: 40px; line-height: 1; margin-bottom: 10px; }
+  .ocr-dropzone-title { font-size: 15px; font-weight: 500; margin-bottom: 6px; }
+  .ocr-dropzone-desc { font-size: 12px; color: var(--text-muted); line-height: 1.7; }
+  .ocr-file-input { display: none; }
+
+  /* ─── 前提条件の警告 (poppler未導入 / Vision LLM停止) ─── */
+  .ocr-alert {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    border-radius: var(--radius-sm);
+    padding: 12px 14px;
+    font-size: 12px;
+    line-height: 1.7;
+    margin-bottom: 16px;
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+  }
+  .ocr-alert.error { border-color: var(--red); background: var(--red-dim); color: var(--text-primary); }
+  .ocr-alert.warn { border-color: var(--orange); background: var(--orange-dim); color: var(--text-primary); }
+  .ocr-alert-icon { font-size: 16px; line-height: 1.4; }
+  .ocr-alert-body { flex: 1; min-width: 0; }
+  .ocr-alert-title { font-weight: 600; margin-bottom: 3px; }
+  .ocr-alert code {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    background: var(--bg-primary);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  /* ─── ジョブカード ─── */
+  .ocr-job-list { display: flex; flex-direction: column; gap: 10px; }
+  .ocr-job {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 14px 16px;
+  }
+  .ocr-job.running { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-dim); }
+  .ocr-job.failed { border-color: var(--red); }
+
+  .ocr-job-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+  }
+  .ocr-job-name {
+    font-weight: 500;
+    font-size: 14px;
+    word-break: break-all;
+    flex: 1;
+    min-width: 160px;
+  }
+  .ocr-job-size { font-size: 11px; color: var(--text-muted); font-family: var(--font-mono); }
+
+  .ocr-status {
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .ocr-status.pending   { background: var(--bg-hover);   color: var(--text-secondary); }
+  .ocr-status.queued    { background: var(--blue-dim);   color: var(--blue); }
+  .ocr-status.running   { background: var(--orange-dim); color: var(--orange); }
+  .ocr-status.completed { background: var(--green-dim);  color: var(--green); }
+  .ocr-status.failed    { background: var(--red-dim);    color: var(--red); }
+  .ocr-status.cancelled { background: var(--bg-hover);   color: var(--text-muted); }
+
+  /* ─── 進捗バー ─── */
+  .ocr-progress {
+    height: 8px;
+    background: var(--bg-primary);
+    border-radius: 20px;
+    overflow: hidden;
+    margin-bottom: 8px;
+  }
+  .ocr-progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--accent-hover));
+    border-radius: 20px;
+    transition: width 0.3s ease;
+  }
+  .ocr-progress-fill.done { background: var(--green); }
+  .ocr-progress-fill.failed { background: var(--red); }
+  .ocr-progress-fill.idle { background: var(--text-muted); }
+  /* 実行中は進行方向に流れるストライプを重ねて「動いている」ことを示す */
+  .ocr-progress-fill.active {
+    background-image: linear-gradient(90deg, var(--accent), var(--accent-hover)),
+      repeating-linear-gradient(45deg, rgba(255,255,255,0.16) 0 8px, transparent 8px 16px);
+    background-blend-mode: overlay;
+    animation: ocr-stripes 1s linear infinite;
+    background-size: 100% 100%, 22px 22px;
+  }
+  @keyframes ocr-stripes {
+    from { background-position: 0 0, 0 0; }
+    to   { background-position: 0 0, 22px 0; }
+  }
+
+  .ocr-progress-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 10px;
+    font-size: 12px;
+    flex-wrap: wrap;
+  }
+  .ocr-progress-pages { font-family: var(--font-mono); color: var(--text-primary); }
+  .ocr-progress-pct { color: var(--accent); font-weight: 600; }
+  .ocr-progress-time { color: var(--text-muted); font-size: 11px; font-family: var(--font-mono); }
+
+  /* ─── メタ情報 ─── */
+  .ocr-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 16px;
+    margin-top: 10px;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  .ocr-meta-item { display: flex; gap: 5px; }
+  .ocr-meta-key { color: var(--text-muted); }
+  .ocr-meta-val { color: var(--text-secondary); font-family: var(--font-mono); }
+
+  .ocr-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    padding: 3px 9px;
+    border-radius: 20px;
+    background: var(--green-dim);
+    color: var(--green);
+    font-family: var(--font-mono);
+  }
+  .ocr-badge.warn { background: var(--orange-dim); color: var(--orange); }
+
+  .ocr-error {
+    margin-top: 10px;
+    padding: 8px 10px;
+    background: var(--red-dim);
+    border: 1px solid var(--red);
+    border-radius: var(--radius-sm);
+    color: var(--red);
+    font-size: 12px;
+    line-height: 1.6;
+    word-break: break-word;
+  }
+
+  .ocr-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 12px;
+    flex-wrap: wrap;
+  }
+  .ocr-actions .spacer { margin-left: auto; }
+
+  /* ─── アップロード中のリスト ─── */
+  .ocr-uploading {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 10px 14px;
+    margin-bottom: 10px;
+  }
+  .ocr-spinner {
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--border-active);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: ocr-spin 0.8s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes ocr-spin { to { transform: rotate(360deg); } }
+
+  @media (max-width: 768px) {
+    .ocr-dropzone { padding: 26px 14px; }
+    .ocr-job-name { min-width: 100%; }
+  }

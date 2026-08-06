@@ -227,6 +227,26 @@ renderer.code = function(arg1, arg2) {
   }
   return '<div class="code-block-wrapper"><div class="code-header"><span>' + (language || 'code') + '</span><div class="code-header-actions">' + actionBtns + '<button class="copy-btn" onclick="copyCode(this, \'' + id + '\')">コピー</button></div></div><pre><code id="' + id + '" class="hljs language-' + language + '">' + highlighted + '</code></pre><div id="output-' + id + '"></div></div>';
 };
+// ─── カスタムRenderer: 飛べないリンクは素のテキストに落とす ───
+// RAG の出典をモデルが Markdown のリンク記法で書き出すことがある。
+// 例: 「[219](テラメカニックス-走行力学-.md)」
+// これは相対パスなので現在のURL (/chat/xxx) に連結され、存在しないページへの
+// リンクになる。しかもファイル名はモデルが書き崩していて手掛かりにもならない。
+// http(s)/mailto/アンカー/絶対パス以外はリンクにせず、文字として表示する。
+renderer.link = function (arg1, title, text) {
+  // marked v12 は (href, title, text)。将来版のオブジェクト形式にも備える
+  const isObj = typeof arg1 === 'object' && arg1 !== null;
+  const href = String(isObj ? (arg1.href || '') : (arg1 || ''));
+  const ttl = String(isObj ? (arg1.title || '') : (title || ''));
+  const label = String(isObj ? (arg1.text || '') : (text || ''));
+  // /chat/<何か>.md は存在しない。モデルがフルURLで出典を捏造した時の形なので弾く
+  const bogusDoc = /\/chat\/[^?#]*\.md$/i.test(href);
+  const navigable = /^(https?:\/\/|mailto:|#|\/)/i.test(href) && !bogusDoc;
+  if (!navigable) return label || href;
+  const q = (s) => s.replace(/"/g, '&quot;');
+  return '<a href="' + q(href) + '"' + (ttl ? ' title="' + q(ttl) + '"' : '')
+    + ' target="_blank" rel="noreferrer noopener">' + label + '</a>';
+};
 marked.use({ renderer });
 
 // ─── コピー関数（グローバル）───
@@ -527,8 +547,169 @@ function escapeHtml(str) {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+// ─── 数式の照合 ─────────────────────────────────────────
+// 資料の本文は ragSources[].text として手元にあるので、回答に書かれた数式が
+// 本当にそこから写されたものかを、モデルに聞かずに文字列比較で確かめられる。
+// DRY サンプラーが原因で n が \infty に化けた件は、これで検出できる。
+//
+// 注意: ここで見ているのは「渡した資料どおりに書いたか」であって、
+// 「式が正しいか」ではない。OCR が間違っていれば、忠実に写した時点で一致する。
+function extractMathSpans(text) {
+  // コードブロック内の $ は数式ではないので先に落とす
+  const s = String(text || '').replace(/```[\s\S]*?```/g, '');
+  // OCR の出力は不揃いで、同じ本でも $$…$$ のページと \begin{equation} の
+  // ページが混ざる。どちらも数式として扱わないと照合対象から漏れる
+  const re = /\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\\begin\{(?:equation|align|gather|displaymath)\*?\}([\s\S]+?)\\end\{(?:equation|align|gather|displaymath)\*?\}|\$([^$\n]+?)\$|\\\(([\s\S]+?)\\\)/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    // $$…$$ / \[…\] / \begin{equation} はブロック数式。「これが式です」と
+    // 提示している箇所。インラインは文中で項を取り出して説明していることが
+    // 多いので扱いを分ける
+    const display = m[1] != null || m[2] != null || m[3] != null;
+    const body = (m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5] ?? '').trim();
+    if (body) out.push({ raw: body, display });
+  }
+  return out;
+}
+
+// 表記ゆれの吸収。$ と $$ の違い、\left\right の有無、空白や波括弧の付け方で
+// 不一致にしたくない。両辺に同じ正規化をかけるので、比較としては壊れない
+function normalizeMath(s) {
+  return String(s || '')
+    // 式番号 (\tag{5.3}) は資料側にしか無いことが多く、比較の邪魔になる
+    .replace(/\\tag\*?\{[^}]*\}/g, '')
+    .replace(/\\left|\\right|\\displaystyle|\\quad|\\qquad|\\cdot|\\[,;:!]/g, '')
+    .replace(/[{}\s]/g, '');
+}
+
+// 短い式は何にでも一致してしまい情報量が無いので対象外にする。
+// ただしブロック数式 ($$…$$) は「これが式です」という主張なので、
+// 文中で記号に触れているだけのインラインより短くても判定する。
+// p_m = \frac{W}{2BD} は正規化して14字。25字では取りこぼしていた
+const MATH_MIN_LEN = 25;          // インライン数式
+const MATH_MIN_LEN_DISPLAY = 10;  // ブロック数式
+
+// 2文字組の重なりで似ている度合いを測る (Dice係数)。外部ライブラリ不要で、
+// 記号の並びのような短い文字列でも素直に効く
+function diceSimilarity(a, b) {
+  if (a === b) return 1;
+  if (a.length < 2 || b.length < 2) return 0;
+  const grams = new Map();
+  for (let i = 0; i < a.length - 1; i++) {
+    const g = a.slice(i, i + 2);
+    grams.set(g, (grams.get(g) || 0) + 1);
+  }
+  let hit = 0;
+  for (let i = 0; i < b.length - 1; i++) {
+    const g = b.slice(i, i + 2);
+    const c = grams.get(g) || 0;
+    if (c > 0) { grams.set(g, c - 1); hit++; }
+  }
+  return (2 * hit) / ((a.length - 1) + (b.length - 1));
+}
+
+// 食い違っている部分だけを切り出す。共通の先頭と末尾を落として真ん中を残す。
+// ε が係数から分母へ移ったような違いは、これで一目で分かる
+function diffMiddle(a, b) {
+  let s = 0;
+  while (s < a.length && s < b.length && a[s] === b[s]) s++;
+  let e = 0;
+  while (e < a.length - s && e < b.length - s && a[a.length - 1 - e] === b[b.length - 1 - e]) e++;
+  return {
+    head: a.slice(0, s),
+    aMid: a.slice(s, a.length - e),
+    bMid: b.slice(s, b.length - e),
+    tail: e ? a.slice(a.length - e) : '',
+  };
+}
+
+function checkMathAgainstSources(content, ragSources) {
+  const sources = ragSources || [];
+  if (!sources.length) return null;
+  const srcNorm = sources.map(s => normalizeMath(s.text));
+  // 資料側の数式も抜いておく。一致しなかった時に「原文はこう」と並べるため
+  const srcSpans = [];
+  for (const s of sources) {
+    for (const { raw } of extractMathSpans(s.text)) {
+      const key = normalizeMath(raw);
+      if (key.length >= MATH_MIN_LEN_DISPLAY) srcSpans.push({ raw, key, src: s });
+    }
+  }
+  const spans = extractMathSpans(content)
+    .map(f => ({ ...f, key: normalizeMath(f.raw) }))
+    .filter(f => f.key.length >= (f.display ? MATH_MIN_LEN_DISPLAY : MATH_MIN_LEN));
+  if (!spans.length) return null;
+
+  const matched = [];    // 資料の本文にそのまま在る
+  const unmatched = [];  // 在らず、かつ「本来こうだ」と示せる
+  const unverified = []; // 在らず、示すものも無い (判定を保留する)
+  for (const f of spans) {
+    if (srcNorm.some(src => src.includes(f.key))) { matched.push(f.raw); continue; }
+    // 一番近い資料側の式を探す。無関係な式を並べると却って混乱するので閾値を置く
+    let best = null, bestScore = 0;
+    for (const c of srcSpans) {
+      const sc = diceSimilarity(f.key, c.key);
+      if (sc > bestScore) { bestScore = sc; best = c; }
+    }
+    const near = bestScore >= 0.55 ? best : null;
+    // 対応する式を示せない時は「不一致」と断定しない。理由が3つあり得て、
+    // どれなのか判別できないため:
+    //   ・モデルが書き換えた
+    //   ・モデルが式を変形・分解して説明した (正しい)
+    //   ・資料側の OCR が数式を LaTeX 化できていない (正しい)
+    // 実際、p_m = \frac{W}{2BD} に対して資料は "pm = W2BD" と分数の横線が
+    // 落ちた状態で、意味は同じなのに文字列は一致しない。
+    // ここを警告にすると、正しい回答が毎回警告されて信用されなくなる。
+    if (!near) {
+      // インラインは項の説明であることが多いので黙る。ブロックは中立の印を出す
+      if (f.display) unverified.push(f.raw);
+      continue;
+    }
+    unmatched.push({ raw: f.raw, near });
+  }
+  const total = matched.length + unmatched.length + unverified.length;
+  if (!total) return null;   // 「数式0本は資料どおりです」は意味を成さない
+  return { total, matched, unmatched, unverified };
+}
+
+/**
+ * 照合結果を数式そのものの位置に貼る。
+ * 出典欄にまとめて出すと、どの式のことなのか本文と突き合わせないと分からない。
+ * verdicts は「正規化した式 → 判定」の Map (checkMathAgainstSources が作る)。
+ */
+function mathVerdictMap(check) {
+  if (!check) return null;
+  const m = new Map();
+  for (const raw of check.matched || []) m.set(normalizeMath(raw), { ok: true });
+  for (const u of check.unmatched || []) m.set(normalizeMath(u.raw), { ok: false, near: u.near });
+  for (const raw of check.unverified || []) m.set(normalizeMath(raw), { ok: null });
+  return m.size ? m : null;
+}
+
+// 一致しなかった式の下に、資料側の式と食い違い部分を並べる HTML を作る。
+//
+// 要素はすべてインライン (span/code/mark) にすること。数式は marked が作った
+// <p> の中へ後から差し込まれるので、<div> を混ぜるとブラウザが <p> を閉じてしまい、
+// この塊が数式の外へ飛び出す。見た目はCSSの display:block で作る。
+function mathDiffHtml(raw, near) {
+  if (!near) {
+    return '<span class="math-chk-note">取得した資料の本文に、これに近い式が見つかりませんでした</span>';
+  }
+  const d = diffMiddle(raw, near.raw);
+  const row = (label, cls, mid) =>
+    '<span class="math-chk-row"><span class="math-chk-tag ' + cls + '">' + label + '</span>'
+    + '<code>' + escapeHtml(d.head) + '<mark>' + escapeHtml(mid) + '</mark>' + escapeHtml(d.tail) + '</code></span>';
+  return '<span class="math-chk-diff">'
+    + row('回答', 'ans', d.aMid)
+    + row('資料', 'src', d.bMid)
+    + '<span class="math-chk-note">' + escapeHtml(near.src.label)
+    + (near.src.pageText ? ' p.' + escapeHtml(near.src.pageText) : '') + ' より</span>'
+    + '</span>';
+}
+
 // ─── LaTeX レンダリング ───
-function renderLatex(text) {
+function renderLatex(text, verdicts) {
   if (!text || typeof katex === 'undefined') return text;
 
   const placeholders = [];
@@ -541,11 +722,27 @@ function renderLatex(text) {
   }
 
   function renderKatex(expr, displayMode) {
+    let html;
     try {
-      return katex.renderToString(expr, { displayMode, throwOnError: false, trust: true });
+      html = katex.renderToString(expr, { displayMode, throwOnError: false, trust: true });
     } catch {
-      return '<code>' + escapeHtml(expr) + '</code>';
+      html = '<code>' + escapeHtml(expr) + '</code>';
     }
+    const v = verdicts && verdicts.get(normalizeMath(expr));
+    if (!v) return html;
+    if (v.ok === true) {
+      return '<span class="math-chk ok" title="取得した資料の本文と一致します（資料自体の正しさまでは保証しません）">'
+        + html + '<span class="math-chk-badge">✓ 資料と一致</span></span>';
+    }
+    if (v.ok === null) {
+      // 資料側に対応する式が見つからない。書き換えなのか、式を変形したのか、
+      // 資料の OCR が数式を LaTeX 化できていないのか、区別できない
+      return '<span class="math-chk unk" title="資料側に対応する式が見つからず、照合できませんでした。誤りとは限りません（資料のOCRが数式を取れていない場合もここに入ります）">'
+        + html + '<span class="math-chk-badge">? 照合できず</span></span>';
+    }
+    return '<span class="math-chk ng" title="取得した資料の本文と一致しません">'
+      + html + '<span class="math-chk-badge">⚠ 資料と不一致</span>'
+      + (displayMode ? mathDiffHtml(expr, v.near) : '') + '</span>';
   }
 
   // コードブロック保護: ```...``` をプレースホルダーに退避
@@ -569,6 +766,10 @@ function renderLatex(text) {
   // ブロック数式: $$ ... $$ or \[ ... \]
   text = text.replace(/\$\$([\s\S]+?)\$\$/g, (_, expr) => placeholder(renderKatex(expr.trim(), true)));
   text = text.replace(/\\\[([\s\S]+?)\\\]/g, (_, expr) => placeholder(renderKatex(expr.trim(), true)));
+  // OCR が \begin{equation} 形式で出すことがある。KaTeX はこの環境名を解さないので
+  // 中身だけ取り出してブロック数式として描画する (\tag は KaTeX が解釈できる)
+  text = text.replace(/\\begin\{(?:equation|displaymath)\*?\}([\s\S]+?)\\end\{(?:equation|displaymath)\*?\}/g,
+    (_, expr) => placeholder(renderKatex(expr.trim(), true)));
 
   // インライン数式: $ ... $ or \( ... \)（ただし $5 や $10 のような通貨表記は除外）
   text = text.replace(/(?<!\$)\$(?!\$)(?!\d+\s)(.+?)(?<!\$)\$(?!\$)/g, (_, expr) => placeholder(renderKatex(expr.trim(), false)));
@@ -603,8 +804,14 @@ function renderLatex(text) {
 // ─── MarkdownContent コンポーネント ───
 // MarkdownContent: メッセージのcontentをMarkdownレンダリング
 // React.memo でラップして、contentが変わらなければ再レンダリングしない（出力DOMの保持のため重要）
-const MarkdownContent = React.memo(function MarkdownContent({ content }) {
+const MarkdownContent = React.memo(function MarkdownContent({ content, mathSources }) {
   const ref = useRef(null);
+
+  // 数式の照合結果。式そのものの位置にバッジを出すため、ここで作って
+  // renderLatex に渡す。mathSources が null の間 (ストリーミング中) は照合しない
+  const mathVerdicts = React.useMemo(
+    () => mathVerdictMap(mathSources ? checkMathAgainstSources(content, mathSources) : null),
+    [content, mathSources]);
 
   // [[gen_image:URL|encodedPrompt]] / [[gen_audio:URL|encodedText]] マーカーを
   // パースしてセグメントに分割。
@@ -643,7 +850,7 @@ const MarkdownContent = React.memo(function MarkdownContent({ content }) {
   // React.memo で contentが変わらない限りこの関数自体が呼ばれないので、
   // 既に書き込まれた output-* の中身は再レンダリングで消えない
   if (!hasMarkers) {
-    const html = renderLatex(content || '');
+    const html = renderLatex(content || '', mathVerdicts);
     return React.createElement('div', {
       ref,
       dangerouslySetInnerHTML: { __html: html },
@@ -656,7 +863,7 @@ const MarkdownContent = React.memo(function MarkdownContent({ content }) {
       {segments.map((seg, i) => {
         if (seg.type === 'text') {
           if (!seg.value.trim()) return null;
-          const html = renderLatex(seg.value);
+          const html = renderLatex(seg.value, mathVerdicts);
           return <div key={i} dangerouslySetInnerHTML={{ __html: html }} />;
         }
         if (seg.type === 'gen_image') {
@@ -1072,6 +1279,8 @@ function App() {
   // 永続RAG (サーバー側 ml/rag/) の状態
   // embedding 利用可能 + 登録ドキュメント数 > 0 のとき、通常チャットでも自動的に
   // search_persistent_documents ツールが追加される
+  // 出典ビューア (【S1】をクリックすると、渡された本文と元PDFの該当ページを表示)
+  const [sourceViewer, setSourceViewer] = useState(null);
   const [persistentRagAvailable, setPersistentRagAvailable] = useState(false);
   const [persistentRagDocCount, setPersistentRagDocCount] = useState(0);
   const [persistentRagDocNames, setPersistentRagDocNames] = useState([]);
@@ -1089,6 +1298,112 @@ function App() {
     return persistentRagDocNames.length > maxShow
       ? `${shown} など${persistentRagDocCount}件`
       : shown;
+  }
+
+  // 永続RAGの出典に使う「短い呼び名」を作る。
+  // 長い日本語ファイル名 (テラメカニックス-走行力学-.md) をモデルに何度も
+  // 書き写させると毎回違う形に崩れる (テラメカニクックス / テラメカノックス 等) ため、
+  // 拡張子を落とし、最初の区切り記号までを呼び名として使う。
+  //   テラメカニックス-走行力学-.md            → テラメカニックス
+  //   入門シリーズ32 斜面の安定・変形…-.md      → 入門シリーズ32
+  //   S.P.Cウォール工法.md                     → S.P.Cウォール工法
+  function shortSourceLabel(filename) {
+    let s = String(filename || '').replace(/\.[^.]+$/, '');
+    const cut = s.split(/[-–—―~〜_\s　]/).filter(Boolean)[0];
+    if (cut) s = cut;
+    if (s.length > 14) s = s.slice(0, 14);
+    return s.trim() || String(filename || '資料');
+  }
+
+  // ─── 出典の捏造対策 ─────────────────────────────────────
+  // ツール結果は次のターンの履歴に載らない。にもかかわらず履歴の中の
+  // 回答本文には【S3】のような出典キーが残るので、モデルは手元に無い
+  // 資料をキーだけ見て思い出そうとし、「S9 は Bekker の文献」のように
+  // 意味を作り出してしまう。履歴に渡す時点でキーを実際の資料名に開き、
+  // 対応表に無い（＝捏造された）キーは落としておく。
+  function resolveStaleSourceKeys(m) {
+    const content = String(m.content || '');
+    if (m.role !== 'assistant' || !/【\s*S\d+\s*】/.test(content)) return content;
+    const map = new Map((m.ragSources || []).map(s => [s.key, s]));
+    return content.replace(/【\s*(S\d+)\s*】/g, (_whole, key) => {
+      const s = map.get(key);
+      return s ? `（出典: ${s.label}${s.pageText ? ' p.' + s.pageText : ''}）` : '';
+    });
+  }
+
+  // 「ソースは?」「どこに書いてある?」のような問い直しは、判断モデルに
+  // 任せると「さっき答えたばかり」と見なして検索を省く。だが手元に資料は
+  // 残っていないので、省いた瞬間に出典は作文になる。この形の発話では
+  // 検索を強制する。
+  // 取りこぼしと空振りでは重さが違う（空振りは検索1回ぶんの待ち時間だが、
+  // 取りこぼしは出典の捏造になる）ので、広めに拾う。
+  // 「エラーはどこで出てますか」のような無関係な質問も引っかかるが許容する。
+  const SOURCE_QUESTION_RE = new RegExp([
+    '出典', '引用元', '原典', '根拠', '裏付け', 'エビデンス', '参考文献',
+    // 「ソースコード」「リソース」を巻き込まないよう助詞まで見る
+    'ソース\\s*(は|を|が|って|教え|示し|出し|[?？])',
+    'どこ(に|で)?(書|載|出て|ありま|でしょ)', 'どこから', 'どこですか', 'どこ\\s*[?？]',
+    '何ページ', '何頁', 'どのページ', 'どの(章|節|項)', '何(章|節)',
+    'どの資料', 'どのファイル', 'どの本', 'md\\s?ファイル',
+    '該当(の|する)?(箇所|部分|ページ|ファイル|記述)', '箇所を?\\s*(教え|示し|知り)',
+    '(載って|書いて|記載され)(ない|ません|いない|いません|ますか)',
+    '(存在し|実在し)(ない|ません)',
+    '本当\\s*[?？]', '本当ですか', '確か(なの|ですか)',
+    'S\\d+\\s*(って|とは|は何|は[?？])',
+  ].join('|'));
+
+  // 資料を引いたように読める書きぶり。検索していないのにこれが出ていたら、
+  // 出典そのものがモデルの作文である可能性が高い。
+  // 「によると」のような一般的な言い回しは入れない（雑談で誤爆するため）
+  const CITATION_SHAPE_RE = /【\s*S\d+\s*】|[^\s「」『』()（）]+\.md\b|出典|参考文献|原典|に記載され|に書かれて|p\.\s?\d+/;
+
+  // 直前の検索で読んだ資料を、次のターンにも持ち越すための「出典台帳」。
+  // ツール結果そのものを残せれば一番いいが、1回の検索で約19,000トークンあり
+  // 64K のコンテキストでは2〜3ターンで溢れる。「どの資料の何ページを読んだか」
+  // と短い抜粋だけなら数千トークンで収まり、これだけあれば
+  // 「この式はどこに出てきますか」には再検索なしで答えられる。
+  // 本文の続きが要る質問は、従来どおり検索し直させる。
+  function buildSourceLedger(msgs) {
+    // parseInt(undefined) は NaN。NaN は ?? をすり抜けるので Number.isFinite で見る
+    // (?? が拾うのは null/undefined だけ)。設定が無いと台帳ごと消えていた
+    const num = (v, dflt) => { const n = parseInt(v); return Number.isFinite(n) ? Math.max(0, n) : dflt; };
+    const turns = num(appConfig.ragLedgerTurns, 1);
+    if (!turns) return null;
+    const excerpt = num(appConfig.ragLedgerChars, 400);
+    // 新しい順に、出典対応表を持つアシスタント発言を turns 件ぶん拾う
+    const picked = [];
+    for (let i = msgs.length - 1; i >= 0 && picked.length < turns; i--) {
+      if (msgs[i].role === 'assistant' && msgs[i].ragSources?.length) picked.push(msgs[i]);
+    }
+    if (!picked.length) return null;
+    const seen = new Set();
+    const lines = [];
+    for (const m of picked) {
+      for (const s of m.ragSources) {
+        const id = `${s.filename}#${s.pageText}`;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        // 本文中では短い呼び名で書かれているので、実ファイル名との対応も出す
+        const head = `── ${s.label}（${s.filename}）${s.pageText ? ` p.${s.pageText}` : ''} ──`;
+        const full = String(s.text || '');
+        const body = excerpt ? full.replace(/\s+/g, ' ').slice(0, excerpt) : '';
+        lines.push(body ? `${head}\n${body}${full.length > excerpt ? ' …(以下略)' : ''}` : head);
+      }
+    }
+    if (!lines.length) return null;
+    return {
+      role: 'system',
+      content: '【前のターンで実際に読んだ資料】\n'
+        + 'これは直前の検索で取得した範囲です。「どの資料の何ページか」を問われたら、この一覧に基づいて答えてください。\n'
+        + '本文は抜粋です。続きや細部が要る場合は search_persistent_documents で取り直してください。\n'
+        + 'ここに無い資料名・ページ・人名・ファイル名を、読んだかのように書いてはいけません。\n\n'
+        + lines.join('\n\n'),
+    };
+  }
+
+  // 本文に出てくる .md ファイル名を拾う（登録済みかどうかの照合用）
+  function mdNamesIn(text) {
+    return [...new Set((String(text || '').match(/[^\s「」『』()（）\[\]【】、,]+\.md\b/g) || []))];
   }
 
   // URLパスからチャットIDを取得（例: /chat/abc123 → "abc123"）
@@ -1492,9 +1807,11 @@ function App() {
 
     // 直近履歴（履歴中の画像までは送らない。テキストのみ）
     const RECENT = appConfig.recentMessageCount || 6;
+    // 出典キーは「そのターン限りの通し番号」なので、履歴に渡す前に実際の
+    // 資料名へ開いておく（詳細は resolveStaleSourceKeys のコメント）
     const history = messages.slice(-RECENT)
       .filter(m => typeof m.content === 'string' && m.content)
-      .map(m => ({ role: m.role, content: m.content }));
+      .map(m => ({ role: m.role, content: resolveStaleSourceKeys(m) }));
 
     // 参照ドキュメント: チャット添付分はブラウザ側に埋め込みがあるのでここで検索する。
     // サーバー側の永続RAGは /orchestra/run 内で検索され、両者が統合される。
@@ -1794,7 +2111,7 @@ function App() {
       if (oldMessages.length > 0) {
         const summary = oldMessages.map(m => {
           const role = m.role === 'user' ? 'ユーザー' : 'アシスタント';
-          const content = (m.content || '').slice(0, 500);  // 各500文字に圧縮
+          const content = resolveStaleSourceKeys(m).slice(0, 500);  // 各500文字に圧縮
           return `[${role}] ${content}`;
         }).join('\n\n');
         history.push({
@@ -1807,7 +2124,9 @@ function App() {
       recentMessages.forEach((m, i) => {
         const isLast = i === recentMessages.length - 1;
         const hasImages = m.images && m.images.length > 0;
-        let textContent = m.content || '';
+        // 出典キーは「そのターン限りの通し番号」なので、履歴に渡す前に
+        // 実際の資料名へ開いておく（詳細は resolveStaleSourceKeys のコメント）
+        let textContent = resolveStaleSourceKeys(m);
         if (isLast && m.role === 'user' && textContent) {
           textContent = `【今この質問に回答してください】\n${textContent}`;
         }
@@ -1829,6 +2148,21 @@ function App() {
         }
         history.push(h);
       });
+
+      // 直前に読んだ資料の台帳を、今回の質問の直前に差し込む。
+      // ツール結果は履歴に残らないので、これが無いとモデルは
+      // 出典キーだけを頼りに中身を思い出そうとして作文する
+      const ledger = buildSourceLedger(allMessages);
+      if (ledger) {
+        history.splice(Math.max(0, history.length - 1), 0, ledger);
+        console.log(`[出典台帳] ${ledger.content.length}文字を履歴に追加`);
+      } else {
+        // 乗らなかった時こそ理由が要る。台帳は黙って消えると気づけない
+        const withSrc = allMessages.filter(m => m.role === 'assistant' && m.ragSources?.length).length;
+        console.log(`[出典台帳] 追加なし (ragLedgerTurns=${appConfig.ragLedgerTurns}, `
+          + `ragLedgerChars=${appConfig.ragLedgerChars}, 出典付きの過去回答=${withSrc}件)`);
+      }
+
       // OpenAI互換パラメータ（llama-server）
       // num_ctxはサーバー起動時に固定されるためリクエスト時は不要
       const llamaCommonOptions = {
@@ -1864,8 +2198,12 @@ function App() {
       // ツール判断ループ(agentic)に入る条件。
       // ドキュメント添付 or Web検索ON に加え、画像生成/音声合成/Google Drive が有効なら
       // 「描いて」「音声にして」「ドライブの資料見て」等を検出できるよう常にツール判断を通す。
+      // 永続RAGに資料があるならツール判断は必要。これが条件から漏れていると、
+      // Web検索も画像生成も切った「資料を読むだけ」の構成で
+      // search_persistent_documents に一生たどり着けない
       const useAgentic = appConfig.ragMode === 'agentic'
-        && (documents.length > 0 || webSearchActive || appConfig.imageGen || appConfig.ttsGen || gdriveActive);
+        && (documents.length > 0 || webSearchActive || appConfig.imageGen || appConfig.ttsGen || gdriveActive
+            || (persistentRagAvailable && persistentRagDocCount > 0));
 
       if (useAgentic) {
         // ─── Agentic RAG + Web検索: LLMがツールで検索を判断 ───
@@ -2386,6 +2724,11 @@ function App() {
         if (gdriveActive && sp.googleDrive) {
           agentSystem += '\n\n' + sp.googleDrive;
         }
+        // 永続RAGが使える時だけ、引用の忠実性に関する指示を足す
+        // (原文の数式・記号を一般形に書き換えるのを抑え、出典ページを添えさせる)
+        if (persistentRagAvailable && persistentRagDocCount > 0 && sp.rag) {
+          agentSystem += '\n\n' + sp.rag;
+        }
         if (sp.python) {
           agentSystem += '\n\n' + sp.python;
         }
@@ -2400,6 +2743,120 @@ function App() {
         // 実行済みツール呼び出し (fnName + 引数) の記録。同じ呼び出しの繰り返しを防ぐ
         const executedToolCalls = new Set();
         let searchQueries = [];
+        // 永続RAGの出典レジストリ。ターン内で S1, S2, … の通し番号を維持する。
+        // モデルには ASCII の短いキーだけを書かせ、実際のファイル名は
+        // 画面側がこのデータから描く。日本語の資料名を転写させると
+        // 「テラメカニックス」が毎回違う形に崩れるため (Qwen3.6 で確認)。
+        const ragSourceRegistry = [];   // [{ key, filename, label, page, pageRange }]
+        const ragSourceKey = (r) => {
+          const pg = r.pageRange ? `${r.pageRange[0]}-${r.pageRange[1]}`
+            : (r.page != null ? String(r.page) : '');
+          const found = ragSourceRegistry.find(s => s.filename === r.filename && s.pageText === pg);
+          if (found) return found;
+          const entry = {
+            key: `S${ragSourceRegistry.length + 1}`,
+            filename: r.filename,
+            label: shortSourceLabel(r.filename),
+            pageText: pg,
+            // 出典をクリックした時に見せる「実際に渡された本文」。
+            // 履歴JSONが肥大しないよう上限を設ける
+            text: String(r.text || '').slice(0, 4000),
+            // OCR由来の資料なら同名のPDFが uploads にある (foo.md → foo.pdf)。
+            // PDFの物理ページ番号は <!-- page=N --> と一致するので #page= で直接開ける
+            pdf: /\.md$/i.test(r.filename) ? r.filename.replace(/\.md$/i, '.pdf') : null,
+            pdfPage: r.pageRange ? r.pageRange[0] : (r.page != null ? r.page : null),
+          };
+          ragSourceRegistry.push(entry);
+          return entry;
+        };
+
+        // 永続RAG検索の実体。ツール呼び出しからも、出典を問われた時の強制検索からも
+        // ここを通す。結果の整形と出典レジストリの更新を二重に持ちたくないため。
+        const searchPersistentRag = async (query) => {
+          searchQueries.push({ query: `永続RAG検索: ${query}`, resultCount: null, type: 'rag' });
+          setMessages(prev => {
+            const copy = [...prev];
+            copy[copy.length - 1] = {
+              ...copy[copy.length - 1],
+              agentStatus: `📚 永続RAG検索「${query}」中...`,
+              searchQueries: [...searchQueries],
+            };
+            return copy;
+          });
+
+          let ragResults = [];
+          let ragError = null;
+          try {
+            const res = await fetch('/rag/search', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              // topK は config.ragTopK を尊重する (以前は 5 固定で設定が効いていなかった)。
+              // neighbors は省略してサーバー側の config.ragNeighborChunks に委ねる。
+              body: JSON.stringify({ query, topK: appConfig.ragTopK || 10 }),
+            });
+            if (res.ok) {
+              const data = await res.json();
+              ragResults = data.results || [];
+            } else {
+              const data = await res.json().catch(() => ({}));
+              ragError = data.error || `HTTP ${res.status}`;
+            }
+          } catch (e) {
+            ragError = e.message;
+          }
+          searchQueries[searchQueries.length - 1].resultCount = ragResults.length;
+
+          let ragResultText;
+          if (ragError) {
+            ragResultText = `永続RAG検索エラー: ${ragError}`;
+          } else if (ragResults.length === 0) {
+            ragResultText = 'サーバー登録ドキュメントから関連する情報は見つかりませんでした。'
+              + '\n見つからなかったのだから、資料名・ページ・著者名を書いてはいけません。'
+              + '「登録資料には該当する記述が見つかりませんでした」とだけ答えてください。';
+          } else {
+            // 出典は ASCII の短いキー (S1, S2, …) で書かせる。
+            // 日本語の資料名を転写させると「テラメカニックス」が
+            // 「テラメカニンクス」「テラメカロニク ス」等に毎回崩れるため
+            // (Qwen3.6 で確認)。実際のファイル名とページは画面側が
+            // ragSources から描くので、モデルを経由しない。
+            const citations = [];
+            ragResultText = ragResults.map((r) => {
+              const s = ragSourceKey(r);
+              citations.push(`【${s.key}】`);
+              return `── 資料 ${s.key} ──\n`
+                + `出典キー: ${s.key}   (${s.label}${s.pageText ? ' p.' + s.pageText : ''})   類似度: ${r.score.toFixed(3)}\n`
+                + `${r.text}\n`
+                + `── ここまでが ${s.key} の内容 ──`;
+            }).join('\n\n');
+            ragResultText += '\n\n════\n'
+              + '上記を回答に使うときは、各記述の末尾に出典キーを書いてください。\n'
+              + '使用できる出典キー: ' + citations.join(' / ') + '\n'
+              + '【S1】のように、キーだけを【】で囲んで書いてください。'
+              + '資料名やページ番号を自分で書き足さないでください（画面側が対応表を表示します）。\n'
+              + '角括弧と丸括弧を並べたリンク記法（[...](...)）で書いてはいけません。\n'
+              + 'ここに無いキーを書いてはいけません。章や節の番号を推測で書くことも禁止です。\n'
+              + '上に載っていない人名・著者名・文献名・ファイル名を書いてはいけません。'
+              + '聞かれても「取得した範囲には出てきません」と答えてください。';
+          }
+
+          setMessages(prev => {
+            const copy = [...prev];
+            copy[copy.length - 1] = {
+              ...copy[copy.length - 1],
+              agentStatus: null,
+              searchQueries: [...searchQueries],
+              // 「このターンで実際に検索したか」を残す。検索していないのに
+              // 出典めいた書きぶりをしていたら画面側で警告するため
+              ragSearched: true,
+              // 出典の対応表をメッセージに持たせる。表示はモデルの出力ではなく
+              // このデータから描くので、資料名が書き崩されることがない
+              ...(ragSourceRegistry.length > 0 ? { ragSources: ragSourceRegistry.map(s => ({ ...s })) } : {}),
+            };
+            return copy;
+          });
+          return ragResultText;
+        };
+
         // ツールが実際に生成したメディアの本物URL。
         // LLMが [[gen_audio:...]]/[[gen_image:...]] のファイル名を改変して出力する
         // ことがあるため、最終応答でこの実URLでマーカーを確定させる。
@@ -2436,7 +2893,13 @@ function App() {
         }
         if (persistentRagAvailable && persistentRagDocCount > 0) {
           const persistentSummary = summarizePersistentRagDocs(5);
-          toolListLines.push(`- search_persistent_documents: サーバー登録済みドキュメント (${persistentSummary}) から検索 ★社内文書・マニュアル・FAQ等の参照に使う`);
+          // 「社内文書・マニュアル・FAQ」とだけ書くと、専門書が登録されていても
+          // 判断モデルが対象外と見なして web_search に流れる。資料名を前に出す
+          toolListLines.push(
+            `- search_persistent_documents: サーバーに登録済みの資料 (${persistentSummary}) から検索。` +
+            `★これらの資料で扱っていそうな話題なら、web_search より先に必ずこれを使う。` +
+            `専門書・技術資料・社内文書・マニュアル等が登録されている`
+          );
         }
         if (webSearchActive) {
           toolListLines.push('- web_search: インターネット検索（最新情報が必要な場合）');
@@ -2480,6 +2943,43 @@ function App() {
 
         const judgeNumPredict = needsLargeGen ? largePredict : smallPredict;
         console.log(`[ツール判断] max_tokens=${judgeNumPredict}, history=${judgeHistory.length}件 (needsLargeGen=${needsLargeGen})`);
+
+        // ─── 判断モデルを待たずに永続RAGを引く場合 ───
+        //
+        // (a) 出典を問い直された時
+        //     ツール結果は次のターンの履歴に残らない。にもかかわらず判断モデルは
+        //     「さっき答えたばかり」と見て検索を省くので、モデルの手元には
+        //     資料が無いまま出典だけを聞かれる状態になり、人名・文献名・
+        //     ファイル名を作文してしまう（実際に「中村」や存在しない .md が出た）。
+        //
+        // (b) ragAlwaysSearch が true の時
+        //     資料を読むための道具として使うなら、毎回引いた方が確実。
+        //     判断モデル (30B級) は専門書の質問に web_search を選んだり、
+        //     存在しないテーブルへの SQL を書いたりする。信用しない選択肢を残す。
+        const ragUsable = persistentRagAvailable && persistentRagDocCount > 0;
+        const isSourceQuestion = ragUsable && SOURCE_QUESTION_RE.test(text);
+        const alwaysSearchRag = ragUsable && appConfig.ragAlwaysSearch === true;
+        if (isSourceQuestion || alwaysSearchRag) {
+          let forcedQuery = text.slice(0, 400);
+          if (isSourceQuestion) {
+            // 「ソースは?」だけでは検索語として弱い。直前の質問を軸に据える
+            const prevUser = [...messages].reverse()
+              .find(m => m.role === 'user' && typeof m.content === 'string' && m.content);
+            forcedQuery = [prevUser?.content, text].filter(Boolean).join(' ').slice(0, 400);
+          }
+          console.log(`[永続RAGを強制検索] ${isSourceQuestion ? '出典要求を検出' : 'ragAlwaysSearch'}: "${forcedQuery}"`);
+          const forcedArgs = JSON.stringify({ query: forcedQuery });
+          const forcedCall = {
+            id: 'call_forced_rag',
+            type: 'function',
+            function: { name: 'search_persistent_documents', arguments: forcedArgs },
+          };
+          const forcedText = await searchPersistentRag(forcedQuery);
+          apiMessages.push({ role: 'assistant', content: '', tool_calls: [forcedCall] });
+          apiMessages.push({ role: 'tool', tool_call_id: forcedCall.id, content: forcedText });
+          // 同じ引数での再検索は無駄なので実行済みにしておく
+          executedToolCalls.add(`search_persistent_documents:${forcedArgs}`);
+        }
 
         // ─── ツール実行ループ ───
         // Gemma系モデルはマルチターンのツール呼び出しが不安定（テキスト形式の<|tool_call|>を出力することがある）
@@ -2821,59 +3321,7 @@ function App() {
 
             } else if (fnName === 'search_persistent_documents') {
               // 永続RAG: サーバー側 ml/rag/ に登録済みのドキュメントから embedding 検索
-              const query = fnArgs.query || text;
-              searchQueries.push({ query: `永続RAG検索: ${query}`, resultCount: null, type: 'rag' });
-
-              setMessages(prev => {
-                const copy = [...prev];
-                copy[copy.length - 1] = {
-                  ...copy[copy.length - 1],
-                  agentStatus: `📚 永続RAG検索「${query}」中...`,
-                  searchQueries: [...searchQueries],
-                };
-                return copy;
-              });
-
-              let ragResults = [];
-              let ragError = null;
-              try {
-                const res = await fetch('/rag/search', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ query, topK: 5 }),
-                });
-                if (res.ok) {
-                  const data = await res.json();
-                  ragResults = data.results || [];
-                } else {
-                  const data = await res.json().catch(() => ({}));
-                  ragError = data.error || `HTTP ${res.status}`;
-                }
-              } catch (e) {
-                ragError = e.message;
-              }
-              searchQueries[searchQueries.length - 1].resultCount = ragResults.length;
-
-              setMessages(prev => {
-                const copy = [...prev];
-                copy[copy.length - 1] = {
-                  ...copy[copy.length - 1],
-                  agentStatus: null,
-                  searchQueries: [...searchQueries],
-                };
-                return copy;
-              });
-
-              let ragResultText;
-              if (ragError) {
-                ragResultText = `永続RAG検索エラー: ${ragError}`;
-              } else if (ragResults.length === 0) {
-                ragResultText = 'サーバー登録ドキュメントから関連する情報は見つかりませんでした。';
-              } else {
-                ragResultText = ragResults.map((r, i) =>
-                  `[サーバー資料${i + 1}: ${r.filename} (スコア: ${r.score.toFixed(3)})]\n${r.text}`
-                ).join('\n\n');
-              }
+              const ragResultText = await searchPersistentRag(fnArgs.query || text);
               apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: ragResultText });
 
             } else if (fnName === 'detect_objects') {
@@ -3603,6 +4051,8 @@ function App() {
         const contextInfo = uniqueContexts.length > 0 ? uniqueContexts : null;
 
         // ステップ3: 最終ストリーミング応答（toolsなしで即座にストリーム）
+        // ragSources はツール実行中に付けた出典対応表。ここで作り直すと
+        // 消えてしまうので明示的に引き継ぐ（回答本文だけをクリアする）
         setMessages(prev => {
           const copy = [...prev];
           copy[copy.length - 1] = {
@@ -3610,9 +4060,21 @@ function App() {
             contexts: contextInfo,
             agentStatus: searchQueries.length > 0 ? '回答生成中...' : null,
             searchQueries: searchQueries,
+            ragSources: copy[copy.length - 1]?.ragSources,
+            ragSearched: copy[copy.length - 1]?.ragSearched,
           };
           return copy;
         });
+
+        // ─── 引用させる回答では繰り返し系サンプラーを外す ───
+        // DRY はコンテキスト内の既出トークン列の再出現を指数関数的に罰する。
+        // 検索結果を渡した状態でこれを効かせると、原文どおりに書き写す行為が
+        // そのまま罰の対象になり、モデルは別の語に逃げるしかなくなる
+        // (数式の n が \infty に化け、日本語も既出の漢字から順に脱落した)。
+        // 暴走ループは streamResponse の findTailRepetition と max_tokens で受ける。
+        const hasSourcesForAnswer = apiMessages.some(m => m.role === 'tool');
+        const relaxSamplers = hasSourcesForAnswer && appConfig.ragRelaxSamplers !== false;
+        if (relaxSamplers) console.log('[サンプラー緩和] 逐語引用のため繰り返しペナルティを無効化');
 
         const finalRes = await fetchWithRetry('/v1/chat/completions', {
           method: 'POST',
@@ -3623,6 +4085,13 @@ function App() {
             stream: true,
             stream_options: { include_usage: true },
             ...llamaCommonOptions,
+            // llamaCommonOptions より後ろに置くこと。先に書くと上書きされて効かない
+            ...(relaxSamplers ? {
+              repeat_penalty: 1.0,
+              dry_multiplier: 0,
+              presence_penalty: 0,
+              frequency_penalty: 0,
+            } : {}),
           }),
           signal: controller.signal,
         });
@@ -3666,6 +4135,13 @@ function App() {
                 stream: true,
                 stream_options: { include_usage: true },
                 ...llamaCommonOptions,
+                // 本番と同じ条件で引き直す (ここもツール結果を渡した回答なので)
+                ...(relaxSamplers ? {
+                  repeat_penalty: 1.0,
+                  dry_multiplier: 0,
+                  presence_penalty: 0,
+                  frequency_penalty: 0,
+                } : {}),
               }),
               signal: controller.signal,
             });
@@ -3787,6 +4263,7 @@ function App() {
           searchQueries[searchQueries.length - 1].resultCount = webResults.length;
 
           // 既存の最終応答メッセージをクリアして再ストリーミング
+          // (ragSources は引き継ぐ。作り直すと出典対応表が消えるため)
           setMessages(prev => {
             const copy = [...prev];
             copy[copy.length - 1] = {
@@ -3794,6 +4271,8 @@ function App() {
               contexts: contextInfo,
               agentStatus: '回答生成中...',
               searchQueries: [...searchQueries],
+              ragSources: copy[copy.length - 1]?.ragSources,
+              ragSearched: copy[copy.length - 1]?.ragSearched,
             };
             return copy;
           });
@@ -5767,6 +6246,11 @@ ${conversationText}
                   🤖 機械学習
                 </a>
               )}
+              {appConfig.ocr?.enabled && (
+                <a className="tuning-link" href="/ocr.html" title="PDFをOCRしてRAGに登録する画面を開く">
+                  📄 OCR
+                </a>
+              )}
             </div>
           </div>
         </div>
@@ -5911,21 +6395,6 @@ ${conversationText}
                 <button className="doc-remove" onClick={() => { setDocuments(prev => prev.filter((_, j) => j !== i)); messagesDirtyRef.current = true; }}>×</button>
               </div>
             ))}
-            {persistentRagAvailable && persistentRagDocCount > 0 && (
-              <div
-                className="doc-item"
-                style={{ background: 'var(--accent-dim, rgba(124,77,255,0.08))', cursor: 'help' }}
-                title={`サーバーに登録済みのRAGドキュメント (${persistentRagDocCount}件): ${persistentRagDocNames.join(', ')}\nLLMが自動的にこれらを検索します`}
-              >
-                <div className="doc-info">
-                  <div className="doc-icon">📚</div>
-                  <div className="doc-meta">
-                    <div className="doc-name">永続RAG (サーバー登録)</div>
-                    <div className="doc-stats">{persistentRagDocCount}件のドキュメントを自動検索</div>
-                  </div>
-                </div>
-              </div>
-            )}
           </div>
         </div>
         <a
@@ -6037,6 +6506,55 @@ ${conversationText}
               </div>
             </div>
           )}
+          {/* 出典ビューア: LLMに実際に渡された本文と、元PDFの該当ページを並べて出す。
+              モデルの要約ではなく生の引用元を見せるので、原典との突き合わせがその場でできる */}
+          {sourceViewer && (
+            <div className="role-modal-overlay" onClick={() => setSourceViewer(null)}>
+              <div className="src-modal" onClick={e => e.stopPropagation()}>
+                <div className="role-modal-header">
+                  <span>
+                    <span className="rag-source-key">{sourceViewer.key}</span>
+                    {' '}{sourceViewer.filename.replace(/\.md$/, '')}
+                    {sourceViewer.pageText && ` p.${sourceViewer.pageText}`}
+                  </span>
+                  <button className="role-modal-close" onClick={() => setSourceViewer(null)}>×</button>
+                </div>
+                <div className="src-modal-body">
+                  <div className="src-pane">
+                    <div className="src-pane-title">
+                      LLMに渡された本文
+                      <button className="src-copy-btn"
+                        onClick={() => navigator.clipboard?.writeText(sourceViewer.text || '')}>コピー</button>
+                    </div>
+                    <div className="src-text">{sourceViewer.text || '(本文が保存されていません)'}</div>
+                  </div>
+                  <div className="src-pane">
+                    <div className="src-pane-title">
+                      元のPDF
+                      {sourceViewer.pdf && (
+                        <a className="src-copy-btn"
+                          href={`/uploads/${encodeURIComponent(sourceViewer.pdf)}${sourceViewer.pdfPage ? `#page=${sourceViewer.pdfPage}` : ''}`}
+                          target="_blank" rel="noreferrer noopener">別タブで開く</a>
+                      )}
+                    </div>
+                    {sourceViewer.pdf ? (
+                      <iframe
+                        className="src-pdf"
+                        title="出典PDF"
+                        src={`/uploads/${encodeURIComponent(sourceViewer.pdf)}${sourceViewer.pdfPage ? `#page=${sourceViewer.pdfPage}&view=FitH` : ''}`}
+                      />
+                    ) : (
+                      <div className="src-text">この資料には対応するPDFがありません。</div>
+                    )}
+                  </div>
+                </div>
+                <div className="role-editor-hint">
+                  💡 ページ番号はPDFの物理ページです（本に印刷されたノンブルとずれることがあります）。
+                  PDFが表示されない場合は、元ファイルが uploads から削除されています。
+                </div>
+              </div>
+            </div>
+          )}
           {messages.length === 0 ? (
             <div className="welcome-screen">
               <div className="welcome-icon"></div>
@@ -6123,10 +6641,108 @@ ${conversationText}
                       ))}
                     </div>
                   )}
+                  {/* 永続RAGの出典対応表。回答中の【S1】がどの資料の何ページかを示す。
+                      モデルの出力ではなく検索結果のデータから描くので、
+                      資料名が書き崩されることがない */}
+                  {(() => {
+                    if (msg.role !== 'assistant') return null;
+                    const body = String(msg.content || '');
+                    // 本文が使っている出典キーを拾い、対応表に無いものを警告する。
+                    // 検索していないのにモデルが【S5】等を捏造することがあり、
+                    // 出典が付いているぶん却って信頼できるように見えてしまうため。
+                    const known = new Set((msg.ragSources || []).map(s => s.key));
+                    const used = new Set((body.match(/【\s*(S\d+)\s*】/g) || [])
+                      .map(m => m.replace(/[【】\s]/g, '')));
+                    const unknown = [...used].filter(k => !known.has(k));
+                    // 本文に出てくる .md のうち、登録されていないファイル名。
+                    // 「テラメカクス/走行力学.md」のような、それらしいだけの
+                    // 存在しないファイル名を名指しで潰す
+                    const knownMd = new Set(persistentRagDocNames);
+                    const fakeMd = mdNamesIn(body).filter(n => !knownMd.has(n));
+                    // 検索していないのに資料を引いたような書きぶりをしている
+                    // ragSearched が付く前に保存されたチャットもあるので、
+                    // 出典対応表が付いていれば検索済みとみなす
+                    const searched = !!msg.ragSearched || !!msg.ragSources?.length;
+                    const notSearched =
+                      persistentRagAvailable && persistentRagDocCount > 0 &&
+                      !searched && !(isLoading && i === messages.length - 1);
+                    const citeyWithoutSearch = notSearched && CITATION_SHAPE_RE.test(body);
+                    // 出典めいた語が無くても内容を作ることはある。まとまった長さの
+                    // 回答には「検索したのか」を必ず出す。短い相槌までは出さない
+                    const quietNotSearched = notSearched && !citeyWithoutSearch && body.length >= 120;
+                    // 数式の照合。ストリーミング中は毎トークン走ってしまうので、
+                    // 書き終わってから一度だけ判定する
+                    const mathCheck = (isLoading && i === messages.length - 1)
+                      ? null : checkMathAgainstSources(body, msg.ragSources);
+                    const hasWarn = unknown.length > 0 || fakeMd.length > 0 || citeyWithoutSearch;
+                    if (!msg.ragSources?.length && !hasWarn) {
+                      return quietNotSearched
+                        ? <div className="rag-nosearch">🔍 登録資料は未検索 — この回答はモデルの知識だけで書かれています</div>
+                        : null;
+                    }
+                    return (
+                      <div className="rag-sources">
+                        <div className="rag-sources-title">📚 出典</div>
+                        {(msg.ragSources || []).map(s => (
+                          <button
+                            key={s.key}
+                            className="rag-source-item"
+                            onClick={() => setSourceViewer(s)}
+                            title="クリックで引用元の本文とPDFを表示"
+                          >
+                            <span className="rag-source-key">{s.key}</span>
+                            <span className="rag-source-name" title={s.filename}>{s.filename.replace(/\.md$/, '')}</span>
+                            {s.pageText && <span className="rag-source-page">p.{s.pageText}</span>}
+                            <span className="rag-source-open">🔍</span>
+                          </button>
+                        ))}
+                        {citeyWithoutSearch && (
+                          <div className="rag-source-warn">
+                            ⚠️ この回答はサーバー登録資料を<strong>検索していません</strong>。
+                            資料名・ページ・著者名が書かれていても裏付けはなく、モデルの記憶によるものです。
+                            「◯◯について、登録資料を検索して出典を示してください」と聞き直してください。
+                          </div>
+                        )}
+                        {unknown.length > 0 && (
+                          <div className="rag-source-warn">
+                            ⚠️ 本文に、検索結果に無い出典キー（{unknown.join(', ')}）が使われています。
+                            該当箇所は資料の裏付けが無く、モデルの知識で書かれた可能性があります。
+                          </div>
+                        )}
+                        {fakeMd.length > 0 && (
+                          <div className="rag-source-warn">
+                            ⚠️ 本文に、登録されていないファイル名（{fakeMd.join(', ')}）が書かれています。
+                            このファイルは存在しません。
+                          </div>
+                        )}
+                        {mathCheck && (
+                          <div className={mathCheck.unmatched.length ? 'rag-source-warn' : 'rag-math-ok'}>
+                            {mathCheck.unmatched.length > 0 && (
+                              <>⚠️ 数式{mathCheck.total}本のうち{mathCheck.unmatched.length}本が、取得した資料の本文と一致しません。
+                                本文中の該当する式に印を付け、資料側の式と並べています。</>
+                            )}
+                            {mathCheck.unmatched.length === 0 && mathCheck.matched.length > 0 && (
+                              <>🧮 数式{mathCheck.matched.length}本は取得した資料の本文どおりです
+                                <span className="rag-math-note">（資料自体の正しさまでは保証しません）</span></>
+                            )}
+                            {mathCheck.unmatched.length === 0 && mathCheck.unverified.length > 0 && (
+                              <div className="rag-math-note">
+                                {mathCheck.unverified.length}本は資料側に対応する式が見つからず、照合できませんでした。
+                                誤りとは限りません（資料のOCRが数式を取れていない場合もここに入ります）。
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
                   {msg.orchestra && <OrchestraPanel orch={msg.orchestra} />}
                   {msg.role === 'assistant' ? (
                     <div className="msg-bubble">
-                      <MarkdownContent content={msg.content} />
+                      <MarkdownContent
+                        content={msg.content}
+                        mathSources={(isLoading && i === messages.length - 1) ? null : msg.ragSources}
+                      />
                     </div>
                   ) : (
                     <React.Fragment>

@@ -62,6 +62,91 @@ LLMが直接サーバーのファイルシステムに `.py` / `.xml` / `.json` 
 
 → セットアップ手順は [☁️ Google Drive 連携のセットアップ](#️-google-drive-連携のセットアップ) を参照
 
+### 📄 PDF OCR（Vision LLM → Markdown → RAG自動登録）
+
+紙の技術書をスキャンしたPDFを `/ocr.html` にドロップするだけで、**Vision LLM が1ページずつ Markdown に起こし、完了後そのまま RAG に登録**されます。以降はチャット画面で「あの資料の◯◯について」と普通に聞けます（フロントエンドの追加操作は不要）。
+
+**流れ**
+
+```
+PDF アップロード
+  → pdftoppm で1ページずつ 300dpi PNG 化
+  → Vision LLM (Qwen2.5-VL 等) に投げて Markdown 化
+  → ページ単位でキャッシュ (ml/ocr/cache/<jobId>/pXXXX.md)
+  → 全ページ結合 → public/uploads/<名前>.md
+  → ragIngestFile() で RAG 登録 → search_persistent_documents から参照可能
+```
+
+**特徴**
+
+- **ページ単位でリアルタイム進捗**: SSE (`/ocr/jobs/:id/stream`) で `p42/258 (16%)` のように表示。経過時間と残り時間の推定も出る
+**回答に書かれた数式の照合**
+
+検索でヒットしたチャンクの本文は `ragSources[].text` として画面側に残るので、回答の数式（`$...$` / `$$...$$` / `\(...\)` / `\[...\]` / `\begin{equation}…\end{equation}`）がそこから写されたものかを、モデルに聞かずに文字列比較で確かめます。空白・波括弧・`\left`/`\right`/`\cdot` の差は正規化して吸収します。短すぎる式は何にでも一致してしまうため、**インラインは正規化後25文字以上、ブロック数式（`$$…$$`）は10文字以上**を判定対象にします。ブロック数式は「これが式です」という主張なので、`$$p_m = \frac{W}{2BD}$$`（正規化13文字）のような短いものも見ます。
+
+**「一致しない」と「照合できない」を分けます。** 資料側に対応する式を示せない時は `? 照合できず` と中立に表示し、警告にはしません。理由が3つあり得て区別できないためです — モデルが書き換えた／モデルが式を変形した／**資料側のOCRが数式をLaTeX化できていない**。実際 `p_m = \frac{W}{2BD}` に対し資料が `pm = W2BD`（分数の横線が落ちている）という例があり、意味は同じなのに文字列は一致しません。ここを警告にすると正しい回答が毎回警告され、警告そのものが信用されなくなります。
+
+インライン数式で資料側に近い式も見つからないものは、判定せず見送ります。文中で式の項を取り出して説明している箇所（`$\frac{1}{l}\sum W_i\delta_i$` など）が該当し、正しい回答でも必ず引っかかるためです。「元がこれだ」と示せない以上、書き換えなのか導出なのか区別できません。ブロック数式（`$$…$$`）は「これが式です」という提示なので、示せなくても知らせます。
+
+判定は**本文中の数式そのものに付きます**（`✓ 資料と一致` / `⚠ 資料と不一致`）。出典欄にまとめて出すと、どの式のことか本文と突き合わせないと分からないためです。一致しないブロック数式には、資料側から一番近い式（Dice係数0.55以上）を探して**その場に回答と資料を並べ、食い違う部分だけを強調**します。実際に `Q_c = \frac{2BD}{\varepsilon}(...)` と `Q_c = 2BD\varepsilon(...)` の違い（ε が係数から分母へ移っている＝物理的に別の式）を、この表示で特定できました。その場から出典ビューアも開けます。**見ているのは「渡した資料どおりに書いたか」であって「式が正しいか」ではありません**（OCR が誤っていれば、忠実に写した時点で一致します）。式を変形して答えた場合も警告に出ます。
+
+---
+
+- **中断しても続きから**: ページごとに Markdown をキャッシュしているので、キャンセル・サーバー再起動のあと「▶ 再開」を押せば未処理ページだけを処理します。300ページのPDFで250ページ目に落ちても、やり直しは50ページぶんだけ
+- **1ページ失敗してもジョブは止まらない**: リトライ後スキップして次ページへ進み、失敗ページを記録します（結合後のMarkdownにも `<!-- page=12 failed=1 -->` として残る）
+- **完了後でもページ単位で引き直せる**: 完了ジョブの「🔄 再OCR」でページ番号（`240` / `133, 240` / `10-12`）を指定すると、そのページのキャッシュだけ捨てて取り直し、Markdownの再結合とRAG再登録まで自動で走ります。空欄なら全ページやり直し
+- **依存パッケージ追加なし**: PDF→画像は poppler-utils の `pdftoppm` を `child_process` で呼ぶだけ。npm 依存は増えません
+- **単一GPUを前提に1ジョブずつ順次処理**: Qwen2.5-VL 7B (~9GB) と embedding (~1.5GB) は同じGPUに同居できます。`maxConcurrentJobs` を上げれば将来のマルチGPUにも対応
+- **数式・表・図に対応したプロンプト**: 表は Markdown テーブル、数式は LaTeX (`$...$` / `$$...$$`)、図は `[図: 説明]` で出力させます（`ocr.prompt` で変更可）
+
+**必要なもの**
+
+poppler-utils（`pdftoppm` / `pdfinfo`）。npm の依存追加はありません。
+
+| OS | 導入方法 |
+|---|---|
+| Ubuntu / Debian | `sudo apt install poppler-utils` |
+| macOS | `brew install poppler` |
+| Windows | [poppler-windows](https://github.com/oschwartz10612/poppler-windows/releases) のZIPを展開し `Library\bin` を PATH に追加。PATHを通さない場合は `ocr.pdfToImageCmd` / `ocr.pdfInfoCmd` にフルパスを指定（例 `"C:/poppler/Library/bin/pdftoppm.exe"`） |
+
+未導入のまま `/ocr.html` を開くと、**動作中のOSに合わせた導入手順**が画面上部に警告として出ます。
+
+加えて、Vision対応モデルの llama-server を別ポートで起動しておきます（`config.ocr.vlmEndpoint` の指す先）。
+
+```bash
+llama-server -m /models/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf \
+  --mmproj /models/mmproj-Qwen2.5-VL-7B-f16.gguf \
+  --port 8090 -ngl 99 -c 8192
+```
+
+**API**（認証は既存の `requireAuth` + 参照系 `ml:read` / 更新系 `ml:write`）
+
+| Method | Path | 説明 |
+|---|---|---|
+| `POST` | `/ocr/upload` | PDF を受信 → ジョブ登録（既定でそのまま開始。`?autostart=0` で保留） |
+| `GET` | `/ocr/jobs` | 全ジョブの状態一覧 |
+| `GET` | `/ocr/jobs/:jobId` | 個別ジョブの詳細 |
+| `GET` | `/ocr/jobs/:jobId/stream` | SSE でリアルタイム進捗配信 |
+| `POST` | `/ocr/jobs/:jobId/start` | 開始 / 中断ジョブの再開。ボディ `{"redo":true}` で完了済みの引き直し、`{"redo":true,"pages":"133, 240"}` で指定ページだけ |
+| `POST` | `/ocr/jobs/:jobId/cancel` | 実行中ジョブの中断 |
+| `DELETE` | `/ocr/jobs/:jobId` | ジョブ削除（キャッシュ・PDF・Markdown・RAG登録もまとめて） |
+| `GET` | `/ocr/status` | 依存コマンドと Vision LLM の生存確認 |
+
+`curl` からも使えます（multipart でも、生のPDFボディでも受け付けます）。
+
+```bash
+curl -X POST 'http://localhost:3000/ocr/upload' \
+  -H 'Authorization: Bearer <APIトークン>' \
+  -F 'file=@book.pdf'
+
+# 生ボディで送る場合
+curl -X POST 'http://localhost:3000/ocr/upload?name=book.pdf' \
+  -H 'Authorization: Bearer <APIトークン>' \
+  -H 'Content-Type: application/pdf' --data-binary @book.pdf
+```
+
+**セキュリティ**: 拡張子・MIMEタイプ・ファイル先頭の `%PDF-` を三重にチェックし、ファイル名はサニタイズして `uploads` 直下に固定します。300MB（`ocr.maxUploadMB`）を超えるものとディスク残量不足は受信時に弾きます。
+
 ### 🎯 ドラッグ&ドロップ統合UI
 3つのドロップゾーンが状況に応じて自動で振り分け:
 - **チャット入力欄**: 画像→Vision添付、その他→ドキュメント取り込み
@@ -338,6 +423,7 @@ config.json から HTTPサーバーや llama-server の細かな設定を調整�
 - **通常チャットでの自動有効化**: 登録ドキュメントが1件以上あれば、UI 操作なしで自動的にツールがLLMに提供される。サイドバーに「📚 永続RAG (サーバー登録)」バッジを表示
 - **embedding 未設定時の自動 OFF**: 4層防御 (UI非表示 / 起動時自動除外 / API 503 / agent_proxy ツール除外)
 - **Python REST 経由で管理**: `/rag/documents` 等のエンドポイントで登録・一覧・削除
+- **PDFからの登録**: スキャンPDFは [📄 PDF OCR](#-pdf-ocrvision-llm--markdown--rag自動登録) を使えば、Markdown化から登録まで自動で行われる
 
 ### 🖼️ 画像物体検出 (torchvision)
 `/ml.html` の「画像」タブで、画像内の物体を検出できる。COCO事前学習モデルでの即時検出と、独自クラスのカスタムモデル学習の両方に対応。**追加パッケージは torchvision のみ** (YOLO等の外部依存なし、BSDライセンス)。
@@ -405,6 +491,9 @@ sudo apt install -y nodejs
 # Python関連（任意）
 sudo apt install -y python3 python3-pip python3-venv \
   fonts-ipaexfont fonts-noto-cjk
+
+# PDF OCR機能を使う場合（任意、pdftoppm / pdfinfo が入る）
+sudo apt install -y poppler-utils
 ```
 
 ### 2. llama.cpp ビルド
@@ -513,6 +602,9 @@ Apple SiliconならMetalで高速動作。Mシリーズ統合GPUは大量のVRAM
 
 # 必要なツール
 brew install cmake git node python@3.12
+
+# PDF OCR機能を使う場合（任意、pdftoppm / pdfinfo が入る）
+brew install poppler
 ```
 
 ### 2. llama.cpp ビルド（Metal）
@@ -656,6 +748,10 @@ Visual Studio C++ ビルドツールが必要、設定は少し手間ですがWS
 - **Git for Windows**: https://git-scm.com/download/win
 - **Node.js LTS**: https://nodejs.org/ja
 - **Python 3.12**: https://www.python.org/downloads/
+- **poppler for Windows**（PDF OCR機能を使う場合のみ）: https://github.com/oschwartz10612/poppler-windows/releases
+  - ZIPを展開して `Library\bin` を PATH に追加（`pdftoppm.exe` / `pdfinfo.exe` が入っています）
+  - PATHを通さない場合は `config.json` の `ocr.pdfToImageCmd` / `ocr.pdfInfoCmd` にフルパスを指定
+    （JSONなのでバックスラッシュは `\\` にエスケープするか、`"C:/poppler/Library/bin/pdftoppm.exe"` のように `/` で書きます）
 
 #### 2. llama.cpp ビルド
 
@@ -858,6 +954,7 @@ opengeek-llm-chat/
 ├── llm_pool.js                 # マルチLLMワーカープール (複数llama-server同時起動・VRAM自動判定)
 ├── gguf_info.js                # GGUFのVRAM見積り診断ツール (node gguf_info.js で全モデル診断)
 ├── orchestrator.js             # マルチLLMオーケストレーション実行エンジン (ワークフローDAG実行)
+├── ocr.js                      # PDF OCR パイプライン (pdftoppm + Vision LLM + ジョブキュー、依存なし)
 ├── public/
 │   ├── index.html              # React SPA（チャットUI）
 │   ├── styles.css              # メインスタイルシート (CSS変数, レイアウト, コンポーネント)
@@ -865,6 +962,8 @@ opengeek-llm-chat/
 │   ├── tuning-styles.css       # ファインチューニングUI用スタイル
 │   ├── ml.html                 # React SPA（機械学習UI）
 │   ├── ml-styles.css           # 機械学習UI用スタイル
+│   ├── ocr.html                # React SPA（PDF OCR / RAG登録UI）
+│   ├── ocr-styles.css          # OCR UI用スタイル（レイアウトは tuning-styles.css を共用）
 │   ├── editconfig.html         # React SPA（config.json編集UI、本体再起動も可能）
 │   ├── editconfig-styles.css   # config編集UI用スタイル
 │   ├── aiicon.jpg              # アイコン（任意）
@@ -899,9 +998,13 @@ opengeek-llm-chat/
 │   │   ├── label_encoders.pkl  # カテゴリ列のエンコーダ
 │   │   ├── metrics.json        # 学習指標 + 履歴
 │   │   └── train.log           # 学習ログ
-│   └── rag/                    # 外部API用 永続RAGドキュメント
-│       ├── index.json          # 登録ドキュメント一覧
-│       └── <docId>.json        # チャンク + embeddingベクトル
+│   ├── rag/                    # 外部API用 永続RAGドキュメント
+│   │   ├── index.json          # 登録ドキュメント一覧
+│   │   └── <docId>.json        # チャンク + embeddingベクトル
+│   └── ocr/                    # PDF OCR の作業データ（自動生成）
+│       ├── jobs.json           # OCRジョブの状態（再起動しても復元される）
+│       └── cache/<jobId>/      # ページ単位のMarkdownキャッシュ（中断ジョブの再開用）
+│           └── pXXXX.md        # 1ページぶんのOCR結果
 ├── chats/                      # チャット履歴JSON（自動生成）
 ├── settings.json               # ユーザー設定（自動生成）
 ├── DESIGN.md                   # 設計ドキュメント
@@ -987,6 +1090,26 @@ opengeek-llm-chat/
     "tokenFile": "gdrive_token.json"
   },
 
+  "ocr": {
+    "enabled": true,
+    "vlmEndpoint": "http://localhost:8090/v1/chat/completions",
+    "vlmModel": "qwen2.5vl",
+    "dpi": 300,
+    "maxTokens": 6144,
+    "temperature": 0.1,
+    "pageTimeoutSec": 600,
+    "pageRetries": 1,
+    "maxConcurrentJobs": 1,
+    "maxUploadMB": 300,
+    "cacheDir": "ml/ocr/cache",
+    "jobsFile": "ml/ocr/jobs.json",
+    "pdfToImageCmd": "pdftoppm",
+    "pdfInfoCmd": "pdfinfo",
+    "autoRegisterToRag": true,
+    "keepPdf": true,
+    "prompt": "この画像は書籍のスキャンページです。..."
+  },
+
   "ragTopK": 10,
   "ragMode": "agentic",
   "agentContext": {
@@ -1057,6 +1180,20 @@ opengeek-llm-chat/
 | `googleDrive.maxTextChars` | LLMに渡すテキストの最大文字数（既定20000） |
 | `googleDrive.sharedDrives` | 共有ドライブ（旧チームドライブ）も対象に含める |
 | `googleDrive.tokenFile` | リフレッシュトークンの保存先（既定 `gdrive_token.json`、chmod600） |
+| `ocr.enabled` | PDF OCR 機能 ON/OFF。要 poppler-utils（`pdftoppm` / `pdfinfo`） |
+| `ocr.vlmEndpoint` | Vision LLM の OpenAI互換エンドポイント（Qwen2.5-VL 等を別ポートで起動しておく） |
+| `ocr.vlmModel` | リクエストの `model` フィールドに入れる名前 |
+| `ocr.dpi` | ページ画像化の解像度（既定300。上げると精度は上がるが遅く・重くなる） |
+| `ocr.maxTokens` / `temperature` | 1ページあたりの生成上限とランダム性（既定 6144 / 0.1） |
+| `ocr.pageTimeoutSec` | 1ページのOCRタイムアウト（秒、既定600） |
+| `ocr.pageRetries` | ページ失敗時のリトライ回数（既定1）。使い切ったらそのページはスキップしジョブは継続 |
+| `ocr.maxConcurrentJobs` | 同時実行ジョブ数（既定1＝単一GPU前提。マルチGPUなら増やせる） |
+| `ocr.maxUploadMB` | PDF 1ファイルのアップロード上限（既定300MB） |
+| `ocr.cacheDir` / `jobsFile` | ページキャッシュとジョブ状態の保存先（中断ジョブの再開・再起動復元に使う） |
+| `ocr.pdfToImageCmd` / `pdfInfoCmd` | poppler-utils のコマンド名。PATHが通っていなければ絶対パスを指定（Windows は `"C:/poppler/Library/bin/pdftoppm.exe"` のように `/` 区切りが書きやすい） |
+| `ocr.autoRegisterToRag` | 完了後に生成Markdownを自動でRAG登録するか（既定true） |
+| `ocr.keepPdf` | 完了後もアップロードしたPDFを `uploads/` に残すか（既定true） |
+| `ocr.prompt` | Vision LLM に渡すOCR指示。表・数式・図の扱いをここで調整する |
 | `imageGen` | 画像生成（stable-diffusion.cpp連携）ON/OFF。`imageModels[]` を定義した上で `true` にして有効化 |
 | `stableDiffusion.binPath` | sd-server バイナリの絶対パス |
 | `stableDiffusion.port` | sd-server HTTP ポート（内部通信用、デフォルト 7860） |
@@ -1105,6 +1242,12 @@ opengeek-llm-chat/
 | `orchestration.workflows[]` | ワークフロー定義。**ブラウザのワークフローエディタから編集・保存される**（手書き不要） |
 | `ragTopK` | RAG検索チャンク数 |
 | `ragMode` | `agentic` / `always` |
+| `ragChunkSize` / `ragChunkOverlap` | 分割の粒度と重なり。embedding の ctx（BERT系は512トークン）を超えないこと。変更したら再登録が必要 |
+| `ragNeighborChunks` | ヒットの前後何チャンクを一緒に渡すか。数式と記号定義が分断されるのを防ぐ（0で無効） |
+| `ragRelaxSamplers` | 検索結果を渡して回答させる時、繰り返しペナルティ（DRY・repeat_penalty）を外す。既定 `true`。**RAG で原文どおりの引用が必要なら切らないこと**（詳細は下記） |
+| `ragAlwaysSearch` | 毎ターン必ず永続RAGを検索する。判断モデルが `web_search` を選んだり検索を省いたりする場合に `true`。既定 `false` |
+| `ragLedgerTurns` | 直近いくつの回答ぶんの出典（資料名・ページ・抜粋）を次のターンへ持ち越すか、デフォルト1（0で無効） |
+| `ragLedgerChars` | 持ち越す1出典あたりの抜粋文字数、デフォルト400（0ならページ対応表のみ） |
 | `agentContext.smallPredict` | ツール判断時のmax_tokens（短文モード）デフォルト512 |
 | `agentContext.largePredict` | ツール判断時のmax_tokens（長文モード）+ continueGen時、デフォルト8192 |
 | `agentContext.judgeHistoryCount` | ツール判断時に送る直近メッセージ件数、デフォルト3 |
@@ -1181,6 +1324,7 @@ LLMへの指示文を `config.json` の `systemPrompts` キーで完全カスタ
 | `python` | Python実行案内（常時） | - |
 | `meta` | メタ抑制指示（常時） | - |
 | `judge` | ツール判断専用（軽量） | `{toolList}` |
+| `rag` | サーバー登録ドキュメント（RAG）の引用ルール。原文どおりの数式・記号の書き写し、出典キー `【S1】` の付与、記憶に頼った引用の禁止など | - |
 
 ---
 
