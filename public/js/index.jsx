@@ -6395,21 +6395,6 @@ ${conversationText}
                 <button className="doc-remove" onClick={() => { setDocuments(prev => prev.filter((_, j) => j !== i)); messagesDirtyRef.current = true; }}>×</button>
               </div>
             ))}
-            {persistentRagAvailable && persistentRagDocCount > 0 && (
-              <div
-                className="doc-item"
-                style={{ background: 'var(--accent-dim, rgba(124,77,255,0.08))', cursor: 'help' }}
-                title={`サーバーに登録済みのRAGドキュメント (${persistentRagDocCount}件): ${persistentRagDocNames.join(', ')}\nLLMが自動的にこれらを検索します`}
-              >
-                <div className="doc-info">
-                  <div className="doc-icon">📚</div>
-                  <div className="doc-meta">
-                    <div className="doc-name">永続RAG (サーバー登録)</div>
-                    <div className="doc-stats">{persistentRagDocCount}件のドキュメントを自動検索</div>
-                  </div>
-                </div>
-              </div>
-            )}
           </div>
         </div>
         <a
