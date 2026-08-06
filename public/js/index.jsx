@@ -557,14 +557,17 @@ function escapeHtml(str) {
 function extractMathSpans(text) {
   // コードブロック内の $ は数式ではないので先に落とす
   const s = String(text || '').replace(/```[\s\S]*?```/g, '');
-  const re = /\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\$([^$\n]+?)\$|\\\(([\s\S]+?)\\\)/g;
+  // OCR の出力は不揃いで、同じ本でも $$…$$ のページと \begin{equation} の
+  // ページが混ざる。どちらも数式として扱わないと照合対象から漏れる
+  const re = /\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\\begin\{(?:equation|align|gather|displaymath)\*?\}([\s\S]+?)\\end\{(?:equation|align|gather|displaymath)\*?\}|\$([^$\n]+?)\$|\\\(([\s\S]+?)\\\)/g;
   const out = [];
   let m;
   while ((m = re.exec(s)) !== null) {
-    // $$…$$ と \[…\] はブロック数式。「これが式です」と提示している箇所。
-    // インラインは文中で項を取り出して説明していることが多く、扱いを分ける
-    const display = m[1] != null || m[2] != null;
-    const body = (m[1] ?? m[2] ?? m[3] ?? m[4] ?? '').trim();
+    // $$…$$ / \[…\] / \begin{equation} はブロック数式。「これが式です」と
+    // 提示している箇所。インラインは文中で項を取り出して説明していることが
+    // 多いので扱いを分ける
+    const display = m[1] != null || m[2] != null || m[3] != null;
+    const body = (m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5] ?? '').trim();
     if (body) out.push({ raw: body, display });
   }
   return out;
@@ -574,6 +577,8 @@ function extractMathSpans(text) {
 // 不一致にしたくない。両辺に同じ正規化をかけるので、比較としては壊れない
 function normalizeMath(s) {
   return String(s || '')
+    // 式番号 (\tag{5.3}) は資料側にしか無いことが多く、比較の邪魔になる
+    .replace(/\\tag\*?\{[^}]*\}/g, '')
     .replace(/\\left|\\right|\\displaystyle|\\quad|\\qquad|\\cdot|\\[,;:!]/g, '')
     .replace(/[{}\s]/g, '');
 }
@@ -761,6 +766,10 @@ function renderLatex(text, verdicts) {
   // ブロック数式: $$ ... $$ or \[ ... \]
   text = text.replace(/\$\$([\s\S]+?)\$\$/g, (_, expr) => placeholder(renderKatex(expr.trim(), true)));
   text = text.replace(/\\\[([\s\S]+?)\\\]/g, (_, expr) => placeholder(renderKatex(expr.trim(), true)));
+  // OCR が \begin{equation} 形式で出すことがある。KaTeX はこの環境名を解さないので
+  // 中身だけ取り出してブロック数式として描画する (\tag は KaTeX が解釈できる)
+  text = text.replace(/\\begin\{(?:equation|displaymath)\*?\}([\s\S]+?)\\end\{(?:equation|displaymath)\*?\}/g,
+    (_, expr) => placeholder(renderKatex(expr.trim(), true)));
 
   // インライン数式: $ ... $ or \( ... \)（ただし $5 や $10 のような通貨表記は除外）
   text = text.replace(/(?<!\$)\$(?!\$)(?!\d+\s)(.+?)(?<!\$)\$(?!\$)/g, (_, expr) => placeholder(renderKatex(expr.trim(), false)));
