@@ -6247,8 +6247,8 @@ ${conversationText}
                 </a>
               )}
               {appConfig.ocr?.enabled && (
-                <a className="tuning-link" href="/ocr.html" title="PDFをOCRしてRAGに登録する画面を開く">
-                  📄 OCR
+                <a className="tuning-link" href="/ocr.html" title="PDFをOCRして永続RAGに登録する画面を開く">
+                  📄 永続RAG(OCR登録)
                 </a>
               )}
             </div>
