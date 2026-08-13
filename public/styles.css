@@ -2214,6 +2214,35 @@
     transition: width 0.3s;
   }
 
+  /* ── Compaction Divider (コンテキスト圧縮の区切り) ── */
+  .compaction-divider {
+    margin: 16px 0;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  .compaction-divider summary {
+    cursor: pointer;
+    text-align: center;
+    padding: 6px 10px;
+    border-top: 1px dashed var(--border);
+    border-bottom: 1px dashed var(--border);
+    list-style: none;
+    user-select: none;
+  }
+  .compaction-divider summary::-webkit-details-marker { display: none; }
+  .compaction-divider summary:hover { color: var(--accent); }
+  .compaction-summary {
+    margin: 8px auto;
+    max-width: 720px;
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-tertiary);
+    white-space: pre-wrap;
+    line-height: 1.6;
+    font-size: 12px;
+  }
+
   /* ── Thinking Block ── */
   .thinking-block {
     margin-bottom: 8px;

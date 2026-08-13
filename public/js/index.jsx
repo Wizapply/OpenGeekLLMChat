@@ -1810,7 +1810,7 @@ function App() {
     // 出典キーは「そのターン限りの通し番号」なので、履歴に渡す前に実際の
     // 資料名へ開いておく（詳細は resolveStaleSourceKeys のコメント）
     const history = messages.slice(-RECENT)
-      .filter(m => typeof m.content === 'string' && m.content)
+      .filter(m => (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content)
       .map(m => ({ role: m.role, content: resolveStaleSourceKeys(m) }));
 
     // 参照ドキュメント: チャット添付分はブラウザ側に埋め込みがあるのでここで検索する。
@@ -2094,60 +2094,186 @@ function App() {
       const sp = appConfig.systemPrompts || {};
       const fillTemplate = (str, vars) => (str || '').replace(/\{(\w+)\}/g, (_, k) => vars[k] != null ? vars[k] : '');
       const systemPrompt = fillTemplate(sp.base || '', { date: dateStr });
-      // ─── 履歴の重み付き構築 ───
-      // 最新ユーザー質問を「今これに答えて」と強調、古いメッセージを「参考」と明示
+      // ─── 会話履歴の構築 ───
+      // historyMode:
+      //   'compaction' (デフォルト): Claude風。履歴は無圧縮のまま送り、コンテキスト
+      //     上限に近づいた時だけLLM自身に要約させて古い部分を1つの要約に置き換える。
+      //     トークン使用率は圧縮が走るまで単調に増え、圧縮時に一段下がる。
+      //   'weighted': 従来方式。直近N件以外を毎ターン500文字に切り詰めて送る。
+      const historyMode = appConfig.historyMode || 'compaction';
       const allMessages = [...messages, userMsg];
-      const RECENT_COUNT = appConfig.recentMessageCount || 6;  // 直近N件はそのまま送信
-      const MAX_TOTAL = 20;
-      const recentSlice = allMessages.slice(-Math.min(MAX_TOTAL, allMessages.length));
-      // recentSliceを「古い参考」と「直近そのまま」に分割
-      const splitIdx = Math.max(0, recentSlice.length - RECENT_COUNT);
-      const oldMessages = recentSlice.slice(0, splitIdx);    // 古い: 参考情報扱い
-      const recentMessages = recentSlice.slice(splitIdx);    // 直近: 通常 + 最後を強調
-
       const history = [];
 
-      // 古いメッセージは参考情報として包む（複数まとめて1つのassistantメモに）
-      if (oldMessages.length > 0) {
-        const summary = oldMessages.map(m => {
-          const role = m.role === 'user' ? 'ユーザー' : 'アシスタント';
-          const content = resolveStaleSourceKeys(m).slice(0, 500);  // 各500文字に圧縮
-          return `[${role}] ${content}`;
-        }).join('\n\n');
-        history.push({
-          role: 'system',
-          content: `【参考: 過去の会話履歴（${oldMessages.length}件）】\n以下は背景情報です。最新の質問への回答に直接関連する場合のみ参照してください。\n\n${summary}`,
+      // メッセージ列をそのままOpenAI互換形式でhistoryに積む（両モード共通）。
+      // 最後のユーザー質問の強調は、小型ローカルモデルが古い話題に引きずられる
+      // のを防ぐためのもので、コンテキスト管理方式とは独立に維持する
+      const pushVerbatim = (list) => {
+        list.forEach((m, i) => {
+          const isLast = i === list.length - 1;
+          const hasImages = m.images && m.images.length > 0;
+          // 出典キーは「そのターン限りの通し番号」なので、履歴に渡す前に
+          // 実際の資料名へ開いておく（詳細は resolveStaleSourceKeys のコメント）
+          let textContent = resolveStaleSourceKeys(m);
+          if (isLast && m.role === 'user' && textContent) {
+            textContent = `【今この質問に回答してください】\n${textContent}`;
+          }
+
+          const h = { role: m.role };
+          if (hasImages) {
+            // OpenAI互換 (llama-server): content配列で text + image_url を送る
+            h.content = [];
+            if (textContent) h.content.push({ type: 'text', text: textContent });
+            for (const img of m.images) {
+              // base64がdata URI形式(data:image/png;base64,...)を含むかチェックして整形
+              const dataUrl = img.base64.startsWith('data:')
+                ? img.base64
+                : `data:image/png;base64,${img.base64}`;
+              h.content.push({ type: 'image_url', image_url: { url: dataUrl } });
+            }
+          } else {
+            h.content = textContent;
+          }
+          history.push(h);
         });
-      }
+      };
 
-      // 直近メッセージはそのまま、ただし最後のユーザー質問は強調
-      recentMessages.forEach((m, i) => {
-        const isLast = i === recentMessages.length - 1;
-        const hasImages = m.images && m.images.length > 0;
-        // 出典キーは「そのターン限りの通し番号」なので、履歴に渡す前に
-        // 実際の資料名へ開いておく（詳細は resolveStaleSourceKeys のコメント）
-        let textContent = resolveStaleSourceKeys(m);
-        if (isLast && m.role === 'user' && textContent) {
-          textContent = `【今この質問に回答してください】\n${textContent}`;
+      if (historyMode === 'weighted') {
+        // ─── 従来: 履歴の重み付き構築 ───
+        const RECENT_COUNT = appConfig.recentMessageCount || 6;  // 直近N件はそのまま送信
+        const MAX_TOTAL = 20;
+        const plain = allMessages.filter(m => m.role !== 'compaction');
+        const recentSlice = plain.slice(-Math.min(MAX_TOTAL, plain.length));
+        // recentSliceを「古い参考」と「直近そのまま」に分割
+        const splitIdx = Math.max(0, recentSlice.length - RECENT_COUNT);
+        const oldMessages = recentSlice.slice(0, splitIdx);    // 古い: 参考情報扱い
+        const recentMessages = recentSlice.slice(splitIdx);    // 直近: 通常 + 最後を強調
+
+        // 古いメッセージは参考情報として包む（複数まとめて1つのsystemメモに）
+        if (oldMessages.length > 0) {
+          const summary = oldMessages.map(m => {
+            const role = m.role === 'user' ? 'ユーザー' : 'アシスタント';
+            const content = resolveStaleSourceKeys(m).slice(0, 500);  // 各500文字に圧縮
+            return `[${role}] ${content}`;
+          }).join('\n\n');
+          history.push({
+            role: 'system',
+            content: `【参考: 過去の会話履歴（${oldMessages.length}件）】\n以下は背景情報です。最新の質問への回答に直接関連する場合のみ参照してください。\n\n${summary}`,
+          });
         }
+        pushVerbatim(recentMessages);
+      } else {
+        // ─── Claude風コンパクション ───
+        const cc = appConfig.contextCompaction || {};
+        const threshold = cc.threshold ?? 0.75;            // n_ctxのこの割合を超えたら圧縮
+        const keepRecent = Math.max(2, cc.keepRecent ?? 4); // 圧縮後も原文で残す直近件数
 
-        const h = { role: m.role };
-        if (hasImages) {
-          // OpenAI互換 (llama-server): content配列で text + image_url を送る
-          h.content = [];
-          if (textContent) h.content.push({ type: 'text', text: textContent });
-          for (const img of m.images) {
-            // base64がdata URI形式(data:image/png;base64,...)を含むかチェックして整形
-            const dataUrl = img.base64.startsWith('data:')
-              ? img.base64
-              : `data:image/png;base64,${img.base64}`;
-            h.content.push({ type: 'image_url', image_url: { url: dataUrl } });
+        // 前回の圧縮位置（roleが'compaction'のマーカー）を探す。
+        // マーカーより前のメッセージは画面には残るが、モデルには要約だけを送る
+        let markerIdx = -1;
+        for (let i = allMessages.length - 1; i >= 0; i--) {
+          if (allMessages[i].role === 'compaction') { markerIdx = i; break; }
+        }
+        let summaryText = markerIdx >= 0 ? allMessages[markerIdx].content : '';
+        let liveStart = markerIdx + 1;
+
+        // 次のプロンプトのトークン数を見積もる。直近の実測値
+        // (usage.prompt_tokens + completion_tokens) を基準に、その後に増えた
+        // メッセージ分だけ文字数から概算で足す（日本語≒1字1トークン、英語≒4字1トークン
+        // の中間として2字1トークンで概算）
+        const estTok = (s) => Math.ceil(String(s || '').length / 2);
+        const textOf = (m) => typeof m.content === 'string' ? m.content : '';
+        let lastInfoIdx = -1;
+        for (let i = allMessages.length - 1; i >= liveStart; i--) {
+          if (allMessages[i].tokenInfo) { lastInfoIdx = i; break; }
+        }
+        let estimated;
+        if (lastInfoIdx >= 0) {
+          const ti = allMessages[lastInfoIdx].tokenInfo;
+          estimated = (ti.promptTokens || 0) + (ti.completionTokens || 0);
+          for (let i = lastInfoIdx + 1; i < allMessages.length; i++) {
+            estimated += estTok(textOf(allMessages[i]));
+            if (allMessages[i].images) estimated += allMessages[i].images.length * 800;
           }
         } else {
-          h.content = textContent;
+          estimated = estTok(systemPrompt) + estTok(summaryText);
+          for (let i = liveStart; i < allMessages.length; i++) {
+            estimated += estTok(textOf(allMessages[i]));
+            if (allMessages[i].images) estimated += allMessages[i].images.length * 800;
+          }
         }
-        history.push(h);
-      });
+
+        // 圧縮対象（圧縮後も残す直近keepRecent件を除いた未圧縮メッセージ）が
+        // 2件以上あり、見積もりが閾値を超えていたら圧縮を実行
+        const compactible = allMessages.length - liveStart - keepRecent;
+        if (numCtx > 0 && estimated > numCtx * threshold && compactible >= 2) {
+          console.log(`[コンパクション] 推定${estimated}tok > ${Math.round(numCtx * threshold)}tok (ctx=${numCtx}) → 会話を要約`);
+          setLoadingMessage('コンテキスト上限に近づいたため、会話を要約して圧縮中...');
+          try {
+            const target = allMessages.slice(liveStart, allMessages.length - keepRecent)
+              .filter(m => (m.role === 'user' || m.role === 'assistant') && resolveStaleSourceKeys(m));
+            const convoText = target.map(m =>
+              `[${m.role === 'user' ? 'ユーザー' : 'アシスタント'}] ${resolveStaleSourceKeys(m)}`
+            ).join('\n\n');
+            const compactSystem = 'あなたは会話履歴の要約担当です。以下の会話を、続きの会話でモデルが文脈として使うための要約にまとめてください。\n'
+              + '- 事実・決定事項・数値・固有名詞・ファイル名・コードの要点は正確に残す\n'
+              + '- ユーザーの目的と、未解決の課題・宿題を明記する\n'
+              + '- 挨拶や相づちなど冗長な部分は省く\n'
+              + '- 800字程度の日本語で、箇条書き中心でまとめる\n'
+              + '- 要約本文のみを出力する（前置きや説明は不要）';
+            const compactUser = (summaryText
+              ? `これまでの要約:\n${summaryText}\n\n上記の要約の続きの会話:\n${convoText}\n\n要約と続きの会話を統合した新しい要約を作成してください。`
+              : convoText);
+            const sumRes = await fetchWithRetry('/v1/chat/completions', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                model: chatModel,
+                messages: [
+                  { role: 'system', content: compactSystem },
+                  { role: 'user', content: compactUser },
+                ],
+                stream: false,
+                temperature: 0.2,
+                max_tokens: cc.summaryMaxTokens ?? 1024,
+                cache_prompt: true,
+              }),
+              signal: controller.signal,
+            });
+            if (!sumRes.ok) throw new Error(`API Error: ${sumRes.status}`);
+            const sumData = await sumRes.json();
+            const newSummary = String(sumData.choices?.[0]?.message?.content || '')
+              .replace(/<think>[\s\S]*?(<\/think>|$)/gi, '').trim();
+            if (newSummary) {
+              summaryText = newSummary;
+              liveStart = allMessages.length - keepRecent;
+              // 画面表示・保存用に圧縮位置へマーカーを挿入（チャット保存で永続化される）。
+              // 過去のマーカーはそのまま残すが、モデルへは最新の要約だけを送る
+              const marker = { role: 'compaction', content: newSummary };
+              setMessages(prev => {
+                const cut = prev.length - keepRecent;
+                if (cut < 0) return prev;
+                return [...prev.slice(0, cut), marker, ...prev.slice(cut)];
+              });
+              messagesDirtyRef.current = true;
+              console.log(`[コンパクション] 完了: ${target.length}件 → 要約${newSummary.length}文字`);
+            }
+          } catch (e) {
+            if (e.name === 'AbortError') throw e;
+            // 失敗しても今回は未圧縮のまま送信（閾値は上限より手前なのでまだ収まる。
+            // 次のターンで再試行される）
+            console.warn('[コンパクション] 要約に失敗、今回は未圧縮で送信:', e);
+          }
+          setLoadingMessage('');
+        }
+
+        if (summaryText) {
+          history.push({
+            role: 'system',
+            content: `【これまでの会話の要約】\n以下はコンテキスト節約のため要約された、それ以前の会話の内容です。\n\n${summaryText}`,
+          });
+        }
+        pushVerbatim(allMessages.slice(liveStart).filter(m => m.role !== 'compaction'));
+      }
 
       // 直前に読んだ資料の台帳を、今回の質問の直前に差し込む。
       // ツール結果は履歴に残らないので、これが無いとモデルは
@@ -5501,7 +5627,19 @@ function App() {
       const systemPrompt = fillTemplate(sp.base || '', { date: dateStr });
 
       // idxまでの会話履歴 + thinking情報を引き継ぎ、続きを促す
-      const history = messages.slice(0, idx).map(m => {
+      // コンパクション済みの会話では、最後のマーカーより前は要約で置き換える
+      // （通常送信時と同じ扱いにしてコンテキスト溢れを防ぐ）
+      const upTo = messages.slice(0, idx);
+      let contMarkerIdx = -1;
+      for (let i = upTo.length - 1; i >= 0; i--) {
+        if (upTo[i].role === 'compaction') { contMarkerIdx = i; break; }
+      }
+      const contSummary = contMarkerIdx >= 0
+        ? [{ role: 'system', content: `【これまでの会話の要約】\n以下はコンテキスト節約のため要約された、それ以前の会話の内容です。\n\n${upTo[contMarkerIdx].content}` }]
+        : [];
+      const history = contSummary.concat(upTo.slice(contMarkerIdx + 1)
+        .filter(m => m.role !== 'compaction')
+        .map(m => {
         const hasImages = m.images && m.images.length > 0;
         if (!hasImages) return { role: m.role, content: m.content };
         // OpenAI互換: content配列形式
@@ -5514,7 +5652,7 @@ function App() {
           content.push({ type: 'image_url', image_url: { url: dataUrl } });
         }
         return { role: m.role, content };
-      });
+      }));
 
       // 途中までの思考+応答を「部分応答」として追加し、続きを書くよう促す
       const partial = [target.thinking ? `<think>${target.thinking}</think>` : '', target.content || ''].filter(Boolean).join('\n').trim();
@@ -6604,7 +6742,15 @@ ${conversationText}
               </div>
             </div>
           ) : (
-            messages.map((msg, i) => (
+            messages.map((msg, i) => msg.role === 'compaction' ? (
+              /* コンパクション区切り: これより上は要約されてモデルに送られる */
+              <div key={i} className="compaction-divider">
+                <details>
+                  <summary>📦 コンテキスト圧縮: ここまでの会話は要約してモデルに送信されます（クリックで要約を表示）</summary>
+                  <div className="compaction-summary">{msg.content}</div>
+                </details>
+              </div>
+            ) : (
               <div key={i} className={`message ${msg.role}`}>
                 <div
                   className={`msg-avatar ${msg.role === 'assistant' ? 'assistant-av' : 'user-av'}`}
