@@ -260,6 +260,7 @@
   "orchestration": {
     "enabled": true,
     "poolMode": "auto",
+    "gpuPlacement": "spread",
     "portRange": [
       8100,
       8149
@@ -465,6 +466,7 @@
     "enabled": true,
     "vlmEndpoint": "http://localhost:8090/v1/chat/completions",
     "vlmModel": "qwen2.5vl",
+    "vlmPoolModel": "",
     "dpi": 300,
     "maxTokens": 6144,
     "temperature": 0.1,

@@ -122,6 +122,10 @@ const DEFAULT_CONFIG = {
   orchestration: {
     enabled: false,           // 機能の有効化。workflows を1つ以上定義して使う
     poolMode: 'auto',         // 'auto' | 'resident'(全同時常駐) | 'swap'(逐次載せ替え)
+    // ワーカーをどのGPUに載せるか。'spread' は llama.cpp 任せ(全GPUに分散)。
+    // 'auto' は丸ごと載るGPUが1枚あればそこに固定し、無ければ分散に戻す。
+    // GPUが2枚以上あり、モデルが1枚に収まる構成でだけ意味がある
+    gpuPlacement: 'spread',   // 'spread' | 'auto'
     portRange: [8100, 8149],  // ワーカーllama-serverに割り当てるポート範囲
     maxResident: 3,           // 同時常駐させるワーカー数の上限 (resident時)
     workerParallel: 1,        // ワーカーの -np。2以上にすると同一モデルへ並列に投げられるが、
@@ -177,8 +181,12 @@ const DEFAULT_CONFIG = {
   //   Ubuntu/Debian: sudo apt install poppler-utils
   ocr: {
     enabled: true,
-    vlmEndpoint: 'http://localhost:8090/v1/chat/completions', // Vision LLM (OpenAI互換)
+    vlmEndpoint: 'http://localhost:8090/v1/chat/completions', // Vision LLM (OpenAI互換、外部起動)
     vlmModel: 'qwen2.5vl',      // リクエストの model フィールド
+    // chatModels の名前を入れるとLLMプール管理になる (vlmEndpoint は無視される)。
+    // OCR中だけロードされ、終われば orchestration.idleUnloadMs でアンロードされる。
+    // 空なら従来どおり vlmEndpoint の llama-server を自分で起動しておく運用
+    vlmPoolModel: '',
     dpi: 300,                   // ページ画像化の解像度
     maxTokens: 6144,            // 1ページあたりの生成上限
     temperature: 0.1,
@@ -418,9 +426,14 @@ function waitForTcpReady(host, port, timeoutMs) {
 
 // onOutput を渡すと、logLevel に関係なく出力を受け取れる（異常終了時の原因調査用）。
 // 画面へのエコーは従来どおり logLevel に従う。
-function spawnLlamaServer(args, label, onOutput) {
+function spawnLlamaServer(args, label, onOutput, envOverride) {
   const ls = appConfig.llamaServer;
-  log('-', `[${label}] spawn: ${ls.binPath} ${args.join(' ')}`);
+  // 可視GPUの絞り込み等、プロセスごとに変えたい環境変数はここで載せる。
+  // どのGPUに載せたかは後から追えないと困るので、コマンドと一緒に出す
+  const envNote = envOverride && Object.keys(envOverride).length
+    ? Object.entries(envOverride).map(([k, v]) => `${k}=${v}`).join(' ') + ' '
+    : '';
+  log('-', `[${label}] spawn: ${envNote}${ls.binPath} ${args.join(' ')}`);
   const isQuiet = appConfig.logLevel === 'quiet';
   // 外部APIサーバー(label='ext:...')は強制的にログを出す（デバッグ用）
   const isExternal = label.startsWith('ext:');
@@ -429,7 +442,7 @@ function spawnLlamaServer(args, label, onOutput) {
   const capture = echo || !!onOutput;
   const proc = spawn(ls.binPath, args, {
     stdio: capture ? ['ignore', 'pipe', 'pipe'] : ['ignore', 'ignore', 'ignore'],
-    env: { ...process.env },
+    env: { ...process.env, ...(envOverride || {}) },
   });
   if (capture) {
     const handle = (d) => {
@@ -835,6 +848,9 @@ const llmPool = createLlmPool({
   waitForReady,
   log,
   getGpuInfo: () => cachedGpuData,
+  // GPU固定に使う環境変数名がベンダーで違う (ROCR_ / CUDA_) ので、
+  // 監視が使っているバックエンドをそのまま判断材料にする
+  getGpuBackend: () => gpuBackend,
   // 外部APIサーバーが使用中のポートは避ける
   isPortTaken: (port) => {
     for (const [, s] of externalServers) {
@@ -9210,6 +9226,29 @@ const ocr = createOcrManager({
   ragIngestFile: (filename) => ragIngestFile(filename),
   ragDeleteDoc: (docId) => ragDeleteDocById(docId),
   ensureEmbedding: () => ensureEmbeddingLoaded(),
+  // ocr.vlmPoolModel が設定されている時だけ使われる。OCRジョブの間だけ
+  // Vision LLM をワーカーとして載せ、終わればプールのアイドルアンロードに任せる
+  vlmPool: {
+    info: (name) => {
+      const m = findModelByName(name);
+      if (!m) {
+        return {
+          ok: false,
+          message: `ocr.vlmPoolModel「${name}」が config.json の chatModels に見つかりません`,
+        };
+      }
+      if (!fs.existsSync(m.path)) {
+        return { ok: false, message: `モデルファイルが存在しません: ${m.path}` };
+      }
+      // --mmproj が無いモデルは画像を受け取れない (チャットの vision 判定と同じ基準)
+      return { ok: true, vision: (m.extraArgs || []).includes('--mmproj') };
+    },
+    plan: (name) => llmPool.planMode([name]),
+    acquire: (name, opts) => llmPool.acquire(name, opts),
+    // wait=true は接続断のとき。子プロセスの 'exit' がソケットのエラーより
+    // 後に届くので少しだけ待つ。それ以外は待たずに記録だけ見る
+    crash: (name, wait) => (wait ? llmPool.awaitCrash(name, 2000) : Promise.resolve(llmPool.getCrash(name))),
+  },
 });
 
 // 起動時: 実行中のまま落ちたジョブを「待機中」に戻す (ページキャッシュから再開できる)

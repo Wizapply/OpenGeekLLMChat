@@ -379,10 +379,11 @@ function parseMeasurements(lines) {
  * @param {object} deps
  *   getConfig()          → appConfig
  *   findModelByName(n)   → chatModels の要素
- *   spawnLlamaServer(args, label) → ChildProcess
+ *   spawnLlamaServer(args, label, onOutput, env) → ChildProcess
  *   waitForReady(host, port, timeoutMs) → Promise<boolean>
  *   log(ip, msg)
  *   getGpuInfo()         → [{ vramTotalMB, vramUsedMB }, ...]
+ *   getGpuBackend()      → 'amd' | 'rocm' | 'nvidia' | 'none' | null（GPU固定の環境変数を決めるのに使う）
  *   isPortTaken(port)    → boolean  （外部APIサーバー等との衝突回避）
  *   mainChat: {
  *     getModel(), isStarting(), getEndpoint() → {host, port},
@@ -392,7 +393,7 @@ function parseMeasurements(lines) {
 function createLlmPool(deps) {
   const {
     getConfig, findModelByName, spawnLlamaServer, waitForReady,
-    log, getGpuInfo, isPortTaken, mainChat,
+    log, getGpuInfo, getGpuBackend = () => null, isPortTaken, mainChat,
   } = deps;
 
   /** @type {Map<string, object>} modelName → worker */
@@ -451,6 +452,79 @@ function createLlmPool(deps) {
       if (total > 0) free += Math.max(0, total - used);
     }
     return Math.round(free);
+  }
+
+  // ─── GPU配置 ───
+  //
+  // llama.cpp は複数デバイスが見えていると既定でレイヤーを全GPUに分散する
+  // (--split-mode layer)。1枚に収まるモデルまで分散されると、トークンごとに
+  // PCIe をまたぐぶん遅くなり、2GBしかない内蔵GPUのような枠にも配られてしまう。
+  // 丸ごと載るGPUが1枚あるならそこに固定する。
+  //
+  // 固定は llama.cpp のフラグ (--split-mode / --main-gpu) ではなく可視デバイスの
+  // 絞り込みで行う。フラグの解釈はビルドによって変わるが、可視デバイスは
+  // ランタイム層の話なのでバージョン差の影響を受けず、1枚しか見せなければ
+  // 「llama.cpp が何番をどう解釈するか」という曖昧さ自体が消える。
+
+  function gpuPlacementMode() {
+    return cfg().gpuPlacement || 'spread';
+  }
+
+  // 配置を決めてから実測VRAMに現れるまでのラグ。GPU情報は1秒間隔で更新されるが、
+  // llama-server は起動中に少しずつ確保するので、readyになった直後もまだ足りない
+  const GPU_SETTLE_MS = 15000;
+
+  /** そのGPUに載せたばかりで、まだ実測に反映されていないぶん(MB) */
+  function reservedOnGpu(idx) {
+    let mb = 0;
+    for (const [, w] of workers) {
+      if (w.gpuIndex !== idx) continue;
+      // 起動中のあいだと、ready 直後のしばらくは実測を信用しない。
+      // これが無いと、ほぼ同時に走った2本が同じGPUを「空いている」と見て二重に載る
+      if (!w.ready || !w.readyAt || Date.now() - w.readyAt < GPU_SETTLE_MS) mb += w.estMB || 0;
+    }
+    return mb;
+  }
+
+  /**
+   * モデルを丸ごと載せられるGPUを1枚選ぶ。空きが最も多いものを選ぶ。
+   * 選べなければ null を返し、呼び出し側は従来どおり llama.cpp の分散に任せる。
+   */
+  function pickGpu(requiredMB) {
+    if (gpuPlacementMode() !== 'auto') return null;
+    const backend = getGpuBackend();
+    if (!backend || backend === 'none') return null;   // 環境変数の名前が決められない
+    const gpus = getGpuInfo() || [];
+    if (gpus.length < 2) return null;                  // 1枚しかないなら固定する意味がない
+    if (!(requiredMB > 0)) return null;                // 見積れないモデルは分散のまま
+
+    const margin = Number.isFinite(cfg().vramSafetyMarginMB) ? cfg().vramSafetyMarginMB : 2048;
+    let best = null;
+    for (let i = 0; i < gpus.length; i++) {
+      const total = gpus[i].vramTotalMB || 0;
+      const used = gpus[i].vramUsedMB || 0;
+      if (total <= 0) continue;
+      const free = Math.max(0, total - used) - reservedOnGpu(i);
+      if (free < requiredMB + margin) continue;
+      if (!best || free > best.freeMB) best = { index: i, freeMB: free };
+    }
+    return best;
+  }
+
+  /** 指定GPUだけを見せる環境変数 */
+  function gpuEnv(index) {
+    if (getGpuBackend() === 'nvidia') {
+      return {
+        // nvidia-smi は既定でPCIバス順、CUDA は性能順に並べる。揃えないと
+        // 「監視で見ている0番」と「CUDAの0番」がずれて、別のGPUに載る
+        CUDA_DEVICE_ORDER: 'PCI_BUS_ID',
+        CUDA_VISIBLE_DEVICES: String(index),
+      };
+    }
+    // AMD。HIP_VISIBLE_DEVICES と併用してはいけない:
+    // ROCR_ で絞った後のリストに対して HIP_ がさらに添字を取るため、
+    // 両方に同じ番号を入れると 1番以降で「そんなデバイスは無い」になる
+    return { ROCR_VISIBLE_DEVICES: String(index) };
   }
 
   /**
@@ -600,15 +674,28 @@ function createLlmPool(deps) {
         ...(model.extraArgs || []),
       ];
 
+      // 丸ごと載るGPUが1枚あればそこに固定する。無ければ null で従来どおり分散。
+      // 予約 (reservedOnGpu) が効くよう、workers に入れる前に決めておく
+      const est = estimateModelVram(model);
+      const placement = pickGpu(est.totalMB);
+      const env = placement ? gpuEnv(placement.index) : null;
+
       const worker = {
         modelName, host, port,
         proc: null, ready: false, refCount: 0, stopping: false,
         logTail: [],   // 直近の出力（異常終了時の原因表示用）
         lastUsed: Date.now(), startedAt: Date.now(),
+        // GPU固定の記録。readyAt は「実測VRAMに現れるまでの猶予」の起点
+        gpuIndex: placement ? placement.index : null,
+        estMB: est.totalMB,
+        readyAt: null,
       };
       workers.set(modelName, worker);
 
-      log('-', `[LLMプール] ワーカー起動: ${modelName} @ ${host}:${port} (-np ${np})`);
+      log('-', `[LLMプール] ワーカー起動: ${modelName} @ ${host}:${port} (-np ${np})`
+        + (placement
+          ? ` / GPU${placement.index} に固定 (必要 ${(est.totalMB / 1024).toFixed(1)}GB ≦ 空き ${(placement.freeMB / 1024).toFixed(1)}GB)`
+          : (gpuPlacementMode() === 'auto' ? ' / 1枚に収まらないため全GPUに分散' : '')));
       // logLevel が quiet でも出力は捨てず、末尾数十行だけ保持しておく
       worker.proc = spawnLlamaServer(args, `pool:${modelName}`, (chunk) => {
         for (const line of String(chunk).split('\n')) {
@@ -616,7 +703,7 @@ function createLlmPool(deps) {
           worker.logTail.push(line);
           if (worker.logTail.length > LOG_TAIL_LINES) worker.logTail.shift();
         }
-      });
+      }, env);
       worker.proc.on('exit', (code, signal) => {
         // 異常終了しても Map に残っていると死んだポートを掴み続けるので掃除する
         if (workers.get(modelName) === worker) workers.delete(modelName);
@@ -672,7 +759,9 @@ function createLlmPool(deps) {
       }
       worker.ready = true;
       worker.lastUsed = Date.now();
-      log('-', `[LLMプール] ワーカー準備完了: ${modelName} @ ${host}:${port}`);
+      worker.readyAt = Date.now();
+      log('-', `[LLMプール] ワーカー準備完了: ${modelName} @ ${host}:${port}`
+        + (worker.gpuIndex != null ? ` (GPU${worker.gpuIndex})` : ''));
       return worker;
     })();
 
@@ -878,6 +967,8 @@ function createLlmPool(deps) {
         modelName: name, host: w.host, port: w.port,
         ready: w.ready, refCount: w.refCount,
         startedAt: w.startedAt, lastUsed: w.lastUsed,
+        // null なら全GPUに分散（1枚に収まらなかった / gpuPlacement が spread）
+        gpuIndex: w.gpuIndex ?? null,
         estimatedVramMB: (() => {
           const m = findModelByName(name);
           return m ? estimateModelVramMB(m) : null;
@@ -893,6 +984,7 @@ function createLlmPool(deps) {
     }
     return {
       mode: cfg().poolMode || 'auto',
+      gpuPlacement: gpuPlacementMode(),
       maxResident: maxResident(),
       freeVramMB: freeVramMB(),
       mainChatModel: mainChat.getModel(),

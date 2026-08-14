@@ -28,6 +28,13 @@ const path = require('path');
 const { spawn } = require('child_process');
 
 /**
+ * 「Vision LLM のプロセスが落ちた」可能性がある失敗かどうか。
+ * fetch (undici) はプロセスが消えていても素っ気ない TypeError: fetch failed しか
+ * 出さないので、原因はプール側の終了記録と突き合わせて初めて分かる。
+ */
+const CONN_LOST_RE = /socket hang up|ECONNRESET|ECONNREFUSED|EPIPE|fetch failed|terminated|other side closed/i;
+
+/**
  * poppler-utils の入れ方の案内。OSごとに手順が違うので、エラーメッセージには
  * 実行中のプラットフォームに合ったものだけを出す。
  * (Windows は apt が無いので「sudo apt install」と言われても何もできない)
@@ -286,6 +293,11 @@ function receiveMultipartToFile(req, { maxBytes, destPath }) {
  * @param {function} [deps.ragIngestFile]   (filename) => Promise<{docId, chunkCount}>
  * @param {function} [deps.ragDeleteDoc]    (docId) => void
  * @param {function} [deps.ensureEmbedding] () => Promise<boolean>
+ * @param {object}   [deps.vlmPool]         LLMプール (ocr.vlmPoolModel 使用時のみ)
+ *   info(name)            → {ok, message?, vision}   モデル定義の検証
+ *   plan(name)            → {mode, reason}           VRAMから resident/swap を判定
+ *   acquire(name, opts)   → Promise<{host, port, release()}>
+ *   crash(name)           → Promise<crash|null>      直近の異常終了 (原因表示用)
  */
 function createOcrManager({
   getConfig,
@@ -295,6 +307,7 @@ function createOcrManager({
   ragIngestFile = null,
   ragDeleteDoc = null,
   ensureEmbedding = null,
+  vlmPool = null,
 }) {
   const cfg = () => (getConfig() || {});
 
@@ -469,26 +482,92 @@ function createOcrManager({
     return { ok: true, missing: [] };
   }
 
-  /** Vision LLM が生きているか (llama-server の /health → /v1/models の順で確認) */
+  /**
+   * VLM をLLMプールに任せる設定か。
+   * ocr.vlmPoolModel が指すのは config.json の chatModels の名前で、
+   * プール管理にすると OCR中だけロードされ、終われば
+   * orchestration.idleUnloadMs でアンロードされる。
+   * 空なら従来どおり ocr.vlmEndpoint の外部 llama-server を叩く。
+   */
+  function poolModelName() {
+    return vlmPool ? String(cfg().vlmPoolModel || '').trim() : '';
+  }
+
+  /** Vision LLM が使えるか。プール管理なら定義の検証、外部なら生存確認 */
   async function checkVlm() {
     const c = cfg();
+
+    // プール管理: プロセスはジョブ開始時に起動するので、ここでは定義だけ見る。
+    // 「今は起動していない」のは正常な状態であって、警告を出す理由にはならない
+    const poolModel = poolModelName();
+    if (poolModel) {
+      const info = vlmPool.info(poolModel);
+      if (!info.ok) {
+        return { ok: false, managed: true, modelName: poolModel, message: info.message };
+      }
+      return {
+        ok: true, managed: true, modelName: poolModel,
+        endpoint: `LLMプール管理 (${poolModel})`,
+        // --mmproj が無いモデルは画像を受け取れない。ジョブは通すが、
+        // 白紙のような出力になるので理由が分かるようにしておく
+        warn: info.vision ? null
+          : `モデル「${poolModel}」の extraArgs に --mmproj がありません。`
+            + `画像を読めないモデルではOCRできません`,
+      };
+    }
+
+    // 従来: 別プロセスで起動済みの llama-server を叩く
     const endpoint = c.vlmEndpoint || 'http://localhost:8090/v1/chat/completions';
     let origin;
     try { origin = new URL(endpoint).origin; }
-    catch { return { ok: false, message: `ocr.vlmEndpoint が不正なURLです: ${endpoint}` }; }
+    catch { return { ok: false, managed: false, message: `ocr.vlmEndpoint が不正なURLです: ${endpoint}` }; }
     for (const p of ['/health', '/v1/models']) {
       try {
         const ctl = new AbortController();
         const t = setTimeout(() => ctl.abort(), 4000);
         const r = await fetch(origin + p, { signal: ctl.signal });
         clearTimeout(t);
-        if (r.ok) return { ok: true, endpoint };
+        if (r.ok) return { ok: true, managed: false, endpoint };
       } catch {}
     }
     return {
       ok: false,
+      managed: false,
       endpoint,
-      message: `Vision LLM に接続できません (${endpoint})。Qwen2.5-VL の llama-server が起動しているか確認してください`,
+      message: `Vision LLM に接続できません (${endpoint})。Qwen2.5-VL の llama-server が起動しているか確認してください`
+        + `。OCR中だけ自動でロード/アンロードさせたい場合は ocr.vlmPoolModel に chatModels の名前を設定してください`,
+    };
+  }
+
+  /**
+   * ジョブ1本ぶんの VLM エンドポイントを確保する。
+   * プール管理なら refCount を握るので、握っている間はアイドルアンロードも
+   * 他ワークフローによる退避も起きない。使い終わったら必ず release() する。
+   *
+   * @returns {Promise<{endpoint: string, model: string, modelName: string|null, release: Function}>}
+   */
+  async function acquireVlm() {
+    const c = cfg();
+    const poolModel = poolModelName();
+    if (!poolModel) {
+      return {
+        endpoint: c.vlmEndpoint || 'http://localhost:8090/v1/chat/completions',
+        model: c.vlmModel || 'qwen2.5vl',
+        modelName: null,
+        release: () => {},
+      };
+    }
+
+    // 単一GPUだとチャットモデルと同居できないことがある。プールの VRAM 判定に
+    // 委ねて、載らないなら swap (メインチャットを一時アンロード) で確保する
+    const plan = vlmPool.plan(poolModel);
+    log('-', `[OCR] Vision LLM「${poolModel}」を${plan.mode === 'swap' ? '逐次スワップ' : '常駐'}で確保します: ${plan.reason}`);
+    const handle = await vlmPool.acquire(poolModel, { mode: plan.mode });
+    return {
+      endpoint: `http://${handle.host}:${handle.port}/v1/chat/completions`,
+      model: poolModel,
+      modelName: poolModel,
+      release: () => handle.release(),
     };
   }
 
@@ -532,13 +611,16 @@ function createOcrManager({
     return out;
   }
 
-  /** Vision LLM に1ページ投げて Markdown を得る */
-  async function ocrImage(pngPath, ctl) {
+  /** Vision LLM に1ページ投げて Markdown を得る (vlm は acquireVlm() の戻り値) */
+  async function ocrImage(pngPath, ctl, vlm) {
     const c = cfg();
-    const endpoint = c.vlmEndpoint || 'http://localhost:8090/v1/chat/completions';
+    // processJob は未処理ページがある時しか確保しないので、ここに来て null は
+    // 呼び出し順の壊れ。TypeError で潰れるより何が起きたか分かる形で落とす
+    if (!vlm) throw new Error('Vision LLM が確保されていません (内部エラー)');
+    const endpoint = vlm.endpoint;
     const b64 = fs.readFileSync(pngPath).toString('base64');
     const payload = {
-      model: c.vlmModel || 'qwen2.5vl',
+      model: vlm.model,
       messages: [{
         role: 'user',
         content: [
@@ -621,6 +703,8 @@ function createOcrManager({
     const pdfPath = path.join(uploadsDir, job.filename);
     const cacheDir = jobCacheDir(job.jobId);
     const imgPrefix = path.join(cacheDir, 'page');
+    // プール管理時はジョブが握っている間だけ VLM が載る。finally で必ず返す
+    let vlm = null;
 
     try {
       fs.mkdirSync(cacheDir, { recursive: true });
@@ -650,6 +734,14 @@ function createOcrManager({
       const rt = parseInt(c.pageRetries);
       const retries = Number.isFinite(rt) ? Math.max(0, rt) : 1;
 
+      // 引くページが1枚もない再実行 (結合し直すだけ) で 9GB のモデルを
+      // 載せても意味がないので、実際に処理が要る時だけ確保する
+      if (job.totalPages - job.donePages > 0) {
+        setStatus(job, 'running', { phase: 'vlm' });
+        vlm = await acquireVlm();
+        setStatus(job, 'running', { phase: 'ocr' });
+      }
+
       for (let page = 1; page <= job.totalPages; page++) {
         if (ctl.cancelled) throw new Error('__CANCELLED__');
 
@@ -664,7 +756,7 @@ function createOcrManager({
           if (ctl.cancelled) throw new Error('__CANCELLED__');
           try {
             const png = await renderPage(pdfPath, page, imgPrefix, ctl);
-            md = await ocrImage(png, ctl);
+            md = await ocrImage(png, ctl, vlm);
             try { fs.unlinkSync(png); } catch {}
             break;
           } catch (e) {
@@ -678,6 +770,25 @@ function createOcrManager({
         }
 
         if (md === null) {
+          // ワーカーが落ちているなら残りページも同じように失敗する。
+          // 「[OCR失敗]」を300ページ書き込んでから気づくのでは遅いので、ここで止める。
+          //
+          // 接続断のときだけ待って確認する。ソケットのエラーは子プロセスの 'exit' より
+          // 先に届くため即座に見ても間に合わない。逆に、ページのタイムアウトのような
+          // プロセスが生きている失敗でいちいち待つと、失敗ページ数ぶん待ち時間が積み上がる
+          const connLost = CONN_LOST_RE.test(lastErr ? lastErr.message : '');
+          const crash = vlm && vlm.modelName && vlmPool
+            ? await vlmPool.crash(vlm.modelName, connLost)
+            : null;
+          if (crash) {
+            throw new Error(
+              `Vision LLM「${vlm.modelName}」の llama-server が異常終了しました`
+              + ` (exit=${crash.code}${crash.signal ? `, signal=${crash.signal}` : ''})`
+              + `\n対処: モデルの ctx を下げる / config.json の orchestration.maxResident を 1 にする /`
+              + ` 小さい Vision モデルに変える`
+              + (crash.tail ? `\n--- llama-server の最終出力 ---\n${crash.tail}` : '')
+            );
+          }
           // リトライしても駄目ならスキップして次ページへ (ジョブ全体は止めない)
           job.failedPages.push(page);
           fs.writeFileSync(cacheFile, `[OCR失敗: ${lastErr ? lastErr.message : '不明なエラー'}]`, 'utf-8');
@@ -708,6 +819,10 @@ function createOcrManager({
       }
 
       if (ctl.cancelled) throw new Error('__CANCELLED__');
+
+      // ページを引き終わったので VLM は返す。結合とRAG登録では使わないので、
+      // ここで手放せば長いRAG登録の間ずっと9GB占有し続けずに済む
+      if (vlm) { vlm.release(); vlm = null; }
 
       // ─── 結合して uploads に書き出す ───
       setStatus(job, 'running', { phase: 'merge', currentPage: 0 });
@@ -755,6 +870,9 @@ function createOcrManager({
         emitEvent(job.jobId, { type: 'error', message: e.message, job: jobView(job) });
       }
     } finally {
+      // 失敗・キャンセルで抜けた場合もここで必ず返す (握ったままだと
+      // アイドルアンロードの対象から永久に外れてVRAMが空かない)
+      if (vlm) { vlm.release(); vlm = null; }
       running.delete(job.jobId);
       // 使い終わった一時PNGを掃除
       try { fs.unlinkSync(`${imgPrefix}.png`); } catch {}
