@@ -219,6 +219,11 @@ const DEFAULT_CONFIG = {
   // 30B級の判断モデルは専門書の質問に web_search を選ぶことがあり、そこが一番の穴になる。
   // 雑談用途では検索1回ぶんの待ち時間と、結果ぶんのコンテキストが毎ターン乗る点に注意。
   ragAlwaysSearch: false,
+  // チャット欄の📚トグル（登録資料の検索）の初期値。既定 false = OFF。
+  // OFFの間は search_persistent_documents ツールもRAG指示も出さないので、
+  // 雑談やコード生成に無関係なベクトル検索が挟まらない。
+  // 常時RAGを引く運用なら true にする（ragAlwaysSearch はトグルONの時だけ効く）
+  ragEnabledByDefault: false,
   ragLedgerTurns: 1,        // 直近いくつの回答ぶんの出典を持ち越すか (0で無効)
   ragLedgerChars: 400,      // 1出典あたりの抜粋文字数 (0ならページ対応表のみ)
   systemPrompts: {

@@ -1284,6 +1284,10 @@ function App() {
   const [persistentRagAvailable, setPersistentRagAvailable] = useState(false);
   const [persistentRagDocCount, setPersistentRagDocCount] = useState(0);
   const [persistentRagDocNames, setPersistentRagDocNames] = useState([]);
+  // チャット欄の📚トグル。資料が登録されていても、ユーザーがONにするまで
+  // 検索ツールを出さない（雑談まで毎回ベクトル検索が走るのを防ぐ）。
+  // 既定はOFF。config.ragEnabledByDefault: true で初期ONにできる
+  const [persistentRagEnabled, setPersistentRagEnabled] = useState(false);
   // Google Drive が外部APIのツール対応モードで使えるか
   const [apiGdriveAvailable, setApiGdriveAvailable] = useState(false);
   const [apiGdriveReason, setApiGdriveReason] = useState('');
@@ -1438,7 +1442,6 @@ function App() {
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
   const fileInputRef = useRef(null);
-  const imageInputRef = useRef(null);
   const serverFileInputRef = useRef(null);
   const [isRecording, setIsRecording] = useState(false);
   const [webSearchEnabled, setWebSearchEnabled] = useState(true);  // チャット欄でのON/OFFトグル（初期値はconfigを後で反映）
@@ -2321,15 +2324,22 @@ function App() {
       const gdriveCanWrite = gdriveActive && !!gdriveStatus?.allowWrite;
       const gdriveCanDelete = gdriveActive && !!gdriveStatus?.allowDelete;
 
+      // 永続RAGが使えるか: embedding利用可 + 登録資料あり + チャット欄の📚トグルON。
+      // OFFの間は検索ツールもRAG用システムプロンプトも出さないので、
+      // 雑談やコード生成に無関係なベクトル検索が挟まらない
+      const persistentRagActive = persistentRagAvailable
+        && persistentRagDocCount > 0
+        && persistentRagEnabled;
+
       // ツール判断ループ(agentic)に入る条件。
       // ドキュメント添付 or Web検索ON に加え、画像生成/音声合成/Google Drive が有効なら
       // 「描いて」「音声にして」「ドライブの資料見て」等を検出できるよう常にツール判断を通す。
-      // 永続RAGに資料があるならツール判断は必要。これが条件から漏れていると、
+      // 永続RAGがONなら（資料があるなら）ツール判断は必要。これが条件から漏れていると、
       // Web検索も画像生成も切った「資料を読むだけ」の構成で
       // search_persistent_documents に一生たどり着けない
       const useAgentic = appConfig.ragMode === 'agentic'
         && (documents.length > 0 || webSearchActive || appConfig.imageGen || appConfig.ttsGen || gdriveActive
-            || (persistentRagAvailable && persistentRagDocCount > 0));
+            || persistentRagActive);
 
       if (useAgentic) {
         // ─── Agentic RAG + Web検索: LLMがツールで検索を判断 ───
@@ -2355,8 +2365,8 @@ function App() {
 
         // 永続RAG (サーバー側 ml/rag/ に登録済みのドキュメント)
         // チャット添付ドキュメントとは独立した恒久的な知識ベース
-        // embedding 利用可能 + 登録ドキュメント数 > 0 のとき自動的にツールを追加
-        if (persistentRagAvailable && persistentRagDocCount > 0) {
+        // embedding 利用可能 + 登録ドキュメント数 > 0 + チャット欄の📚トグルON のとき追加
+        if (persistentRagActive) {
           const docSummary = summarizePersistentRagDocs(10);
           tools.push({
             type: 'function',
@@ -2852,7 +2862,7 @@ function App() {
         }
         // 永続RAGが使える時だけ、引用の忠実性に関する指示を足す
         // (原文の数式・記号を一般形に書き換えるのを抑え、出典ページを添えさせる)
-        if (persistentRagAvailable && persistentRagDocCount > 0 && sp.rag) {
+        if (persistentRagActive && sp.rag) {
           agentSystem += '\n\n' + sp.rag;
         }
         if (sp.python) {
@@ -3017,7 +3027,7 @@ function App() {
         if (documents.length > 0) {
           toolListLines.push(`- search_documents: チャット添付済みドキュメント (${docList}) から検索 ★「資料」「ドキュメント」「添付」関連の質問では最優先`);
         }
-        if (persistentRagAvailable && persistentRagDocCount > 0) {
+        if (persistentRagActive) {
           const persistentSummary = summarizePersistentRagDocs(5);
           // 「社内文書・マニュアル・FAQ」とだけ書くと、専門書が登録されていても
           // 判断モデルが対象外と見なして web_search に流れる。資料名を前に出す
@@ -3082,7 +3092,7 @@ function App() {
         //     資料を読むための道具として使うなら、毎回引いた方が確実。
         //     判断モデル (30B級) は専門書の質問に web_search を選んだり、
         //     存在しないテーブルへの SQL を書いたりする。信用しない選択肢を残す。
-        const ragUsable = persistentRagAvailable && persistentRagDocCount > 0;
+        const ragUsable = persistentRagActive;
         const isSourceQuestion = ragUsable && SOURCE_QUESTION_RE.test(text);
         const alwaysSearchRag = ragUsable && appConfig.ragAlwaysSearch === true;
         if (isSourceQuestion || alwaysSearchRag) {
@@ -5807,6 +5817,9 @@ function App() {
     setShowRoleEditor(false);
     setMessages([]);
     setDocuments([]);
+    // 登録資料の検索は「そのチャットで明示的にONにするもの」なので、
+    // 新規チャットでは既定値（通常OFF）に戻す
+    setPersistentRagEnabled(appConfig.ragEnabledByDefault === true);
     messagesDirtyRef.current = false;  // 新規チャット時もクリア
   }
 
@@ -5995,6 +6008,9 @@ ${conversationText}
           setAppConfig(prev => ({ ...prev, ...cfg }));
           // Web検索ON/OFFのデフォルト値はconfig.webSearchを反映
           setWebSearchEnabled(cfg.webSearch !== false);
+          // 登録資料の検索は既定OFF。毎チャットで検索したい運用向けに
+          // config.ragEnabledByDefault: true で初期ONにできる
+          setPersistentRagEnabled(cfg.ragEnabledByDefault === true);
           document.title = cfg.appName || 'OpenGeekLLMChat';
           if (cfg.accentColor) {
             const hex = cfg.accentColor;
@@ -6809,8 +6825,10 @@ ${conversationText}
                     // ragSearched が付く前に保存されたチャットもあるので、
                     // 出典対応表が付いていれば検索済みとみなす
                     const searched = !!msg.ragSearched || !!msg.ragSources?.length;
+                    // 📚トグルがOFFの時は検索しないのが正しい動作なので、
+                    // 「未検索」警告は出さない（OFFなのに毎回警告が出ると意味を失う）
                     const notSearched =
-                      persistentRagAvailable && persistentRagDocCount > 0 &&
+                      persistentRagAvailable && persistentRagDocCount > 0 && persistentRagEnabled &&
                       !searched && !(isLoading && i === messages.length - 1);
                     const citeyWithoutSearch = notSearched && CITATION_SHAPE_RE.test(body);
                     // 出典めいた語が無くても内容を作ることはある。まとまった長さの
@@ -7055,11 +7073,10 @@ ${conversationText}
             />
             <div className="input-toolbar">
               <div className="input-toolbar-left">
-                <button className="toolbar-btn" title="ドキュメントを追加" onClick={() => fileInputRef.current?.click()}>
+                {/* ドキュメントと画像で入口を分けない。handleFiles が種類で振り分け、
+                    画像はVision添付、それ以外はドキュメント(RAG)登録になる */}
+                <button className="toolbar-btn" title="ドキュメント・画像を追加" onClick={() => fileInputRef.current?.click()}>
                   📎
-                </button>
-                <button className="toolbar-btn" title="画像を追加" onClick={() => imageInputRef.current?.click()}>
-                  🖼️
                 </button>
                 {(typeof window !== 'undefined' && (window.SpeechRecognition || window.webkitSpeechRecognition)) && (
                   <button
@@ -7077,6 +7094,19 @@ ${conversationText}
                     onClick={() => setWebSearchEnabled(v => !v)}
                   >
                     🌐
+                  </button>
+                )}
+                {/* 永続RAG: サーバーに資料が登録されている時だけ出す。
+                    既定OFF — ONにしたチャットでだけ登録資料を検索する */}
+                {persistentRagAvailable && persistentRagDocCount > 0 && (
+                  <button
+                    className={`toolbar-btn rag-toggle ${persistentRagEnabled ? 'active' : ''}`}
+                    title={persistentRagEnabled
+                      ? `登録資料の検索: ON（クリックでOFF）/ ${summarizePersistentRagDocs(3)}`
+                      : `登録資料の検索: OFF（クリックでON）/ 登録済み: ${persistentRagDocCount}件`}
+                    onClick={() => setPersistentRagEnabled(v => !v)}
+                  >
+                    📚
                   </button>
                 )}
                 {/* Google Drive: 設定で有効な時だけ出す。未接続ならクリックで接続パネルへ誘導 */}
@@ -7128,14 +7158,6 @@ ${conversationText}
               )}
             </div>
           </div>
-          <input
-            ref={imageInputRef}
-            type="file"
-            multiple
-            accept="image/*"
-            style={{ display: 'none' }}
-            onChange={e => { handleImageFiles(e.target.files); e.target.value = ''; }}
-          />
           <div className="input-hint">Shift + Enter で改行</div>
         </div>
       </div>

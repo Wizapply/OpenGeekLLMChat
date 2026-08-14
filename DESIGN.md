@@ -1722,6 +1722,35 @@ const gdriveActive = !!(appConfig.googleDrive?.enabled   // 管理者が機能�
 未接続の状態で ☁️ を押した時はトグルを切り替えず、
 **右パネルの「☁️ Drive」タブを開いて接続へ誘導する**（押しても何も起きない、を避ける）。
 
+### 登録資料（永続RAG）トグルも同じ形、ただし既定OFF
+
+📚 ボタンは「サーバーに資料が登録されているか」＋「ユーザーがトグルON」の二段構え:
+
+```javascript
+const persistentRagActive = persistentRagAvailable   // embedding が使える
+  && persistentRagDocCount > 0                        // 資料が登録されている
+  && persistentRagEnabled;                            // ユーザーがトグルON
+```
+
+他のトグルと違い **既定は OFF**（`config.ragEnabledByDefault` で変更可）。
+資料が1件でも登録されていると、以前は全チャットで
+`search_persistent_documents` がツール一覧に載り、判断モデルが雑談にまで
+ベクトル検索を挟んでいた。「資料を読むチャット」と「それ以外」は
+ユーザーにしか区別できないので、明示的にONにさせる。
+
+OFF の時に止まるものは4つ:
+
+| 箇所 | OFF時の挙動 |
+|:--|:--|
+| ツール定義 | `search_persistent_documents` を tools に入れない |
+| judge の `{toolList}` | 資料検索の行を出さない |
+| `systemPrompts.rag` | 引用ルールを agentSystem に足さない |
+| 強制検索 | 出典要求の検出・`ragAlwaysSearch` とも発動しない |
+
+画面側の「🔍 登録資料は未検索」警告も OFF 中は出さない
+（検索しないのが正しい動作なので、警告が出続けると意味を失う）。
+新規チャットを開くと既定値に戻る（`newChat()` でリセット）。
+
 ---
 
 ## 🎭 LLMの役割設定（カスタムシステムプロンプト）

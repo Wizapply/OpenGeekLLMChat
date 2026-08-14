@@ -156,6 +156,9 @@ curl -X POST 'http://localhost:3000/ocr/upload?name=book.pdf' \
 ### 🌐 Web検索ON/OFFトグル
 チャット入力欄の🌐ボタンで検索の有効/無効を即座に切り替え可能。社内ドキュメントだけで答えてほしい時はOFF、最新情報が必要な時はONに。デフォルトは `config.webSearch` で設定。
 
+### 📚 登録資料（永続RAG）ON/OFFトグル
+チャット入力欄の📚ボタンで、サーバー登録資料の検索を切り替えられます（サーバーに資料が登録されている時だけ表示）。**デフォルトはOFF** で、OFFの間は `search_persistent_documents` ツールもRAG用の引用ルールもLLMに渡らないため、雑談やコード生成のたびにベクトル検索が走ることがありません。資料について尋ねたいチャットでONにしてください。新規チャットを開くと既定値に戻ります。初期値は `config.ragEnabledByDefault` で変更できます。
+
 ### 📐 コンテキスト管理（コンパクション / 重み付け）
 会話履歴の送り方は `config.historyMode` で選択:
 - **`compaction`（デフォルト、Claude風）**: 履歴は無圧縮のまま送信し、コンテキスト使用率が閾値（`contextCompaction.threshold`、既定75%）を超えた時だけ、LLM自身に古い会話を要約させて1つの要約メッセージに置き換えます。トークン使用率は圧縮が走るまで単調に増え、圧縮のタイミングで一段下がります。圧縮位置はチャット上に「📦 コンテキスト圧縮」の区切りとして表示され、クリックで要約を確認できます。
@@ -1249,7 +1252,8 @@ opengeek-llm-chat/
 | `ragChunkSize` / `ragChunkOverlap` | 分割の粒度と重なり。embedding の ctx（BERT系は512トークン）を超えないこと。変更したら再登録が必要 |
 | `ragNeighborChunks` | ヒットの前後何チャンクを一緒に渡すか。数式と記号定義が分断されるのを防ぐ（0で無効） |
 | `ragRelaxSamplers` | 検索結果を渡して回答させる時、繰り返しペナルティ（DRY・repeat_penalty）を外す。既定 `true`。**RAG で原文どおりの引用が必要なら切らないこと**（詳細は下記） |
-| `ragAlwaysSearch` | 毎ターン必ず永続RAGを検索する。判断モデルが `web_search` を選んだり検索を省いたりする場合に `true`。既定 `false` |
+| `ragAlwaysSearch` | 毎ターン必ず永続RAGを検索する。判断モデルが `web_search` を選んだり検索を省いたりする場合に `true`。既定 `false`（チャット欄の📚トグルがONのチャットでのみ効く） |
+| `ragEnabledByDefault` | チャット欄の📚トグル（登録資料の検索）の初期値。既定 `false` = OFF。常時RAGを引く運用なら `true` |
 | `ragLedgerTurns` | 直近いくつの回答ぶんの出典（資料名・ページ・抜粋）を次のターンへ持ち越すか、デフォルト1（0で無効） |
 | `ragLedgerChars` | 持ち越す1出典あたりの抜粋文字数、デフォルト400（0ならページ対応表のみ） |
 | `agentContext.smallPredict` | ツール判断時のmax_tokens（短文モード）デフォルト512 |
