@@ -97,6 +97,7 @@ PDF アップロード
 - **完了後でもページ単位で引き直せる**: 完了ジョブの「🔄 再OCR」でページ番号（`240` / `133, 240` / `10-12`）を指定すると、そのページのキャッシュだけ捨てて取り直し、Markdownの再結合とRAG再登録まで自動で走ります。空欄なら全ページやり直し
 - **依存パッケージ追加なし**: PDF→画像は poppler-utils の `pdftoppm` を `child_process` で呼ぶだけ。npm 依存は増えません
 - **単一GPUを前提に1ジョブずつ順次処理**: Qwen2.5-VL 7B (~9GB) と embedding (~1.5GB) は同じGPUに同居できます。`maxConcurrentJobs` を上げれば将来のマルチGPUにも対応
+- **終わったらVision LLMを片付ける**: `ocr.vlmPoolModel` を設定すると Vision LLM が LLMプールの管理下に入り、**OCR中だけロードされて、終わればアイドル時間の経過後に自動アンロード**されます。VRAMが足りなければチャットのモデルを一時的に降ろして枠を作り、次のチャットで戻します。ページを引き終わった時点で手放すので、RAG登録の間ずっと9GBを抱えたままにもなりません
 - **数式・表・図に対応したプロンプト**: 表は Markdown テーブル、数式は LaTeX (`$...$` / `$$...$$`)、図は `[図: 説明]` で出力させます（`ocr.prompt` で変更可）
 
 **必要なもの**
@@ -111,13 +112,30 @@ poppler-utils（`pdftoppm` / `pdfinfo`）。npm の依存追加はありませ�
 
 未導入のまま `/ocr.html` を開くと、**動作中のOSに合わせた導入手順**が画面上部に警告として出ます。
 
-加えて、Vision対応モデルの llama-server を別ポートで起動しておきます（`config.ocr.vlmEndpoint` の指す先）。
+加えて Vision LLM が要ります。**2つのやり方**があり、どちらかを選びます。
+
+**(A) LLMプールに任せる（推奨）** — `chatModels` に Vision モデルを1つ定義し、その名前を `ocr.vlmPoolModel` に書きます。
+
+```jsonc
+"chatModels": [
+  { "name": "Qwen2.5-VL 7B", "path": "/models/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
+    "ctx": 8192, "ngl": 99,
+    "extraArgs": ["--mmproj", "/models/mmproj-Qwen2.5-VL-7B-f16.gguf"] }
+],
+"ocr": { "vlmPoolModel": "Qwen2.5-VL 7B" }
+```
+
+これだけで、**OCRジョブの実行中だけモデルがロードされ、終われば `orchestration.idleUnloadMs`（既定10分）でアンロード**されます。VRAMが足りなければチャットのモデルを一時的に降ろして枠を作り、次のチャットで自動的に戻します。llama-server を自分で起動しておく必要はありません。`vlmEndpoint` は無視されます。
+
+**(B) 自分で別プロセスを起動しておく（従来どおり）** — `ocr.vlmPoolModel` を空のままにして、`ocr.vlmEndpoint` の指す先に llama-server を立てておきます。
 
 ```bash
 llama-server -m /models/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf \
   --mmproj /models/mmproj-Qwen2.5-VL-7B-f16.gguf \
   --port 8090 -ngl 99 -c 8192
 ```
+
+この場合、**OCRが終わってもモデルは載ったまま**です（OpenGeekLLMChat が起動していないプロセスなので、停止も自分で行います）。単一GPUでチャットと共用するなら (A) を選んでください。
 
 **API**（認証は既存の `requireAuth` + 参照系 `ml:read` / 更新系 `ml:write`）
 
@@ -1188,8 +1206,9 @@ opengeek-llm-chat/
 | `googleDrive.sharedDrives` | 共有ドライブ（旧チームドライブ）も対象に含める |
 | `googleDrive.tokenFile` | リフレッシュトークンの保存先（既定 `gdrive_token.json`、chmod600） |
 | `ocr.enabled` | PDF OCR 機能 ON/OFF。要 poppler-utils（`pdftoppm` / `pdfinfo`） |
-| `ocr.vlmEndpoint` | Vision LLM の OpenAI互換エンドポイント（Qwen2.5-VL 等を別ポートで起動しておく） |
-| `ocr.vlmModel` | リクエストの `model` フィールドに入れる名前 |
+| `ocr.vlmPoolModel` | **設定するとVision LLMをLLMプール管理にする**。`chatModels[].name` を入れる。OCR中だけロードされ、終われば `orchestration.idleUnloadMs` でアンロード。空なら従来どおり `vlmEndpoint` を使う（既定 空） |
+| `ocr.vlmEndpoint` | Vision LLM の OpenAI互換エンドポイント（自分で別ポートに起動しておく場合）。`vlmPoolModel` 設定時は無視される |
+| `ocr.vlmModel` | リクエストの `model` フィールドに入れる名前（`vlmEndpoint` 使用時のみ） |
 | `ocr.dpi` | ページ画像化の解像度（既定300。上げると精度は上がるが遅く・重くなる） |
 | `ocr.maxTokens` / `temperature` | 1ページあたりの生成上限とランダム性（既定 6144 / 0.1） |
 | `ocr.pageTimeoutSec` | 1ページのOCRタイムアウト（秒、既定600） |
@@ -1234,6 +1253,7 @@ opengeek-llm-chat/
 | `ml.apiTokens[].permissions` | 権限配列。`"ml:read"` / `"ml:write"` / `"*"` |
 | `orchestration.enabled` | マルチLLMオーケストレーション ON/OFF（デフォルト `false`） |
 | `orchestration.poolMode` | `"auto"`（空きVRAMで自動判定） / `"resident"`（全同時常駐） / `"swap"`（1つずつ載せ替え） |
+| `orchestration.gpuPlacement` | ワーカーをどのGPUに載せるか。`"spread"`（既定、llama.cpp任せで全GPUに分散） / `"auto"`（丸ごと載るGPUが1枚あればそこに固定し、無ければ分散に戻す）。GPU2枚以上でのみ意味がある |
 | `orchestration.portRange` | ワーカーllama-serverに割り当てるポート範囲、デフォルト `[8100, 8149]` |
 | `orchestration.maxResident` | 同時常駐ワーカー数の上限（resident時）、デフォルト3 |
 | `orchestration.workerParallel` | ワーカーの `-np`、デフォルト1。2以上にすると同一モデルへ並列に投げられるが、llama.cpp は `ctx` をスロット数で分割するため1回あたりの文脈が狭くなる |

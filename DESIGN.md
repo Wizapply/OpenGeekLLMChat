@@ -5810,6 +5810,72 @@ evict とアイドルアンロードの両方が同じ判定を使う。
 | ジョブは **既定1本ずつ**順次実行 | 単一GPUに Vision LLM (Qwen2.5-VL 7B ≒ 9GB) と embedding (≒1.5GB) を同居させる前提。並列にすると OOM する。`maxConcurrentJobs` で将来のマルチGPUに開けてある |
 | 1ページ失敗しても **ジョブは止めない** | 300ページ中1ページが崩れただけで全部無駄になるのは損。リトライ後スキップし、失敗ページを記録する |
 | RAG登録は **内部関数呼び出し** | `ragIngestFile()` を直接呼ぶ。自分自身に HTTP を投げると認証・タイムアウト・多重プロキシの面倒が増えるだけで得がない |
+| Vision LLM は **LLMプールに載せられる** | 外部起動 (`vlmEndpoint`) だけだと、OCRが終わっても9GBが載りっぱなしになる。`ocr.vlmPoolModel` を設定すると `llm_pool.js` の管理下に入り、既存のアイドルアンロード・VRAM判定・退避をそのまま使える。プールを作り直すのではなく**既にある仕組みに相乗りする** |
+
+### Vision LLM のライフサイクル
+
+`ocr.vlmPoolModel` に `chatModels[].name` を書くと、OCR の VLM がプール管理になる。
+
+```
+ジョブ開始
+  ↓ 未処理ページが1枚もなければ確保しない  ← 結合し直すだけの再実行で9GBを載せない
+  ↓ pool.planMode([model]) で resident / swap を判定   (phase: vlm)
+  ↓   swap = チャットモデルを一時アンロードして枠を作る
+  ↓     (chatProcAutoUnloaded に控えるので次のチャットで自動復帰)
+  ↓ pool.acquire(model, {mode}) → refCount++            ← 握っている間はアイドル
+  ↓                                                        アンロードも退避も起きない
+全ページOCR                                              (phase: ocr)
+  ↓ handle.release()  ← ここで手放す。結合とRAG登録では使わないので、
+  ↓                      長いRAG登録の間ずっと9GBを抱えない
+結合 → RAG登録                                          (phase: merge / rag)
+  ↓
+プールのアイドルタイマー (orchestration.idleUnloadMs) が拾ってアンロード
+```
+
+設計上の要点:
+
+- **`finally` で必ず `release()`**。失敗・キャンセルで抜けた時に握ったままだと、
+  `isEvictable()` が永久に false になり VRAM が二度と空かない
+- **確保は「未処理ページがある時」だけ**。`totalPages - donePages > 0` で判定する。
+  完了ジョブの結合し直しや、全ページキャッシュ済みの再開で 9GB を載せる意味はない
+- **ワーカーの異常終了を検出したらジョブ全体を止める**。落ちた llama-server に
+  300ページ投げ続けても全部失敗するだけで、`[OCR失敗]` を300個書き込んでから
+  気づくことになる。ただし待って確認するのは接続断のときだけ
+  （ソケットのエラーは子プロセスの `exit` より先に届くため）。ページのタイムアウトの
+  ような「プロセスは生きている」失敗でいちいち待つと、失敗ページ数ぶん待ち時間が積み上がる
+- **`vlmPoolModel` が空なら一切の挙動を変えない**。既存の外部起動運用を壊さないため、
+  分岐は `acquireVlm()` と `checkVlm()` の2箇所に閉じ込め、`ocrImage()` には
+  解決済みのエンドポイントを渡す形にした
+
+### ワーカーのGPU配置 (orchestration.gpuPlacement)
+
+llama.cpp は複数デバイスが見えていると既定でレイヤーを全GPUに分散する
+(`--split-mode layer`)。1枚に収まるモデルまで分散されると、トークンごとに
+PCIe をまたぐぶん遅くなり、2GB しかない内蔵GPUのような枠にも配られてしまう。
+
+`gpuPlacement: 'auto'` にすると、**丸ごと載るGPUが1枚あればそこに固定**する。
+
+| 判断 | 理由 |
+|:--|:--|
+| 固定は **可視デバイスの絞り込み**で行う (`ROCR_VISIBLE_DEVICES` / `CUDA_VISIBLE_DEVICES`) | `--split-mode` / `--main-gpu` はビルドによって解釈が変わる。可視デバイスはランタイム層の話なのでバージョン差の影響を受けない。何より **1枚しか見せなければ「llama.cpp が何番をどう解釈するか」という曖昧さ自体が消える** |
+| AMD で **`HIP_VISIBLE_DEVICES` は併用しない** | `ROCR_` で絞った後のリストに対して `HIP_` がさらに添字を取る。両方に同じ番号を入れると1番以降で「そんなデバイスは無い」になる |
+| NVIDIA では **`CUDA_DEVICE_ORDER=PCI_BUS_ID` を必ず添える** | nvidia-smi は既定でPCIバス順、CUDA は性能順に並べる。揃えないと「監視で見ている0番」と「CUDAの0番」がずれ、別のGPUに載る |
+| 収まらなければ **黙って分散に戻す** | 大きいモデルは1枚に載らないのが当たり前。ここで失敗させると、GPUを増やすまで動かなくなる |
+| **GPUが1枚 / 監視が無い時は何もしない** | 固定する意味が無いか、環境変数の名前を決められない。`getGpuBackend()` が `none`/`null` を返す環境では従来どおり |
+| 既定は **`spread`（従来動作）** | デバイス番号の対応はベンダーとツールに依存する。既存環境の配置を暗黙に変えるべきではないので、明示的に有効化してもらう |
+
+**二重ブッキングの防止。** VRAM の実測値はポーリング(既定1秒間隔)のスナップショットで、
+llama-server は起動中に少しずつ確保する。実測だけを見て選ぶと、**ほぼ同時に起動した
+2本が同じGPUを「空いている」と判断して二重に載る**。そこで `reservedOnGpu()` が、
+そのGPUに置いたばかりのワーカーの見積りぶんを空きから引く:
+
+- 起動中(`!ready`)のあいだは常に引く
+- `ready` になってからも `GPU_SETTLE_MS` (15秒) は引き続き引く
+- それを過ぎたら実測を信用する（見積りと実測の二重計上を避ける）
+
+`planMode()` は変更していない。1枚に収まるなら合計空きも当然足りているので `resident`
+と判定され、収まらないなら分散にフォールバックして従来の合計ベースの判定がそのまま
+正しくなる。両者は自動的に整合する。
 
 ### 処理の流れ
 
@@ -5821,12 +5887,18 @@ POST /ocr/upload (multipart or 生PDFボディ)
   ↓
 [worker]  pdfinfo でページ数取得 (phase: analyze)
   ↓
+  未処理ページがあれば Vision LLM を確保                (phase: vlm)
+  ↓   vlmPoolModel 設定時 = プールから acquire (終了後アンロードされる)
+  ↓   未設定時           = vlmEndpoint をそのまま使う (外部プロセス、常駐)
+  ↓
   for page in 1..N:                                    (phase: ocr)
       ml/ocr/cache/<jobId>/pXXXX.md があればスキップ   ← 再開はここで効く
       pdftoppm -png -r 300 -f N -l N -singlefile → page.png
-      POST <vlmEndpoint> { messages:[{text: prompt}, {image_url: data:image/png;base64,...}] }
+      POST <確保したエンドポイント> { messages:[{text: prompt}, {image_url: data:image/png;base64,...}] }
       choices[0].message.content → pXXXX.md に保存, page.png は削除
       SSE で progress を push
+  ↓
+  Vision LLM を release (以降は使わない)
   ↓
   全ページ結合 → uploads/<title>.md                     (phase: merge)
   ↓

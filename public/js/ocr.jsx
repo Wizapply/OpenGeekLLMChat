@@ -14,6 +14,7 @@ const STATUS_LABEL = {
 // running 中の細かい段階。ページ数の進捗とは別に「今なにをしているか」を出す
 const PHASE_LABEL = {
   analyze: 'PDF解析中',
+  vlm: 'Vision LLM起動中',
   ocr: 'OCR中',
   merge: 'Markdown生成中',
   rag: 'RAG登録中',
@@ -306,6 +307,14 @@ function App() {
             中断しても<strong>ページ単位でキャッシュ</strong>されるので、開始し直せば続きから再開します。
           </div>
 
+          {status?.vlm?.ok && status.vlm.managed && (
+            <div className="info-box">
+              🧠 Vision LLM「<strong>{status.vlm.modelName}</strong>」は<strong>LLMプール管理</strong>です。
+              OCRの実行中だけロードされ、終わればアイドル時間の経過後に自動でアンロードされます
+              （VRAMを掴んだままになりません）。VRAMが足りなければチャットのモデルを一時的に降ろして確保します。
+            </div>
+          )}
+
           <StatusAlerts status={status} config={appConfig} />
 
           <DropZone
@@ -391,8 +400,17 @@ function StatusAlerts({ status, config }) {
   }
   if (status.enabled && status.deps.ok && !status.vlm.ok) {
     alerts.push({
-      type: 'warn', icon: '⚠️', title: 'Vision LLM に接続できません',
+      type: 'warn', icon: '⚠️',
+      // プール管理なら「繋がらない」ではなく設定の問題 (プロセスはまだ起動していなくて当然)
+      title: status.vlm.managed ? 'Vision LLM の設定に問題があります' : 'Vision LLM に接続できません',
       body: <span>{status.vlm.message}<br />アップロードはできますが、OCRの開始時にエラーになります。</span>,
+    });
+  }
+  // 開始はできるが結果が壊れる設定 (--mmproj の無いモデルを指している等)
+  if (status.enabled && status.deps.ok && status.vlm.ok && status.vlm.warn) {
+    alerts.push({
+      type: 'warn', icon: '⚠️', title: 'Vision LLM の設定を確認してください',
+      body: <span>{status.vlm.warn}</span>,
     });
   }
   if (status.enabled && !status.autoRegisterToRag) {
