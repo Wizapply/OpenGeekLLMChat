@@ -22,6 +22,84 @@ function formatBytes(bytes) {
 }
 
 // ─── Utility: 暴走ループ検出（末尾の周期性チェック） ───
+// 日本語 (ひらがな/カタカナ/漢字) を含むか
+const HAS_JA_RE = /[぀-ゟ゠-ヿ一-鿿]/;
+
+// ─── 「印なしで漏れた思考ブロック」の検出 ───
+// Qwen3.6 35B-A3B[MoE] は <think> も reasoning_content も付かないまま、
+// 英語の計画メモを本文の先頭に書いてしまうことがある:
+//   2. Deconstruct Request:
+//   * Part 1: RDMA specifications/overview
+//   3. Knowledge Retrieval & Structuring (Internal):
+// 既存の独白検出は「I will ...」のような【文単位】のパターンなので、
+// この見出し+箇条書き形式は1行も一致せず、まるごと本文に残ってしまう。
+//
+// ここでは文面ではなく【構造】で見る:
+//   - 日本語で聞かれているのに、先頭に日本語を1文字も含まない塊がある
+//   - その塊に計画メモ特有の目印がある
+// 英語で質問された時は動かさない (英語で答えるのが正しいため)。
+// 目印を要求するのは、英語の見出しや用語で始まる正当な回答を消さないため。
+// 計画メモ特有の語。実際のリーク例から採取している。
+// 日本語の回答の中に英語で紛れ込むことはまず無い語を選ぶこと
+const PLAN_STRONG_RE = new RegExp([
+  '\\(Internal\\)',
+  '\\b(Deconstruct|Knowledge Retrieval|Self-correction|Constraint Checklist|Response Plan)\\b',
+  '\\b(Structuring|Structure:|Draft|Drafting|Mental Refinement|Content Generation|Analyze User Input)\\b',
+  "\\b(Here'?s a thinking process|thinking process)\\b",
+  '^\\s*(I (will|need to|should|am going to|must)|The user|Let me|Let\'?s)\\b',
+].join('|'), 'im');
+const PLAN_STRUCT_RE = /^\s*(?:\d+[.)]\s+[A-Z][A-Za-z].*:|[*-]\s+\S)/;
+
+// content から「印なしで漏れた思考」を抜き出す。
+// 戻り値 { reasoning, answer } / 該当なしなら null
+//
+// 思考は先頭だけに出るとは限らない。実際のリークでは
+//   [英語の計画メモ] → [日本語の回答] → [英語の自己検証メモ]
+// のように本文を挟み込む形で現れる。そのため全域を走査し、
+// 「日本語を1文字も含まない連続した塊」ごとに判定する。
+function splitLeakedReasoning(content, expectJapanese) {
+  if (!expectJapanese || !content) return null;
+  const lines = content.split('\n');
+  const isPlanLine = new Array(lines.length).fill(false);
+  let inFence = false;
+  let seenBody = false;   // 日本語かコードを1度でも通過したか (=先頭の塊は終わり)
+  let i = 0;
+
+  while (i < lines.length) {
+    if (/^\s*```/.test(lines[i])) { inFence = !inFence; seenBody = true; i++; continue; }
+    // コードの中身は英語で正常。日本語行と空行は塊の切れ目にしない(空行は計画メモ内にも出る)
+    if (inFence || HAS_JA_RE.test(lines[i])) { if (lines[i].trim()) seenBody = true; i++; continue; }
+    if (!lines[i].trim()) { i++; continue; }
+
+    // 非日本語の行が始まった → 日本語かコードに当たるまでを1つの塊とする
+    let j = i, lastNonEmpty = i;
+    while (j < lines.length && !/^\s*```/.test(lines[j]) && !HAS_JA_RE.test(lines[j])) {
+      if (lines[j].trim()) lastNonEmpty = j;
+      j++;
+    }
+    const run = lines.slice(i, lastNonEmpty + 1);
+    const nonEmpty = run.filter(l => l.trim());
+    const structCount = nonEmpty.filter(l => PLAN_STRUCT_RE.test(l)).length;
+    // 先頭の塊は計画メモが出やすいので緩める。本文の途中・末尾に現れる英語は
+    // 正当な技術用語や引用のこともあるため、強い目印を必須にする
+    const isPlan = seenBody
+      ? PLAN_STRONG_RE.test(run.join('\n'))
+      : (PLAN_STRONG_RE.test(run.join('\n')) || (nonEmpty.length >= 3 && structCount >= 2));
+    if (isPlan) {
+      for (let k = i; k <= lastNonEmpty; k++) isPlanLine[k] = true;
+    } else {
+      seenBody = true;   // 本文とみなした英語ブロック以降は「途中」扱いにする
+    }
+    i = j;
+  }
+
+  if (!isPlanLine.some(Boolean)) return null;
+  const reasoning = lines.filter((_, k) => isPlanLine[k]).join('\n').trim();
+  const answer = lines.filter((_, k) => !isPlanLine[k]).join('\n')
+    .replace(/\n{3,}/g, '\n\n').trim();   // 抜いた跡の空行を詰める
+  return { reasoning, answer };
+}
+
 // 末尾が「同じ文字列の連続した繰り返し」でできているかを調べ、
 // 見つかったらその周期(文字数)を、無ければ 0 を返す。
 //
@@ -1463,6 +1541,8 @@ function App() {
   const gdriveRecentRef = useRef({ list: [], seen: new Map() });
   const [speakingIndex, setSpeakingIndex] = useState(-1);
   const abortRef = useRef(null);
+  // 直近のユーザー入力。streamResponse から「日本語で聞かれたか」を見るために持つ
+  const lastUserTextRef = useRef('');
   const sendMessageRef = useRef(null);
   const setChatImagesRef = useRef(null);
   const [chatImages, setChatImages] = useState([]); // [{ name, base64, preview }]
@@ -2069,6 +2149,8 @@ function App() {
     if (isRecording) stopRecording();
 
     const pendingImages = [...chatImages];
+    // 漏れた思考ブロックの判定に使う（日本語で聞かれた時だけ英語ブロックを疑う）
+    lastUserTextRef.current = text || '';
     const userMsg = {
       role: 'user',
       content: text || '(画像を送信)',
@@ -4504,6 +4586,9 @@ function App() {
 
   // ─── ストリーミング応答の共通処理 ───
   async function streamResponse(res, contextInfo, searchQueries, genMedia) {
+    // 日本語で聞かれた時だけ「先頭の英語ブロック = 漏れた思考」を疑う。
+    // 英語で質問された場合は英語で答えるのが正しいので判定しない
+    const expectJapanese = HAS_JA_RE.test(lastUserTextRef.current || '');
     // genMedia = { audios: [{url,text}], images: [{url,prompt}] } | undefined
     // ツールが実際に生成したメディアの本物URL。LLMがマーカーのファイル名を
     // 改変して出力しても、最終応答でこの実URLに上書き・補完して正しく描画する。
@@ -4682,6 +4767,16 @@ function App() {
             }
           }
 
+          // ─── 印なしで漏れた「計画メモ」ブロックの退避 ───
+          // 上の行単位パターンは文単位の独白しか拾えない。見出し+箇条書きの
+          // 計画メモ (2. Deconstruct Request: …) は1行も一致せず素通りするため、
+          // 「日本語で聞かれたのに先頭が英語の塊」という構造で切り出す
+          const leaked = splitLeakedReasoning(displayContent, expectJapanese);
+          if (leaked) {
+            displayThinking = (displayThinking ? displayThinking + '\n' : '') + leaked.reasoning;
+            displayContent = leaked.answer;
+          }
+
           setMessages(prev => {
             const copy = [...prev];
             copy[copy.length - 1] = {
@@ -4726,16 +4821,22 @@ function App() {
           /^\s*The response (will|is) /i,
           /^\s*I (need|want|have) to /i,
         ];
-        // 独白でない行 (実応答候補) を抽出
+        // 独白でない行 (実応答候補) を抽出。
+        // 日本語で聞かれている場合、日本語を含まない行は回答本文ではない
+        // (計画メモは英語の見出し+箇条書きで、上のパターンには一致しないため、
+        //  ここで弾かないと思考がそのまま本文に昇格してしまう)
+        const isReasoningLine = (trimmed) =>
+          reasoningPatterns.some(p => p.test(trimmed))
+          || (expectJapanese && !HAS_JA_RE.test(trimmed));
         const realAnswerLines = thinkingLines.filter(l => {
           const trimmed = l.trim();
           if (!trimmed) return false;
-          return !reasoningPatterns.some(p => p.test(trimmed));
+          return !isReasoningLine(trimmed);
         });
         const reasoningLines = thinkingLines.filter(l => {
           const trimmed = l.trim();
           if (!trimmed) return false;
-          return reasoningPatterns.some(p => p.test(trimmed));
+          return isReasoningLine(trimmed);
         });
 
         if (realAnswerLines.length > 0) {
