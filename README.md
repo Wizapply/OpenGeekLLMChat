@@ -1280,6 +1280,8 @@ opengeek-llm-chat/
 | `agentContext.largePredict` | ツール判断時のmax_tokens（長文モード）+ continueGen時、デフォルト8192 |
 | `agentContext.judgeHistoryCount` | ツール判断時に送る直近メッセージ件数、デフォルト3 |
 | `agentContext.judgeRetryPredict` | ツール判断が max_tokens で打ち切られた時に引き直す際の max_tokens。`null` で `max(largePredict, smallPredict×4)`。thinking が止まらないモデルへの保険 |
+| `agentContext.judgeTemperature` | ツール判断時の温度、デフォルト0.1。分類タスクなので低くする（高いと前置きを書いてから答えるので遅くなる） |
+| `agentContext.judgeHistoryChars` | ツール判断に送る過去メッセージ1件あたりの最大文字数、デフォルト800（最新の質問は切り詰めない）。判断のたびに長文回答を再処理するのを防ぐ |
 | `chatMaxTokens` | 1応答あたりの最大生成トークン（暴走ループの安全網）。デフォルト8192。`agentContext.largePredict` が優先される。**長い解説やコード生成が途中で切れる場合はここを上げる**（ctx に余裕があること） |
 | `agentContext.largeGenKeywords` | 長文モード判定キーワード（null=デフォルト使用） |
 | `historyMode` | 会話履歴の送信方式。`compaction`（Claude風、上限接近時のみLLM要約で圧縮、デフォルト）/ `weighted`（従来の直近優先圧縮） |

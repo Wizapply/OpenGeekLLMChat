@@ -3172,13 +3172,25 @@ function App() {
         }
         const judgeSystem = fillTemplate(sp.judge || '', { toolList: toolListLines.join('\n') });
 
-        // 判断用のapiMessages（短縮版）— 直近の履歴だけ使う
-        const judgeHistory = history.slice(-judgeHistoryCount);
+        // 判断用のapiMessages（短縮版）— 直近の履歴だけ使う。
+        // 判断に要るのは「今何を聞かれているか」だけなので、過去の長文回答は頭だけ残す。
+        // 上限を上げた今、直前の回答が1万トークン超のこともあり、そのまま送ると
+        // 判断のたびにプロンプト処理でその分待たされる（最新の質問は切らない）
+        const judgeHistoryChars = agentCtx.judgeHistoryChars ?? 800;
+        const judgeHistoryRaw = history.slice(-judgeHistoryCount);
+        const judgeHistory = judgeHistoryRaw.map((m, i) => {
+          const isLast = i === judgeHistoryRaw.length - 1;
+          if (isLast || typeof m.content !== 'string' || m.content.length <= judgeHistoryChars) return m;
+          return { ...m, content: m.content.slice(0, judgeHistoryChars) + '\n…(以下省略)' };
+        });
         // 初回ツール判断用プロンプト
         let judgeMessages = [{ role: 'system', content: judgeSystem }, ...judgeHistory];
 
         const judgeNumPredict = needsLargeGen ? largePredict : smallPredict;
-        console.log(`[ツール判断] max_tokens=${judgeNumPredict}, history=${judgeHistory.length}件 (needsLargeGen=${needsLargeGen})`);
+        // 実際に送る値を出す。以前はここに表示された値と送信値が食い違っており
+        // (max_tokens が上書きされていた)、遅さの原因に気づけなかった
+        const judgeHistChars = judgeHistory.reduce((s, m) => s + (typeof m.content === 'string' ? m.content.length : 0), 0);
+        console.log(`[ツール判断] max_tokens=${judgeNumPredict}, history=${judgeHistory.length}件/${judgeHistChars}文字 (needsLargeGen=${needsLargeGen})`);
 
         // ─── 判断モデルを待たずに永続RAGを引く場合 ───
         //
@@ -3273,9 +3285,16 @@ function App() {
                   messages: turnMessages,
                   tools,
                   stream: false,
+                  ...llamaCommonOptions,
+                  // ── llamaCommonOptions より後ろに置くこと ──
+                  // 先に書くと llamaCommonOptions.max_tokens (= largePredict) に
+                  // 上書きされ、smallPredict が一切効かない。実際そうなっており、
+                  // 判断が上限いっぱいまで思考して延々と待たされていた
                   max_tokens: judgeBudget,
                   chat_template_kwargs: { enable_thinking: false },
-                  ...llamaCommonOptions,
+                  // 判断は「どのツールを呼ぶか」の分類。ばらつきは害にしかならず、
+                  // 温度が高いほど余計な前置きを書いてから答えるので遅くなる
+                  temperature: agentCtx.judgeTemperature ?? 0.1,
                 }),
                 signal: controller.signal,
               });
@@ -4344,22 +4363,30 @@ function App() {
         const relaxSamplers = hasSourcesForAnswer && appConfig.ragRelaxSamplers !== false;
         if (relaxSamplers) console.log('[サンプラー緩和] 逐語引用のため繰り返しペナルティを無効化');
 
-        // ─── ツールを1つも実行していない時は「今は呼べない」と明示する ───
+        // ─── 「この応答ではもうツールを呼べない」と必ず明示する ───
         // 最終応答のリクエストには tools を渡していない。にもかかわらず
         // システムプロンプトにはツール案内（web_search 等）が載ったままなので、
         // モデルは「検索すべきだ」と判断しつつ呼び出す手段が無く、
-        // 検索クエリそのものを本文に書いてしまうことがある。
-        // 実例: 「MPIライブラリで書けますか？」への回答が
-        //       "mpi4py MPI-3 one-sided RMA MPI_Win_create support" だけになった
+        // 検索クエリそのものを本文に書いてしまう。
+        // 実例1 (ツール未実行): 回答が "mpi4py MPI-3 one-sided RMA ..." だけになった
+        // 実例2 (検索5回実行後): 3回が0件だったため、モデルはもう一度引こうとして
+        //        "mpi4py readthedocs one-sided communication RMA tutorial" と書いた
+        //
+        // 【重要】ツールを実行済みかどうかで場合分けしないこと。
+        // 最終応答に tools が無いのは常に真で、検索が空振りした後ほど
+        // 「もう一度引きたい」欲求が強く出る
         let finalMessages = apiMessages;
-        if (!hasSourcesForAnswer && apiMessages[0]?.role === 'system') {
+        if (apiMessages[0]?.role === 'system') {
           finalMessages = [...apiMessages];
           finalMessages[0] = {
             role: 'system',
             content: apiMessages[0].content
               + '\n\n## この応答での制約\n'
-              + '- 今回はツールを呼び出せません。検索クエリやツール名だけを書かず、必ずユーザーへの回答本文を書いてください。\n'
-              + '- 現時点の知識で答えられる範囲を日本語で説明し、確認が必要な点があればその旨を添えてください。',
+              + '- この応答ではツールを呼び出せません。検索クエリやツール名だけを書かず、必ずユーザーへの回答本文を書いてください。\n'
+              + (hasSourcesForAnswer
+                ? '- 追加の検索はできません。すでに得られたツール結果と自分の知識で、いま答えられる範囲を日本語で書いてください。\n'
+                  + '- 結果が不十分だった場合は、分かった範囲を示したうえで「ここまでは確認できた／ここからは未確認」と切り分けて伝えてください。'
+                : '- 現時点の知識で答えられる範囲を日本語で説明し、確認が必要な点があればその旨を添えてください。'),
           };
         }
 
@@ -4396,10 +4423,10 @@ function App() {
           });
           const lastContent = (lastMsg?.content || '').trim();
           const hasToolResultInHistory = apiMessages.some(m => m.role === 'tool');
-          // 本文が「検索クエリだけ」になっていないか。ツールを1件も実行していない
-          // ターンでのみ判定する (ツールを使えた場合はモデルに機会があったため)
-          const queryOnly = !hasToolResultInHistory
-            && looksLikeSearchQuery(lastContent, HAS_JA_RE.test(text || ''));
+          // 本文が「検索クエリだけ」になっていないか。
+          // ツール実行の有無で場合分けしないこと。検索が空振りした後こそ
+          // モデルはもう一度引こうとして、クエリを本文に書く
+          const queryOnly = looksLikeSearchQuery(lastContent, HAS_JA_RE.test(text || ''));
           if (queryOnly) {
             console.warn(`[クエリ応答救済] 本文が検索クエリのようです: "${lastContent}" → 回答を再生成`);
           }
@@ -4414,8 +4441,11 @@ function App() {
                 role: 'user',
                 content:
                   '直前の応答は検索キーワードのようになっていて、回答になっていません。\n'
-                  + '今回はツールを呼び出せないので、検索キーワードではなく回答本文を書いてください。\n'
-                  + '現時点の知識で答えられる範囲を日本語で説明し、確証が持てない部分は「確認が必要です」と明示してください。',
+                  + 'この応答ではツールを呼び出せないので、検索キーワードではなく回答本文を書いてください。\n'
+                  + (hasToolResultInHistory
+                    ? 'すでに得られたツール結果と自分の知識で、いま答えられる範囲を日本語で書いてください。\n'
+                      + '結果が不十分だったなら、分かった範囲を示したうえで「ここまでは確認できた／ここからは未確認」と切り分けて伝えてください。'
+                    : '現時点の知識で答えられる範囲を日本語で説明し、確証が持てない部分は「確認が必要です」と明示してください。'),
               } : {
                 role: 'user',
                 content:
