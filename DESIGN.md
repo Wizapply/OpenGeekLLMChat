@@ -142,6 +142,41 @@ LLMが応答生成前に「ツール判断フェーズ」と「最終応答フ�
 判定が外れても、従来の判断LLMに落ちるか無駄な検索が1回入るだけで回答は壊れない
 （安全側に倒した設計）。
 
+### サンプラー緩和の適用範囲（relaxSamplersAlways）
+
+DRY サンプラーは「コンテキスト内の既出トークン列の再出力」を列が長いほど指数関数的に
+罰する。この罰は検索結果の逐語引用だけでなく、**同じコマンドやコードを2回書く普通の
+回答**にも当たる。実害として `mpirun -np 2 python test.py` を再掲しようとするたびに
+後半の罰が上限を超え、`test.y` → `test.p` → `tes` → `pytho` と1文字ずつ欠けながら
+「ではなく:」の自己訂正ループに陥った。
+
+対策として `relaxSamplersAlways`（既定 true）を追加し、**ユーザーに見せる最終応答
+（agentic 最終ストリーム・always モード・続き生成・各救済リトライ）では常に**
+`repeat_penalty=1.0, dry_multiplier=0` 等で繰り返し系サンプラーを外す。
+ツール判断・コンパクション要約などの内部生成には従来どおりペナルティが効く。
+暴走ループは画面側の `findTailRepetition` と `max_tokens` で受け止める。
+false にすると従来どおり `ragRelaxSamplers`（検索結果を渡したターンのみ緩和）だけが効く。
+
+### チャットテンプレート互換: 途中の system メッセージの正規化（systemMessageCompat）
+
+GPT-OSS（harmony）等のチャットテンプレートは「system は先頭1件のみ」を強制し、
+会話の途中に system ロールが現れると Jinja が
+`System message must be at the beginning` を raise してllama-server が 400 を返す。
+アプリは以下の複数箇所で途中 system を注入するため、該当モデルでは必ず失敗していた:
+
+- コンパクション要約（【これまでの会話の要約】、先頭 system の直後）
+- weighted 履歴モードの過去会話ダイジェスト
+- RAG 出典台帳（`buildSourceLedger`、最新の質問の直前に splice）
+- 追加 Web 検索の結果注入（会話末尾）
+
+対策として `systemMessageCompat`（既定 true）を追加し、`/v1` プロキシが
+`POST /v1/chat/completions` のボディを読み、2件目以降の system 本文を
+**直後の user メッセージの先頭へ連結**してから llama-server へ転送する
+（後続の user が無い末尾 system は user ロールとして送る）。
+注入している内容は情報提供の文章なので user に移しても意味は変わらず、
+Qwen/Gemma 等の寛容なテンプレートにも無害。プロキシ1箇所の対応で、
+通常送信・続き生成・救済リトライ等すべての経路が同時に直る。
+
 ### 小さいテキストファイルのチャット直接添付（インライン添付）
 
 数KBのソースコード・config・テキストは、RAG（ドキュメント登録→embedding→検索）を
@@ -1540,6 +1575,8 @@ isStreaming={isLoading && i === messages.length - 1}
 | `ragMode` | string | "agentic" | agentic / always |
 | `inlineFileMaxChars` | number | 12000 | この文字数以下のテキストファイルはRAG登録せずメッセージ本文へ直接添付（0で常にRAG登録） |
 | `inlineFileTotalMaxChars` | number | 24000 | 1メッセージに直接添付できる合計文字数（超過分はRAG登録へ） |
+| `relaxSamplersAlways` | bool | true | ユーザーに見せる最終応答では常に繰り返しペナルティ(DRY等)を外す（コマンド再掲が1文字ずつ欠ける症状の対策） |
+| `systemMessageCompat` | bool | true | 途中の system メッセージを直後の user へ連結してから送信（GPT-OSS等の「system は先頭のみ」テンプレート対策） |
 | `agentContext.smallPredict` | number | 512 | ツール判断時のmax_tokens（短文モード） |
 | `agentContext.largePredict` | number | 8192 | ツール判断時のmax_tokens（長文モード）+ continueGen時 |
 | `agentContext.judgeHistoryCount` | number | 3 | ツール判断時の履歴件数 |
@@ -2865,6 +2902,26 @@ body, .app-layout, .chat-area {
 
 61. **Reactの条件分岐レンダリングは state を破棄する**
     `{tab === 'x' && <View />}` で false になると React は完全に unmount してコンポーネント state を破棄する。タブを行き来する画面では入力値・スクロール位置・モーダル開閉などが全て初期化されてしまう。`<div style={{display: tab === 'x' ? 'block' : 'none'}}>` でラップすれば DOM・state ともに保持される。useEffect の `[]` 依存も再実行されない。
+
+61-b. **チャット欄トグル（🌐Web検索・📚登録資料・☁️GDrive）はチャットごとに保存**
+    トグル状態はグローバル state だが、保存ペイロードの `toggles` フィールドに含めて
+    チャットごとに永続化する。`loadChat` で復元（`toggles` が無い古いチャットは config の
+    既定値へ）、`newChat` でも既定値に戻すので、前に開いていたチャットの状態を
+    引き継がない。トグルのクリックは `messagesDirtyRef` を立て、自動保存エフェクトの
+    依存配列にトグルを含めることで「トグルだけ変えてチャットを切り替えた」場合も保存される。
+
+61-c. **出典キー規則とWeb検索の併用で「引用ルールの解釈ループ」に入る**
+    永続RAGとWeb検索を同時に使ったターンで、「出典キーを付けられる内容だけを回答に
+    含めてください」の規則がSキーを持たないWeb検索結果と矛盾し、モデルが
+    「Webの内容はどう書けばいいのか」の検討を延々と書き続けるループに入った実例がある。
+    対策: (1) RAG検索結果とWeb検索結果の両方に「出典キーの規則はRAG検索結果にだけ
+    適用され、Web由来の内容はキー無しで書く」旨を明示し、「迷っても検討を書き連ねない」
+    と指示する（systemPrompts.rag にも同じ明確化を追加）。
+    (2) findTailRepetition は完全一致の周期しか拾えないため、言い回しを変えながら
+    繰り返すループ用に findSimilarParagraphLoop を追加。段落の文字バイグラム類似度で
+    「末尾3段落のうち2つ以上に、先行するほぼ同一(0.9以上)の段落がある」を検出する
+    （A,B,A',B'…と交互に繰り返すパターンにも効く）。表・箇条書き・コード行は除外し、
+    80文字以上の段落だけを見ることで誤検出を防ぐ。
 
 62. **チャット履歴の自動保存タイミング = 並び順の更新タイミング**
     `useEffect([messages])` で自動保存すると、`loadChat` で履歴を開いた瞬間に setState → useEffect 発火 → POST → updatedAt 更新となり、開いただけのチャットが先頭に来てしまう。`messagesDirtyRef` で「実際にユーザー操作があったか」を追跡し、それが true のときだけ保存することで「開いただけでは並び順が変わらない」挙動を実現する。useState ではなく useRef を使うのはクロージャ問題と無駄な再レンダー回避のため。

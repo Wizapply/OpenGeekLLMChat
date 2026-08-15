@@ -182,6 +182,45 @@ function findTailRepetition(text, opts = {}) {
   return 0;
 }
 
+// 「少し変化しながら繰り返す」段落ループの検出。
+// findTailRepetition は完全一致の周期しか拾えないため、
+// 「うーん、でも指示では…」のように言い回しを少し変えつつ同じ検討を
+// 書き続けるループ (指示の解釈に迷った時に出る) は素通りしてしまう。
+// しかもこの種のループは2種類の段落が交互に出る (A,B,A',B',…) ことがあるので、
+// 「隣接段落の類似」ではなく「末尾の段落が、それより前の段落とほぼ同一か」を見る:
+// 末尾3段落のうち2つ以上に、先行するほぼ同一 (類似度0.9以上) の段落があればループ。
+// 類似度は文字バイグラム集合の重なりで測る。
+//
+// 誤検出への保険:
+//   - 80文字以上の段落だけを対象 (短い相づちは見ない)
+//   - Markdownの表・箇条書き・見出し・コード行は除外 (似た行が並ぶのが正常なため)
+//   - 正当な文章で「長い段落の9割一致の再出現」が末尾に2つ並ぶことはまず無い。
+//     万一誤検出しても、打ち切り + 「続きを生成」ボタンが出るだけで回答は失われない
+function findSimilarParagraphLoop(tail) {
+  const paras = tail.split(/\n+/)
+    .map(s => s.trim())
+    .filter(s => s.length >= 80 && !/^[|\-*#>0-9`]/.test(s));
+  if (paras.length < 4) return false;  // 先頭の段落は tail の切れ目で欠けている可能性があるため多めに要求
+  const bigrams = (s) => {
+    const set = new Set();
+    for (let i = 0; i < s.length - 1; i++) set.add(s.slice(i, i + 2));
+    return set;
+  };
+  const sets = paras.map(bigrams);
+  const similarity = (A, B) => {
+    let inter = 0;
+    for (const g of A) if (B.has(g)) inter++;
+    return inter / Math.max(A.size, B.size);
+  };
+  let dupCount = 0;
+  for (let i = Math.max(1, paras.length - 3); i < paras.length; i++) {
+    for (let j = 0; j < i; j++) {
+      if (similarity(sets[i], sets[j]) >= 0.9) { dupCount++; break; }
+    }
+  }
+  return dupCount >= 2;
+}
+
 // ─── Utility: GDrive のファイル参照を実IDに解決する ───
 // Google Drive の ID は 33文字前後のランダム文字列で、LLM はこれを正確に書き写すのが
 // 非常に苦手。1〜2文字変えたり途中で切ったりして「IDが違ったのでやり直す」を繰り返し、
@@ -3125,7 +3164,14 @@ function App() {
               + '角括弧と丸括弧を並べたリンク記法（[...](...)）で書いてはいけません。\n'
               + 'ここに無いキーを書いてはいけません。章や節の番号を推測で書くことも禁止です。\n'
               + '上に載っていない人名・著者名・文献名・ファイル名を書いてはいけません。'
-              + '聞かれても「取得した範囲には出てきません」と答えてください。';
+              + '聞かれても「取得した範囲には出てきません」と答えてください。\n'
+              // Web検索と併用したターンで「Sキーの無いWeb結果はどう書けばいいのか」の
+              // 解釈に迷い、検討を延々と書き続ける思考ループに入った実例への対策。
+              // 規則の適用範囲を明示し、迷った時の打ち切りも指示する
+              + '※この出典キーの規則が適用されるのは、この検索結果から引用する内容だけです。'
+              + 'Web検索結果や自分の知識から書く部分には出典キーを付けません'
+              + '（Web検索の内容は「Web検索によると」のように出所を言葉で添えるだけでよい）。'
+              + 'どちらの扱いか迷っても、検討を書き連ねずそのまま書き分けてください。';
           }
 
           setMessages(prev => {
@@ -3837,13 +3883,21 @@ function App() {
                 return copy;
               });
 
-              const resultText = webResults.length > 0
+              let resultText = webResults.length > 0
                 ? webResults.map((r, i) => {
                     let entry = `[Web${i + 1}] ${r.title}\n${r.url}\n${r.snippet}`;
                     if (r.body) entry += `\n--- 本文抜粋 ---\n${r.body}`;
                     return entry;
                   }).join('\n\n===\n\n')
                 : 'Web検索結果が見つかりませんでした。';
+              // 永続RAGと併用したターンでは、Web結果に出典キー【S】が無いことを明示する。
+              // これが無いと「キーを付けられない内容は書けないのでは」と引用ルールの
+              // 解釈で延々と迷う思考ループに入ることがある (実例あり)
+              if (persistentRagActive && webResults.length > 0) {
+                resultText += '\n\n※このWeb検索結果は出典キー【S】の対象外です。'
+                  + '引用時はキーを付けず、「Web検索によると」のように出所を言葉で添えてください'
+                  + '（URLやリンクの転記は不要）。書き方に迷っても検討を書き連ねないでください。';
+              }
               apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: resultText });
 
             } else if (fnName && fnName.startsWith('gdrive_')) {
@@ -4498,15 +4552,19 @@ function App() {
           return copy;
         });
 
-        // ─── 引用させる回答では繰り返し系サンプラーを外す ───
+        // ─── ユーザーに見せる最終応答では繰り返し系サンプラーを外す ───
         // DRY はコンテキスト内の既出トークン列の再出現を指数関数的に罰する。
-        // 検索結果を渡した状態でこれを効かせると、原文どおりに書き写す行為が
-        // そのまま罰の対象になり、モデルは別の語に逃げるしかなくなる
-        // (数式の n が \infty に化け、日本語も既出の漢字から順に脱落した)。
+        // 検索結果の逐語引用だけでなく、「同じコマンドを2回書く」普通の回答でも
+        // 再現の後半ほど罰が強まり、1文字ずつ欠けていく実害があった
+        // (mpirun ... test.py → test.y → test.p → tes、と自己訂正ループに陥る。
+        //  RAG引用では数式の n が \infty に化け、既出の漢字から順に脱落した)。
+        // そこで relaxSamplersAlways (既定true) では最終応答で常に外す。
         // 暴走ループは streamResponse の findTailRepetition と max_tokens で受ける。
+        // false にすると従来どおり、検索結果を渡したターン (ragRelaxSamplers) だけ緩和する。
         const hasSourcesForAnswer = apiMessages.some(m => m.role === 'tool');
-        const relaxSamplers = hasSourcesForAnswer && appConfig.ragRelaxSamplers !== false;
-        if (relaxSamplers) console.log('[サンプラー緩和] 逐語引用のため繰り返しペナルティを無効化');
+        const relaxSamplers = appConfig.relaxSamplersAlways !== false
+          || (hasSourcesForAnswer && appConfig.ragRelaxSamplers !== false);
+        if (relaxSamplers) console.log('[サンプラー緩和] 最終応答では繰り返しペナルティを無効化');
 
         // ─── 「この応答ではもうツールを呼べない」と必ず明示する ───
         // 最終応答のリクエストには tools を渡していない。にもかかわらず
@@ -4763,6 +4821,13 @@ function App() {
               stream: true,
               stream_options: { include_usage: true },
               ...llamaCommonOptions,
+              // llamaCommonOptions より後ろ: 最終応答と同じ条件でサンプラーを緩和する
+              ...(relaxSamplers ? {
+                repeat_penalty: 1.0,
+                dry_multiplier: 0,
+                presence_penalty: 0,
+                frequency_penalty: 0,
+              } : {}),
             }),
             signal: controller.signal,
           });
@@ -4792,6 +4857,14 @@ function App() {
             stream: true,
             stream_options: { include_usage: true },
             ...llamaCommonOptions,
+            // llamaCommonOptions より後ろ: 最終応答では繰り返しペナルティを外す
+            // (relaxSamplersAlways。理由は agentic 経路の relaxSamplers のコメント参照)
+            ...(appConfig.relaxSamplersAlways !== false ? {
+              repeat_penalty: 1.0,
+              dry_multiplier: 0,
+              presence_penalty: 0,
+              frequency_penalty: 0,
+            } : {}),
           }),
           signal: controller.signal,
         });
@@ -4968,6 +5041,14 @@ function App() {
               if (period > 0) {
                 console.log(`[ループ検出] 末尾が周期${period}文字で繰り返し:`,
                   JSON.stringify(tail.slice(-period)).slice(0, 80));
+                loopDetected = true;
+                if (abortRef.current) abortRef.current.abort();
+                break;
+              }
+              // 完全一致でなくても、ほぼ同じ長い段落が3つ連続していたらループ
+              // (言い回しを変えながら同じ検討を繰り返すパターンの検出)
+              if (findSimilarParagraphLoop(tail)) {
+                console.log('[ループ検出] ほぼ同一の段落が連続 (類似度ベース)');
                 loopDetected = true;
                 if (abortRef.current) abortRef.current.abort();
                 break;
@@ -6085,6 +6166,14 @@ function App() {
         dry_allowed_length: appConfig.dryAllowedLength,
         dry_penalty_last_n: appConfig.dryPenaltyLastN,
         cache_prompt: true,
+        // 続き生成もユーザーに見せる最終応答なので、繰り返しペナルティを外す
+        // (relaxSamplersAlways。理由は sendMessage の relaxSamplers のコメント参照)
+        ...(appConfig.relaxSamplersAlways !== false ? {
+          repeat_penalty: 1.0,
+          dry_multiplier: 0,
+          presence_penalty: 0,
+          frequency_penalty: 0,
+        } : {}),
       };
 
       const res = await fetch('/v1/chat/completions', {
@@ -6174,6 +6263,14 @@ function App() {
           messages: msgs,
           role: chatRole || '',
           documents: documents.map(d => ({ name: d.name, text: d.text, chunks: d.chunks, embeddings: d.embeddings })),
+          // チャット欄トグルの状態もチャットごとに保存する
+          // (「この会話は資料を読む会話」「この会話はDrive作業」のような使い分けを
+          //  チャットを切り替えても維持するため)
+          toggles: {
+            webSearch: webSearchEnabled,
+            persistentRag: persistentRagEnabled,
+            gdrive: gdriveEnabled,
+          },
         }),
       });
       loadChatList();
@@ -6194,6 +6291,12 @@ function App() {
       setShowRoleEditor(false);
       setMessages(data.messages || []);
       setDocuments(data.documents || []);
+      // チャット欄トグルの復元。保存されていない古いチャットは既定値に戻す
+      // (残したままだと直前に開いていたチャットの状態を引き継いでしまう)
+      const tg = data.toggles || {};
+      setWebSearchEnabled(tg.webSearch !== undefined ? !!tg.webSearch : (appConfig.webSearch !== false));
+      setPersistentRagEnabled(tg.persistentRag !== undefined ? !!tg.persistentRag : (appConfig.ragEnabledByDefault === true));
+      setGdriveEnabled(tg.gdrive !== undefined ? !!tg.gdrive : true);
       messagesDirtyRef.current = false;  // ロードしただけでは dirty にしない
     } finally {
       setChatLoading(false);
@@ -6210,9 +6313,11 @@ function App() {
     setMessages([]);
     setDocuments([]);
     setChatTextFiles([]);  // 送信前のインライン添付も破棄
-    // 登録資料の検索は「そのチャットで明示的にONにするもの」なので、
-    // 新規チャットでは既定値（通常OFF）に戻す
+    // チャット欄トグルは既定値に戻す (トグル状態はチャットごとに保存されるため、
+    // 新規チャットに前のチャットの状態を引き継がない)
     setPersistentRagEnabled(appConfig.ragEnabledByDefault === true);
+    setWebSearchEnabled(appConfig.webSearch !== false);
+    setGdriveEnabled(true);
     messagesDirtyRef.current = false;  // 新規チャット時もクリア
   }
 
@@ -6634,9 +6739,11 @@ ${conversationText}
     setChatTitle(title);
   }, [messages, isLoading, chatTitle]);
 
-  // メッセージ・ドキュメント変更時に自動保存（1.5秒デバウンス）
+  // メッセージ・ドキュメント・チャット欄トグル変更時に自動保存（1.5秒デバウンス）
   // ただし「履歴を開いただけ」では保存しない（並び順を維持するため）
   // messagesDirtyRef が true のときだけ保存する
+  // (トグルのクリックは onClick 側で dirty を立てる。ロード時の復元 setState では
+  //  dirty が立たないので、開いただけのチャットが保存し直されることはない)
   useEffect(() => {
     if (messages.length === 0 && documents.length === 0) return;
     if (isLoading) return;
@@ -6647,7 +6754,7 @@ ${conversationText}
       messagesDirtyRef.current = false;  // 保存したらクリア
     }, 1500);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-  }, [messages, documents, isLoading]);
+  }, [messages, documents, isLoading, webSearchEnabled, persistentRagEnabled, gdriveEnabled]);
 
   // ─── エラー自動消去 ───
   useEffect(() => {
@@ -7332,7 +7439,7 @@ ${conversationText}
                       <div className="msg-bubble user-bubble">{msg.content}</div>
                     </React.Fragment>
                   )}
-                  {msg.role === 'assistant' && !(isLoading && i === messages.length - 1) && (msg.content || msg.thinking) && (
+                  {msg.role === 'assistant' && !(isLoading && i === messages.length - 1) && (msg.content || msg.thinking || msg.loopDetected || msg.lengthCapped) && (
                     <div className="msg-actions">
                       {msg.content && (
                         <>
@@ -7350,8 +7457,11 @@ ${conversationText}
                         </>
                       )}
                       {/* 思考のみで本応答が空 or 応答が途中で切れた場合に「続ける」ボタン。
-                          max_tokens で切れた時 (lengthCapped) は thinking が無くても出す */}
-                      {i === messages.length - 1 && (!msg.content || msg.thinking || msg.lengthCapped) && (
+                          max_tokens で切れた時 (lengthCapped) は thinking が無くても出す。
+                          ループ検出時 (loopDetected) も同様: 本文側でループした場合は
+                          content があり thinking が空なので、この条件に入れないと
+                          「ボタンで回答を要求できます」の案内だけ出てボタンが無い状態になる */}
+                      {i === messages.length - 1 && (!msg.content || msg.thinking || msg.lengthCapped || msg.loopDetected) && (
                         <button className="msg-action-btn continue-btn" onClick={() => continueGeneration(i)}>
                           {msg.loopDetected ? '⚠️ 思考ループを中断・回答を要求'
                             : msg.lengthCapped ? '✂️ 途中で終了 — 続きを生成'
@@ -7519,7 +7629,7 @@ ${conversationText}
                   <button
                     className={`toolbar-btn web-search-toggle ${webSearchEnabled ? 'active' : ''}`}
                     title={webSearchEnabled ? 'Web検索: ON（クリックでOFF）' : 'Web検索: OFF（クリックでON）'}
-                    onClick={() => setWebSearchEnabled(v => !v)}
+                    onClick={() => { setWebSearchEnabled(v => !v); messagesDirtyRef.current = true; }}
                   >
                     🌐
                   </button>
@@ -7532,7 +7642,7 @@ ${conversationText}
                     title={persistentRagEnabled
                       ? `登録資料の検索: ON（クリックでOFF）/ ${summarizePersistentRagDocs(3)}`
                       : `登録資料の検索: OFF（クリックでON）/ 登録済み: ${persistentRagDocCount}件`}
-                    onClick={() => setPersistentRagEnabled(v => !v)}
+                    onClick={() => { setPersistentRagEnabled(v => !v); messagesDirtyRef.current = true; }}
                   >
                     📚
                   </button>
@@ -7556,6 +7666,7 @@ ${conversationText}
                         return;
                       }
                       setGdriveEnabled(v => !v);
+                      messagesDirtyRef.current = true;
                     }}
                   >
                     ☁️

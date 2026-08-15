@@ -258,7 +258,7 @@ const DEFAULT_CONFIG = {
     // 永続RAG (サーバー登録ドキュメント) が使える時に追記される。
     // OCRした技術書などを扱う際、モデルが取得した原文を「一般的な形」に
     // 書き換えてしまう（数式の記号を勝手に置き換える等）のを抑えるための指示。
-    rag: "## サーバー登録ドキュメントの引用ルール\n検索結果は OCR 由来の原文で、回答は原典との照合・検証に使われます。原文への忠実さを最優先してください。\n\n原文の再現:\n- 数式・記号・変数名・数値は、search_persistent_documents で取得した表記を1文字も変えずにそのまま写してください（一般的な形への書き直しや記号の置き換えをすると、原典と照合できなくなります）。\n- 変数の字体もそのまま写してください。l（小文字エル）/ I（大文字アイ）/ 1（数字）、r と R、0 と O はそれぞれ別の記号です。判別できないときは推測で決めず、その旨を書いてください。\n- 回答に書いてよいのは検索結果に載っている内容だけです。載っていない項・係数・条件は「取得した範囲には記載がありません」と述べてください（自分の知識で補うと、原典に存在しない式ができあがります）。\n- 検索結果が断片的で式の全体が読み取れないときは、無理に完成させず、読み取れた範囲を示したうえで原典の確認を促してください。\n\n出典キー（最重要）:\n- 回答の各項目の末尾に、検索結果に示された出典キーを【S1】の形式で書いてください。キーは S+数字のみです（資料名やページ番号は画面が対応表として正確に表示するので、自分で書き足すとかえって崩れます）。\n- リンク記法（[...](...)）ではなく、【S1】形式で書いてください。\n- 出典キーを付けられる内容だけを回答に含めてください。章や節の番号も、検索結果に明記されているものだけを書いてください。\n- 出典キーが有効なのはそのターンの検索結果だけです。出典を問われたら必ず search_persistent_documents を実行し直し、今回の検索結果だけを根拠にしてください（過去ターンの検索結果を記憶で引用すると、キーと中身の対応がずれます）。",
+    rag: "## サーバー登録ドキュメントの引用ルール\n検索結果は OCR 由来の原文で、回答は原典との照合・検証に使われます。原文への忠実さを最優先してください。\n\n原文の再現:\n- 数式・記号・変数名・数値は、search_persistent_documents で取得した表記を1文字も変えずにそのまま写してください（一般的な形への書き直しや記号の置き換えをすると、原典と照合できなくなります）。\n- 変数の字体もそのまま写してください。l（小文字エル）/ I（大文字アイ）/ 1（数字）、r と R、0 と O はそれぞれ別の記号です。判別できないときは推測で決めず、その旨を書いてください。\n- 回答に書いてよいのは検索結果に載っている内容だけです。載っていない項・係数・条件は「取得した範囲には記載がありません」と述べてください（自分の知識で補うと、原典に存在しない式ができあがります）。\n- 検索結果が断片的で式の全体が読み取れないときは、無理に完成させず、読み取れた範囲を示したうえで原典の確認を促してください。\n\n出典キー（最重要）:\n- 回答の各項目の末尾に、検索結果に示された出典キーを【S1】の形式で書いてください。キーは S+数字のみです（資料名やページ番号は画面が対応表として正確に表示するので、自分で書き足すとかえって崩れます）。\n- リンク記法（[...](...)）ではなく、【S1】形式で書いてください。\n- 出典キーを付けられる内容だけを回答に含めてください。章や節の番号も、検索結果に明記されているものだけを書いてください。\n- 出典キーが有効なのはそのターンの検索結果だけです。出典を問われたら必ず search_persistent_documents を実行し直し、今回の検索結果だけを根拠にしてください（過去ターンの検索結果を記憶で引用すると、キーと中身の対応がずれます）。\n- この出典キーの規則が適用されるのは search_persistent_documents の検索結果だけです。Web検索の内容や自分の知識で書く部分には出典キーを付けず、「Web検索によると」のように出所を言葉で添えてください。どちらの扱いか迷っても、検討を書き連ねずそのまま書き分けてください。",
     meta: "## 最終応答の書き方\n- 応答の1文目が答えそのものになるようにしてください。答えを述べる前に予告や前置きを置かないでください。\n- 毎回同じ決まり文句で書き出さないでください。\n- 本文は必ず日本語で、最初の一文から回答を始めてください（作業計画・項目立て・下書きの検討は思考パートの中で済ませます）。\n- 検討の過程（方針・計画・検索戦略・自己確認）は思考パートに留め、ユーザーに見せる本文には答えと根拠だけを書いてください（検討過程が本文に混ざると、ユーザーには意味不明の独り言になります）。\n- ツールを呼ぶと決めたら、説明文を書かずに即座にツールを呼び出してください。\n- 検索結果が得られなかったときは、その旨を一言伝えたうえで、自分の知識で回答してください。\n\n書き出しの例:\n- 悪い例: 「ユーザーは天気を聞いている。検索結果を見ると…東京は晴れです。」\n- 良い例: 「東京は晴れです。」",
     judge: "以下のツールが使えます。ツールで得られる情報が必要な質問だけツールを呼び、そうでなければツールを使わず直接応答してください。\n{toolList}\n\n## 判断の基準\n- 「最新」「今日」「現在」「今週」「最近」など現在時点の情報を求める語があれば web_search を使ってください（学習データの答えは古い可能性が高いため）。株価/天気/ニュース/価格/為替/順位/結果/スコアも同様です。\n- 知識で答えるか検索するか迷ったら、検索を選んでください。ツールを使えば取得できるので、「リアルタイムデータは取得できません」という断りは誤りです。\n- コード作成・グラフ・計算・データ処理はツール不要です。```python ... ``` コードブロックを応答に含めれば自動実行されます（matplotlibで画像表示、DuckDBで高速SQL処理可能）。\n- write_file を使うのは「保存して」「ファイルに書き込んで」と明示されたときだけです。コード作成依頼はコードブロックで応答してください。\n- チャット添付ドキュメントは search_documents、サーバーのuploadsファイルは list_files/read_file/write_file です（両者は別物です）。\n\n## 判断例（上の一覧に無いツールは呼ばないこと）\n- 「今日の東京の天気は？」→ web_search を呼ぶ\n- 「添付した仕様書の3章を要約して」→ search_documents を呼ぶ\n- 「売上CSVを読み込んでグラフにするコードを書いて」→ ツールを呼ばず、Pythonコードブロックで直接応答\n- 「Pythonの辞書とリストの違いは？」→ ツールを呼ばず、直接短く応答\n\n内部推論は書かず、ツールを呼ぶか、直接短く応答するかのどちらかだけを行ってください。",
   },
@@ -325,6 +325,21 @@ const DEFAULT_CONFIG = {
   // 原文どおりに書き写させたいのに、書き写すことを罰しては噛み合わない。
   // 暴走ループは画面側の findTailRepetition と max_tokens で受け止める。
   ragRelaxSamplers: true,
+  // ユーザーに見せる最終応答では【常に】繰り返し系サンプラー (DRY等) を外す (既定true)。
+  // DRY は既出トークン列の再出力を指数関数的に罰するため、検索の逐語引用だけでなく
+  // 「同じコマンドを2回書く」普通の回答でも後半が1文字ずつ欠ける実害があった
+  // (mpirun ... test.py → test.y → tes と縮んでいく自己訂正ループ)。
+  // ツール判断・要約などの内部生成には従来どおりペナルティが効く。
+  // false にすると検索結果を渡したターン (ragRelaxSamplers) だけ緩和する従来動作
+  relaxSamplersAlways: true,
+  // ─── チャットテンプレート互換: 途中の system メッセージの正規化 (既定true) ───
+  // GPT-OSS (harmony) 等のテンプレートは「system は先頭1件のみ」を強制し、会話の
+  // 途中に system が現れると 400 (System message must be at the beginning) になる。
+  // アプリはコンパクション要約・RAG出典台帳・追加検索結果の注入で途中 system を
+  // 使うため、/v1 プロキシが送信前に2件目以降の system を直後の user メッセージへ
+  // 連結して正規化する。内容は情報提供の文章なので user に移しても意味は変わらず、
+  // Qwen/Gemma 等の寛容なモデルにも無害。false で素通し (従来動作)
+  systemMessageCompat: true,
   // 1応答あたりの最大生成トークン (暴走ループの安全網。agentContext.largePredict が優先)
   chatMaxTokens: 8192,
   // ログレベル: 'verbose' (全ログ), 'normal' (デフォルト), 'quiet' (最小限)
@@ -1858,6 +1873,51 @@ app.get('/transcribe/health', requireAuth, (req, res) => {
   r.on('timeout', () => { r.destroy(); res.json({ enabled: true, status: 'timeout' }); });
 });
 
+// ─── チャットテンプレート互換: 途中の system メッセージの正規化 ───
+// GPT-OSS (harmony) 等のチャットテンプレートは「system は先頭1件のみ」を強制し、
+// 2件目以降に system が現れると Jinja が raise_exception して llama-server が
+// 400 (System message must be at the beginning) を返す。
+// アプリはコンパクション要約・RAG出典台帳・追加検索結果の注入で途中 system を
+// 使うため、2件目以降の system 本文を【直後の user メッセージの先頭】へ連結する。
+// 末尾に残った system (追加検索結果の注入など後続 user が無いもの) は user として送る。
+// user の直後に置き直しても内容は情報提供の文章なので意味は変わらず、他モデルにも無害。
+// 戻り値: 正規化が必要なら新しい配列、不要なら null (呼び出し側は素通し)
+function normalizeMidSystemMessages(messages) {
+  let needFix = false;
+  for (let i = 1; i < messages.length; i++) {
+    if (messages[i] && messages[i].role === 'system') { needFix = true; break; }
+  }
+  if (!needFix) return null;
+
+  // content は文字列 or マルチモーダル配列 ([{type:'text',...},{type:'image_url',...}])
+  const textOf = (c) => {
+    if (typeof c === 'string') return c;
+    if (Array.isArray(c)) return c.filter(p => p && p.type === 'text').map(p => p.text || '').join('\n');
+    return '';
+  };
+
+  const out = [];
+  let pending = [];  // まだ user に連結できていない途中 system の本文
+  messages.forEach((m, i) => {
+    if (i > 0 && m && m.role === 'system') {
+      pending.push(textOf(m.content));
+      return;
+    }
+    if (pending.length > 0 && m && m.role === 'user') {
+      const prefix = pending.join('\n\n') + '\n\n';
+      pending = [];
+      if (Array.isArray(m.content)) {
+        m = { ...m, content: [{ type: 'text', text: prefix }, ...m.content] };
+      } else {
+        m = { ...m, content: prefix + (typeof m.content === 'string' ? m.content : '') };
+      }
+    }
+    out.push(m);
+  });
+  if (pending.length > 0) out.push({ role: 'user', content: pending.join('\n\n') });
+  return out;
+}
+
 // ─── llama-server (OpenAI互換) へのリバースプロキシ ───
 // /v1/* をlocalhost:chatPortへ転送（チャット推論用）
 // /embed/v1/* をlocalhost:embeddingPortへ転送（Embedding用）
@@ -1945,36 +2005,82 @@ function proxyToLlama(targetHost, targetPort, pathPrefix, isChatProxy) {
       options.headers['content-length'] = req.headers['content-length'];
     }
 
-    const proxyReq = http.request(options, (proxyRes) => {
-      if (!isQuiet) {
-        log(ip, `${proxyRes.statusCode} ${req.method} ${targetPath}`);
+    // proxyReq を組み立てて送る共通処理。
+    // bodyBuffer を渡すと (途中systemの正規化などで書き換えた) ボディを送信し、
+    // null ならリクエストをそのままパイプする
+    const sendProxy = (bodyBuffer) => {
+      if (bodyBuffer != null) {
+        options.headers['content-length'] = Buffer.byteLength(bodyBuffer);
       }
-      const headers = {
-        'content-type': proxyRes.headers['content-type'] || 'application/json',
-        'cache-control': 'no-cache',
-      };
-      if (proxyRes.headers['transfer-encoding']) {
-        headers['transfer-encoding'] = proxyRes.headers['transfer-encoding'];
-      }
-      res.writeHead(proxyRes.statusCode, headers);
-      proxyRes.pipe(res, { end: true });
-    });
+      const proxyReq = http.request(options, (proxyRes) => {
+        if (!isQuiet) {
+          log(ip, `${proxyRes.statusCode} ${req.method} ${targetPath}`);
+        }
+        const headers = {
+          'content-type': proxyRes.headers['content-type'] || 'application/json',
+          'cache-control': 'no-cache',
+        };
+        if (proxyRes.headers['transfer-encoding']) {
+          headers['transfer-encoding'] = proxyRes.headers['transfer-encoding'];
+        }
+        res.writeHead(proxyRes.statusCode, headers);
+        proxyRes.pipe(res, { end: true });
+      });
 
-    proxyReq.on('error', (err) => {
-      log(ip, `ERROR ${targetPath} ${err.message}`);
-      if (!res.headersSent) {
-        res.status(502).json({ error: 'llama-server に接続できません: ' + err.message });
-      }
-    });
-    proxyReq.on('timeout', () => {
-      log(ip, `TIMEOUT ${targetPath}`);
-      proxyReq.destroy();
-      if (!res.headersSent) {
-        res.status(504).json({ error: 'llama-server タイムアウト' });
-      }
-    });
+      proxyReq.on('error', (err) => {
+        log(ip, `ERROR ${targetPath} ${err.message}`);
+        if (!res.headersSent) {
+          res.status(502).json({ error: 'llama-server に接続できません: ' + err.message });
+        }
+      });
+      proxyReq.on('timeout', () => {
+        log(ip, `TIMEOUT ${targetPath}`);
+        proxyReq.destroy();
+        if (!res.headersSent) {
+          res.status(504).json({ error: 'llama-server タイムアウト' });
+        }
+      });
 
-    req.pipe(proxyReq, { end: true });
+      if (bodyBuffer != null) {
+        proxyReq.end(bodyBuffer);
+      } else {
+        req.pipe(proxyReq, { end: true });
+      }
+    };
+
+    // チャット補完だけはボディを読み、途中の system メッセージを正規化してから転送する
+    // (systemMessageCompat。GPT-OSS 等の「system は先頭のみ」テンプレートで 400 になる対策)
+    const wantsNormalize = isChatProxy
+      && req.method === 'POST'
+      && req.url.startsWith('/chat/completions')
+      && appConfig.systemMessageCompat !== false;
+
+    if (!wantsNormalize) {
+      sendProxy(null);
+      return;
+    }
+
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('error', () => { try { res.destroy(); } catch {} });
+    req.on('end', () => {
+      let body = Buffer.concat(chunks);
+      try {
+        const parsed = JSON.parse(body.toString('utf-8'));
+        if (Array.isArray(parsed.messages)) {
+          const normalized = normalizeMidSystemMessages(parsed.messages);
+          if (normalized) {
+            const midCount = parsed.messages.filter((m, i) => i > 0 && m && m.role === 'system').length;
+            if (!isQuiet) log(ip, `[system正規化] 途中の system メッセージ ${midCount}件を user へ連結して転送`);
+            parsed.messages = normalized;
+            body = Buffer.from(JSON.stringify(parsed), 'utf-8');
+          }
+        }
+      } catch {
+        // JSONとして読めないボディはそのまま転送 (llama-server側でエラーになる)
+      }
+      sendProxy(body);
+    });
   };
 }
 
