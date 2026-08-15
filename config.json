@@ -504,8 +504,9 @@
   },
   "agentContext": {
     "smallPredict": 1024,
-    "largePredict": 8192,
+    "largePredict": 16384,
     "judgeHistoryCount": 3,
+    "judgeRetryPredict": null,
     "largeGenKeywords": null
   },
   "tokenAvgWindow": 3000,
@@ -528,5 +529,5 @@
   "dryAllowedLength": 4,
   "dryPenaltyLastN": 512,
   "ragRelaxSamplers": true,
-  "chatMaxTokens": 8192
+  "chatMaxTokens": 16384
 }

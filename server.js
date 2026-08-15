@@ -255,6 +255,11 @@ const DEFAULT_CONFIG = {
     smallPredict: 512,        // ツール判断時のmax_tokens (短文モード)
     largePredict: 8192,       // ツール判断時のmax_tokens (長文モード) + continueGen時
     judgeHistoryCount: 3,     // ツール判断時に送信する直近メッセージ数
+    // ツール判断が max_tokens で打ち切られ tool_calls が出なかった時に、
+    // 予算を増やして一度だけ引き直す際の max_tokens。
+    // 未指定なら max(largePredict, smallPredict*4)。thinking が止まらないモデル
+    // (enable_thinking が効かない Qwen3.8 等) で判断が静かに失敗するのを防ぐ
+    judgeRetryPredict: null,
     largeGenKeywords: null,   // 長文モード判定キーワード (null=デフォルト使用)
   },
   tokenAvgWindow: 2000,

@@ -100,6 +100,24 @@ function splitLeakedReasoning(content, expectJapanese) {
   return { reasoning, answer };
 }
 
+// ─── 「回答ではなく検索クエリを書いてしまった」応答の検出 ───
+// 最終応答では tools を渡していないため、モデルが「検索すべき」と判断しても
+// 呼び出す手段が無く、検索語だけを本文に出すことがある。
+// 実例: 「MPIライブラリで書けますか？」→ "mpi4py MPI-3 one-sided RMA MPI_Win_create support"
+//
+// 誤検出すると正当な短い英語回答を潰すので、条件は厳しくする:
+//   日本語で聞かれている / 1行 / 日本語を含まない / 文として終わっていない / 2〜16語
+function looksLikeSearchQuery(text, expectJapanese) {
+  if (!expectJapanese) return false;
+  const t = (text || '').trim();
+  if (!t || t.includes('\n') || t.length > 120) return false;
+  if (HAS_JA_RE.test(t)) return false;              // 日本語があれば回答文
+  if (/[。．.!?？！:：]$/.test(t)) return false;      // 文・見出しとして終わっていれば回答
+  if (/^[`#>*\-|]/.test(t)) return false;           // コード/見出し/箇条書き/表は対象外
+  const words = t.split(/\s+/).filter(Boolean);
+  return words.length >= 2 && words.length <= 16;   // 語の羅列 = クエリらしさ
+}
+
 // 末尾が「同じ文字列の連続した繰り返し」でできているかを調べ、
 // 見つかったらその周期(文字数)を、無ければ 0 を返す。
 //
@@ -3230,50 +3248,82 @@ function App() {
 
           // ツール呼び出し判断（非ストリーミング、thinkingオフで高速化）
           // Qwen3/Qwen3.6 系の thinking モードは tool_calls 判断時に時間を浪費するため明示的に無効化
+          //
+          // ただし chat_template_kwargs.enable_thinking は【モデルによっては効かない】。
+          // Qwen3.8 では思考が止まらず、判断の思考だけで max_tokens を使い切って
+          // tool_calls を出す前に打ち切られ、「ツール無し」として静かに素通りしていた。
+          // 打ち切り (finish_reason='length') を検出し、予算を増やして一度だけ引き直す。
           let toolRes;
-          let retryCount = 0;
-          const MAX_RETRIES = 3;
-          while (retryCount <= MAX_RETRIES) {
-            toolRes = await fetch('/v1/chat/completions', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                model: chatModel,
-                messages: turnMessages,
-                tools,
-                stream: false,
-                max_tokens: judgeNumPredict,
-                chat_template_kwargs: { enable_thinking: false },
-                ...llamaCommonOptions,
-              }),
-              signal: controller.signal,
-            });
-            // 503 = モデル起動中、500/502/504 = サーバー側一時エラー の場合はリトライ
-            const isRetryable = toolRes.status === 503 || toolRes.status === 500 || toolRes.status === 502 || toolRes.status === 504;
-            if (isRetryable && retryCount < MAX_RETRIES) {
-              const errData = await toolRes.json().catch(() => ({}));
-              console.log(`[ツール判断 ${toolRes.status}] ${errData.error || ''} - 5秒後にリトライ (${retryCount + 1}/${MAX_RETRIES})`);
-              await new Promise(r => setTimeout(r, 5000));
-              retryCount++;
+          let toolData;
+          let choice;
+          // 引き直し用の予算。既に上限で回している時 (needsLargeGen) は引き直さない
+          const judgeRetryPredict = agentCtx.judgeRetryPredict
+            ?? Math.max(largePredict, smallPredict * 4);
+          let judgeBudget = judgeNumPredict;
+
+          for (let budgetAttempt = 0; ; budgetAttempt++) {
+            let retryCount = 0;
+            const MAX_RETRIES = 3;
+            while (retryCount <= MAX_RETRIES) {
+              toolRes = await fetch('/v1/chat/completions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  model: chatModel,
+                  messages: turnMessages,
+                  tools,
+                  stream: false,
+                  max_tokens: judgeBudget,
+                  chat_template_kwargs: { enable_thinking: false },
+                  ...llamaCommonOptions,
+                }),
+                signal: controller.signal,
+              });
+              // 503 = モデル起動中、500/502/504 = サーバー側一時エラー の場合はリトライ
+              const isRetryable = toolRes.status === 503 || toolRes.status === 500 || toolRes.status === 502 || toolRes.status === 504;
+              if (isRetryable && retryCount < MAX_RETRIES) {
+                const errData = await toolRes.json().catch(() => ({}));
+                console.log(`[ツール判断 ${toolRes.status}] ${errData.error || ''} - 5秒後にリトライ (${retryCount + 1}/${MAX_RETRIES})`);
+                await new Promise(r => setTimeout(r, 5000));
+                retryCount++;
+                continue;
+              }
+              break;
+            }
+
+            if (!toolRes.ok) {
+              // エラー詳細をできるだけ取得してメッセージに含める
+              let errBody = '';
+              try {
+                const errData = await toolRes.json();
+                errBody = errData.error?.message || errData.error || JSON.stringify(errData).slice(0, 200);
+              } catch {
+                try { errBody = (await toolRes.text()).slice(0, 200); } catch {}
+              }
+              throw new Error(`API Error ${toolRes.status}${errBody ? ': ' + errBody : ''}`);
+            }
+            toolData = await toolRes.json();
+            // OpenAI互換: { choices: [{ message: { role, content, tool_calls } }] }
+            choice = toolData.choices?.[0];
+
+            // 打ち切られた上にツール呼び出しが無い = 判断が完了していない。
+            // 黙って「ツール不要」と解釈すると、検索すべき質問が素通りする
+            const truncated = choice?.finish_reason === 'length';
+            const noToolCall = !(choice?.message?.tool_calls?.length);
+            if (!truncated || !noToolCall) break;
+
+            if (budgetAttempt === 0 && judgeRetryPredict > judgeBudget) {
+              console.warn(`[ツール判断] max_tokens=${judgeBudget} で打ち切られ tool_calls が出ていません。`
+                + `${judgeRetryPredict} に増やして引き直します`);
+              judgeBudget = judgeRetryPredict;
               continue;
             }
+            // 増やしても駄目 = 思考が止まっていない可能性が高い。原因を名指しで残す
+            console.warn(`[ツール判断] max_tokens=${judgeBudget} でも打ち切られました。`
+              + `enable_thinking が効いていない可能性があります `
+              + `(llama-server に --reasoning-budget 0 を渡すか、agentContext.judgeRetryPredict を上げてください)`);
             break;
           }
-
-          if (!toolRes.ok) {
-            // エラー詳細をできるだけ取得してメッセージに含める
-            let errBody = '';
-            try {
-              const errData = await toolRes.json();
-              errBody = errData.error?.message || errData.error || JSON.stringify(errData).slice(0, 200);
-            } catch {
-              try { errBody = (await toolRes.text()).slice(0, 200); } catch {}
-            }
-            throw new Error(`API Error ${toolRes.status}${errBody ? ': ' + errBody : ''}`);
-          }
-          const toolData = await toolRes.json();
-          // OpenAI互換: { choices: [{ message: { role, content, tool_calls } }] }
-          const choice = toolData.choices?.[0];
           // OllamaのassistantMsg形式に正規化（既存のロジックを再利用するため）
           const assistantMsg = {
             role: 'assistant',
@@ -4294,12 +4344,31 @@ function App() {
         const relaxSamplers = hasSourcesForAnswer && appConfig.ragRelaxSamplers !== false;
         if (relaxSamplers) console.log('[サンプラー緩和] 逐語引用のため繰り返しペナルティを無効化');
 
+        // ─── ツールを1つも実行していない時は「今は呼べない」と明示する ───
+        // 最終応答のリクエストには tools を渡していない。にもかかわらず
+        // システムプロンプトにはツール案内（web_search 等）が載ったままなので、
+        // モデルは「検索すべきだ」と判断しつつ呼び出す手段が無く、
+        // 検索クエリそのものを本文に書いてしまうことがある。
+        // 実例: 「MPIライブラリで書けますか？」への回答が
+        //       "mpi4py MPI-3 one-sided RMA MPI_Win_create support" だけになった
+        let finalMessages = apiMessages;
+        if (!hasSourcesForAnswer && apiMessages[0]?.role === 'system') {
+          finalMessages = [...apiMessages];
+          finalMessages[0] = {
+            role: 'system',
+            content: apiMessages[0].content
+              + '\n\n## この応答での制約\n'
+              + '- 今回はツールを呼び出せません。検索クエリやツール名だけを書かず、必ずユーザーへの回答本文を書いてください。\n'
+              + '- 現時点の知識で答えられる範囲を日本語で説明し、確認が必要な点があればその旨を添えてください。',
+          };
+        }
+
         const finalRes = await fetchWithRetry('/v1/chat/completions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             model: chatModel,
-            messages: apiMessages,
+            messages: finalMessages,
             stream: true,
             stream_options: { include_usage: true },
             ...llamaCommonOptions,
@@ -4327,12 +4396,27 @@ function App() {
           });
           const lastContent = (lastMsg?.content || '').trim();
           const hasToolResultInHistory = apiMessages.some(m => m.role === 'tool');
-          if (hasToolResultInHistory && lastContent.length < 5) {
-            console.log('[空応答救済] ツール実行後の応答が空 → 理由説明モードで再生成');
+          // 本文が「検索クエリだけ」になっていないか。ツールを1件も実行していない
+          // ターンでのみ判定する (ツールを使えた場合はモデルに機会があったため)
+          const queryOnly = !hasToolResultInHistory
+            && looksLikeSearchQuery(lastContent, HAS_JA_RE.test(text || ''));
+          if (queryOnly) {
+            console.warn(`[クエリ応答救済] 本文が検索クエリのようです: "${lastContent}" → 回答を再生成`);
+          }
+          if ((hasToolResultInHistory && lastContent.length < 5) || queryOnly) {
+            if (!queryOnly) console.log('[空応答救済] ツール実行後の応答が空 → 理由説明モードで再生成');
             // 「分からない時は分からないと言って」「データ不足なら何が必要か説明して」と明示
             const retryMessages = [
               ...apiMessages,
-              {
+              queryOnly ? {
+                // 検索クエリを書いてしまったケース。ツールが使えないことを伝え、
+                // 知識で答えるか、何が必要かを日本語で説明させる
+                role: 'user',
+                content:
+                  '直前の応答は検索キーワードのようになっていて、回答になっていません。\n'
+                  + '今回はツールを呼び出せないので、検索キーワードではなく回答本文を書いてください。\n'
+                  + '現時点の知識で答えられる範囲を日本語で説明し、確証が持てない部分は「確認が必要です」と明示してください。',
+              } : {
                 role: 'user',
                 content:
                   '上記のツール実行結果をもとに回答してください。\n' +
@@ -4631,6 +4715,9 @@ function App() {
     const startTime = Date.now();
     // ループ検出用（詳細は findTailRepetition のコメント参照）
     let loopDetected = false;
+    // max_tokens に達して途中で切れたか。黙って切れると「なぜか話が途切れる」
+    // としか見えず、原因(出力上限)にも復帰手段(続きを生成)にも辿り着けない
+    let lengthCapped = false;
     const LOOP_CHECK_STRIDE = 100;   // 何文字進むごとに調べるか
     const LOOP_TAIL_SIZE = 1600;     // 末尾何文字を対象にするか（段落単位のループも入る長さ）
     let lastCheckedLen = 0;
@@ -4657,6 +4744,8 @@ function App() {
 
           // OpenAI互換: { choices: [{ delta: { content, reasoning_content, tool_calls } }] }
           const delta = json.choices?.[0]?.delta || {};
+          // 最終チャンクに finish_reason が載る。'length' = max_tokens で打ち切り
+          if (json.choices?.[0]?.finish_reason === 'length') lengthCapped = true;
           // llama.cppは reasoning_content (DeepSeek/QwQ系) をthinking扱い
           if (delta.reasoning_content) assistantThinking += delta.reasoning_content;
           if (delta.content) {
@@ -4786,9 +4875,14 @@ function App() {
               thinking: displayThinking,
               contexts: contextInfo,
               searchQueries: searchQueries,
-              agentStatus: loopDetected ? '⚠️ 思考ループを検出しました。「続きを生成」ボタンで回答を要求できます。' : null,
+              agentStatus: loopDetected
+                ? '⚠️ 思考ループを検出しました。「続きを生成」ボタンで回答を要求できます。'
+                : (lengthCapped
+                  ? '✂️ 最大出力トークンに達したため途中で終了しました。「続きを生成」で続きを書かせられます（config の chatMaxTokens / agentContext.largePredict で上限を変更できます）。'
+                  : null),
               tokenInfo: tokenInfo,
               loopDetected: loopDetected,
+              lengthCapped: lengthCapped,
             };
             return copy;
           });
@@ -7044,10 +7138,13 @@ ${conversationText}
                           )}
                         </>
                       )}
-                      {/* 思考のみで本応答が空 or 応答が途中で切れた場合に「続ける」ボタン */}
-                      {i === messages.length - 1 && (!msg.content || msg.thinking) && (
+                      {/* 思考のみで本応答が空 or 応答が途中で切れた場合に「続ける」ボタン。
+                          max_tokens で切れた時 (lengthCapped) は thinking が無くても出す */}
+                      {i === messages.length - 1 && (!msg.content || msg.thinking || msg.lengthCapped) && (
                         <button className="msg-action-btn continue-btn" onClick={() => continueGeneration(i)}>
-                          {msg.loopDetected ? '⚠️ 思考ループを中断・回答を要求' : '🔄 続きを生成'}
+                          {msg.loopDetected ? '⚠️ 思考ループを中断・回答を要求'
+                            : msg.lengthCapped ? '✂️ 途中で終了 — 続きを生成'
+                            : '🔄 続きを生成'}
                         </button>
                       )}
                     </div>
