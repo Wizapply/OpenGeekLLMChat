@@ -121,6 +121,42 @@ LLMが応答生成前に「ツール判断フェーズ」と「最終応答フ�
     - SSEストリームで content + reasoning_content を受信
 ```
 
+### 高速ツールルーティング（判断LLMの省略）
+
+ツール判断フェーズは軽量化しても数秒〜数十秒かかる。Claude Code 等のエージェントが
+「毎回モデルに聞く」のではなく明白な分岐をハーネス側の規則で即決しているのに倣い、
+判断LLMの前にキーワードによる System-1 判定を挟む（`agentContext.fastToolRouting`、既定 true）:
+
+1. **ツール不要が明白** — どのツール群のヒントキーワード（天気/ニュース系、ドライブ、
+   音声、描いて、サーバーファイル等）にも当たらない → 判断LLMをスキップして最終応答へ直行。
+   雑談・コード作成・知識質問がここに落ち、体感が最も変わる。
+   ただし資料がある構成（永続RAG ON・添付ドキュメントあり）では、専門的な質問ほど
+   一般語で来てキーワードが効かないため、従来どおり判断LLMに回す（検索漏れの方が高くつく）。
+2. **1ツールが明白** — 短い質問で web_search / search_documents のヒントだけが当たる →
+   判断LLMを省き、質問文そのものをクエリに即実行。実行後の「追加ツール判断」も挟まず
+   最終応答へ直行する（通常経路は1回の検索に判断LLMが2回かかる）。
+   gdrive／画像生成／音声合成／ML は引数の組み立てに判断が要るため即決しない。
+3. **強制RAG検索済み**（`ragAlwaysSearch`・出典問い直し） — 検索結果は手元にあるので、
+   他ツールの示唆がなければ判断LLMを省略して最終応答へ。
+
+判定が外れても、従来の判断LLMに落ちるか無駄な検索が1回入るだけで回答は壊れない
+（安全側に倒した設計）。
+
+### 小さいテキストファイルのチャット直接添付（インライン添付）
+
+数KBのソースコード・config・テキストは、RAG（ドキュメント登録→embedding→検索）を
+経由せず、メッセージ本文へ全文を埋め込んで渡す:
+
+- `inlineFileMaxChars`（既定 12000 文字）以下のテキストはインライン添付になり、
+  超えるもの・PDF・バイナリは従来どおりドキュメント（RAG）登録。
+  合計は `inlineFileTotalMaxChars`（既定 24000 文字）まで。超過分はRAG登録に回る。
+- embedding生成もベクトル検索も不要になり、全文が文脈として届く
+  （チャンク分割で文脈が切れず、search_documents を呼ぶかの判断も要らない）。
+- 画面には 📄 チップだけを表示し、モデルへ送る直前に `expandInlineTextFiles()` が
+  本文へ展開する（フェンスはファイル内の ``` と衝突しない長さに自動調整）。
+- 判断LLMに渡す最新メッセージは `agentContext.judgeLastMessageChars`（既定 4000 文字）で
+  切り詰める。質問文は添付ファイルより前に置かれるため、判断に必要な情報は失われない。
+
 ### マルチターン実装のポイント
 
 ```javascript
@@ -1502,9 +1538,13 @@ isStreaming={isLoading && i === messages.length - 1}
 | `googleDrive.tokenFile` | string | "gdrive_token.json" | リフレッシュトークン保存先（chmod600） |
 | `ragTopK` | number | 10 | RAG検索件数 |
 | `ragMode` | string | "agentic" | agentic / always |
+| `inlineFileMaxChars` | number | 12000 | この文字数以下のテキストファイルはRAG登録せずメッセージ本文へ直接添付（0で常にRAG登録） |
+| `inlineFileTotalMaxChars` | number | 24000 | 1メッセージに直接添付できる合計文字数（超過分はRAG登録へ） |
 | `agentContext.smallPredict` | number | 512 | ツール判断時のmax_tokens（短文モード） |
 | `agentContext.largePredict` | number | 8192 | ツール判断時のmax_tokens（長文モード）+ continueGen時 |
 | `agentContext.judgeHistoryCount` | number | 3 | ツール判断時の履歴件数 |
+| `agentContext.judgeLastMessageChars` | number | 4000 | ツール判断に渡す最新メッセージの上限文字数（インライン添付での肥大対策） |
+| `agentContext.fastToolRouting` | bool | true | 明白なケースは判断LLMを省略してキーワードで即決する高速ルーティング |
 | `agentContext.largeGenKeywords` | array | null | 長文モードトリガーワード（null=デフォルト使用） |
 | `logLevel` | string | "normal" | "normal"/"quiet"。quietでllama-server stdout/stderrとプロキシログを抑制 |
 | `llamaServer.idleUnloadMs` | number | 0 | アイドル時の自動アンロード時間（ms、0で無効、推奨600000=10分） |

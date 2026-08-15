@@ -503,6 +503,8 @@
     "judgeRetryPredict": null,
     "judgeTemperature": 0.1,
     "judgeHistoryChars": 800,
+    "judgeLastMessageChars": 4000,
+    "fastToolRouting": true,
     "largeGenKeywords": null
   },
   "tokenAvgWindow": 3000,
@@ -525,5 +527,7 @@
   "dryAllowedLength": 4,
   "dryPenaltyLastN": 512,
   "ragRelaxSamplers": true,
-  "chatMaxTokens": 16384
+  "chatMaxTokens": 16384,
+  "inlineFileMaxChars": 6000,
+  "inlineFileTotalMaxChars": 16000
 }

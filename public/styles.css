@@ -3077,6 +3077,65 @@
 
   .image-preview-remove:hover { background: var(--red); }
 
+  /* ── インライン添付テキストファイルのチップ (入力欄・メッセージ共通) ── */
+  .textfile-preview-bar {
+    display: flex;
+    gap: 8px;
+    padding: 10px 16px 4px;
+    overflow-x: auto;
+    flex-wrap: wrap;
+  }
+
+  .textfile-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    color: var(--text-primary);
+    font-size: 12px;
+    max-width: 260px;
+    flex-shrink: 0;
+  }
+
+  .textfile-chip-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .textfile-chip-size {
+    color: var(--text-muted);
+    font-size: 11px;
+  }
+
+  .textfile-chip-remove {
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    background: rgba(0,0,0,0.4);
+    color: var(--text-secondary);
+    border: none;
+    font-size: 11px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+
+  .textfile-chip-remove:hover { background: var(--red); color: #fff; }
+
+  .msg-textfiles {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+    justify-content: flex-end;
+  }
+
   /* ── Image Display (Messages) ── */
   .msg-images {
     display: flex;

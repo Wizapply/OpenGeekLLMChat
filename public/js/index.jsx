@@ -100,6 +100,35 @@ function splitLeakedReasoning(content, expectJapanese) {
   return { reasoning, answer };
 }
 
+// ─── 高速ツールルーティング (System-1) のキーワード ───
+// 毎ターン判断LLM (数秒〜数十秒) に聞くのではなく、明白なケースはキーワードで即決する。
+// ここの判定は「粗くて良い」: 外れても従来の判断LLM or 無駄な検索1回に落ちるだけで、
+// 回答が壊れることはない。曖昧なケース (複数ヒット・全ヒットなし+RAG有効) は
+// 従来どおり判断LLMへ回す。agentContext.fastToolRouting=false で無効化できる。
+const FAST_WEB_HINT_RE = /最新|今日|昨日|明日|現在|今週|今月|今年|最近|ニュース|天気|気温|株価|為替|相場|価格|値段|速報|順位|結果|スコア|発売|リリース|latest|today|current|news|weather|price|stock/i;
+const FAST_WEB_CMD_RE = /検索して|調べて|ググ|search for/i;
+const FAST_DOC_HINT_RE = /資料|ドキュメント|添付|アップロード/;
+const FAST_GDRIVE_HINT_RE = /ドライブ|drive|クラウド/i;
+const FAST_TTS_HINT_RE = /音声|読み上げ|しゃべ|喋|の声で/;
+const FAST_IMGGEN_HINT_RE = /描いて|イラスト|画像を(作|生成|描)|絵を(作|生成|描)/;
+
+// ─── チャット直接添付されたテキストファイルの展開 ───
+// 数KBのソースコード・config等は、RAG (ドキュメント登録→embedding→検索) を経由せず
+// メッセージ本文へそのまま埋め込む。画面には 📄 チップだけを出し、
+// モデルへ送る本文にはこの関数で全文を展開する。
+// ファイル内容に ``` が含まれてもフェンスが壊れないよう、
+// 内容中の最長バッククォート列より1本長いフェンスで囲む
+function expandInlineTextFiles(m, baseText) {
+  if (!m || !m.textFiles || m.textFiles.length === 0) return baseText;
+  const blocks = m.textFiles.map(f => {
+    const body = String(f.text || '');
+    const longestTicks = (body.match(/`{3,}/g) || []).reduce((mx, s) => Math.max(mx, s.length), 2);
+    const fence = '`'.repeat(Math.max(3, longestTicks + 1));
+    return `【添付ファイル: ${f.name}】\n${fence}\n${body}\n${fence}`;
+  }).join('\n\n');
+  return baseText ? `${baseText}\n\n${blocks}` : blocks;
+}
+
 // ─── 「回答ではなく検索クエリを書いてしまった」応答の検出 ───
 // 最終応答では tools を渡していないため、モデルが「検索すべき」と判断しても
 // 呼び出す手段が無く、検索語だけを本文に出すことがある。
@@ -1564,6 +1593,11 @@ function App() {
   const sendMessageRef = useRef(null);
   const setChatImagesRef = useRef(null);
   const [chatImages, setChatImages] = useState([]); // [{ name, base64, preview }]
+  // 小さいテキストファイルのチャット直接添付 (RAG登録せず本文へ全文を埋め込む)
+  const [chatTextFiles, setChatTextFiles] = useState([]); // [{ name, text }]
+  // FileReader の onload コールバックから最新の合計サイズを参照するためのミラー
+  const chatTextFilesRef = useRef([]);
+  useEffect(() => { chatTextFilesRef.current = chatTextFiles; }, [chatTextFiles]);
   const [lightboxSrc, setLightboxSrc] = useState(null);
 
   // ─── モデル一覧取得 ───
@@ -1885,11 +1919,15 @@ function App() {
     };
 
     const pendingImages = [...chatImages];
+    const pendingTextFiles = [...chatTextFiles];
     setMessages(prev => [...prev,
       {
         role: 'user', content: text,
         images: pendingImages.length
           ? pendingImages.map(img => ({ name: img.name, base64: img.base64, preview: img.preview }))
+          : undefined,
+        textFiles: pendingTextFiles.length
+          ? pendingTextFiles.map(f => ({ name: f.name, text: f.text }))
           : undefined,
       },
       { role: 'assistant', content: '', orchestra: orch },
@@ -1897,6 +1935,7 @@ function App() {
     messagesDirtyRef.current = true;
     setInput('');
     setChatImages([]);
+    setChatTextFiles([]);
     if (inputRef.current) inputRef.current.style.height = 'auto';
     setIsLoading(true);
     setError('');
@@ -1912,7 +1951,7 @@ function App() {
     // 資料名へ開いておく（詳細は resolveStaleSourceKeys のコメント）
     const history = messages.slice(-RECENT)
       .filter(m => (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content)
-      .map(m => ({ role: m.role, content: resolveStaleSourceKeys(m) }));
+      .map(m => ({ role: m.role, content: expandInlineTextFiles(m, resolveStaleSourceKeys(m)) }));
 
     // 参照ドキュメント: チャット添付分はブラウザ側に埋め込みがあるのでここで検索する。
     // サーバー側の永続RAGは /orchestra/run 内で検索され、両者が統合される。
@@ -1956,7 +1995,10 @@ function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          workflowId: wf.id, query: text, history, role: chatRole,
+          workflowId: wf.id,
+          // インライン添付ファイルはクエリ本文に展開して渡す (ワークフロー側の変更不要)
+          query: expandInlineTextFiles({ textFiles: pendingTextFiles }, text),
+          history, role: chatRole,
           docChunks,
           images: pendingImages.map(img => ({ name: img.name, base64: img.base64 })),
         }),
@@ -2067,7 +2109,8 @@ function App() {
   async function sendMessage() {
     const text = input.trim();
     const hasImages = chatImages.length > 0;
-    if ((!text && !hasImages) || isLoading) return;
+    const hasTextFiles = chatTextFiles.length > 0;
+    if ((!text && !hasImages && !hasTextFiles) || isLoading) return;
 
     // モデル選択でマルチLLMワークフローが選ばれている場合は、
     // 通常のツール判断・RAG経路ではなくサーバー側のオーケストレータに委譲する。
@@ -2167,17 +2210,22 @@ function App() {
     if (isRecording) stopRecording();
 
     const pendingImages = [...chatImages];
+    const pendingTextFiles = [...chatTextFiles];
     // 漏れた思考ブロックの判定に使う（日本語で聞かれた時だけ英語ブロックを疑う）
     lastUserTextRef.current = text || '';
     const userMsg = {
       role: 'user',
-      content: text || '(画像を送信)',
+      content: text || (hasImages ? '(画像を送信)' : '(ファイルを送信)'),
       images: hasImages ? pendingImages.map(img => ({ name: img.name, base64: img.base64, preview: img.preview })) : undefined,
+      // インライン添付 (小さいテキストの直接添付)。画面には 📄 チップで出し、
+      // モデルへ送る時に expandInlineTextFiles が本文へ全文を展開する
+      textFiles: hasTextFiles ? pendingTextFiles.map(f => ({ name: f.name, text: f.text })) : undefined,
     };
     setMessages(prev => [...prev, userMsg]);
     messagesDirtyRef.current = true;  // ユーザー送信があったので並び替え対象
     setInput('');
     setChatImages([]);
+    setChatTextFiles([]);
     // textareaの高さを初期サイズにリセット（onInputで広がったままにならないように）
     if (inputRef.current) {
       inputRef.current.style.height = 'auto';
@@ -2217,6 +2265,8 @@ function App() {
           // 出典キーは「そのターン限りの通し番号」なので、履歴に渡す前に
           // 実際の資料名へ開いておく（詳細は resolveStaleSourceKeys のコメント）
           let textContent = resolveStaleSourceKeys(m);
+          // インライン添付ファイルは表示用 content に含まれないので、ここで全文を展開する
+          textContent = expandInlineTextFiles(m, textContent);
           if (isLast && m.role === 'user' && textContent) {
             textContent = `【今この質問に回答してください】\n${textContent}`;
           }
@@ -2285,6 +2335,9 @@ function App() {
         // の中間として2字1トークンで概算）
         const estTok = (s) => Math.ceil(String(s || '').length / 2);
         const textOf = (m) => typeof m.content === 'string' ? m.content : '';
+        // インライン添付ファイルも実際にはプロンプトへ展開されるので見積もりに含める
+        const estTokMsg = (m) => estTok(textOf(m))
+          + (m.textFiles || []).reduce((s, f) => s + estTok(f.text), 0);
         let lastInfoIdx = -1;
         for (let i = allMessages.length - 1; i >= liveStart; i--) {
           if (allMessages[i].tokenInfo) { lastInfoIdx = i; break; }
@@ -2294,13 +2347,13 @@ function App() {
           const ti = allMessages[lastInfoIdx].tokenInfo;
           estimated = (ti.promptTokens || 0) + (ti.completionTokens || 0);
           for (let i = lastInfoIdx + 1; i < allMessages.length; i++) {
-            estimated += estTok(textOf(allMessages[i]));
+            estimated += estTokMsg(allMessages[i]);
             if (allMessages[i].images) estimated += allMessages[i].images.length * 800;
           }
         } else {
           estimated = estTok(systemPrompt) + estTok(summaryText);
           for (let i = liveStart; i < allMessages.length; i++) {
-            estimated += estTok(textOf(allMessages[i]));
+            estimated += estTokMsg(allMessages[i]);
             if (allMessages[i].images) estimated += allMessages[i].images.length * 800;
           }
         }
@@ -3177,11 +3230,17 @@ function App() {
         // 上限を上げた今、直前の回答が1万トークン超のこともあり、そのまま送ると
         // 判断のたびにプロンプト処理でその分待たされる（最新の質問は切らない）
         const judgeHistoryChars = agentCtx.judgeHistoryChars ?? 800;
+        // 最新の質問も無制限にはしない。インライン添付ファイル入りだと数万文字になり、
+        // 判断のプロンプト処理だけで待たされる。質問文は添付ファイルより前に置かれる
+        // ので、末尾 (=ファイル本文の後半) を切っても「何を聞かれているか」は失われない
+        const judgeLastChars = agentCtx.judgeLastMessageChars ?? 4000;
         const judgeHistoryRaw = history.slice(-judgeHistoryCount);
         const judgeHistory = judgeHistoryRaw.map((m, i) => {
           const isLast = i === judgeHistoryRaw.length - 1;
-          if (isLast || typeof m.content !== 'string' || m.content.length <= judgeHistoryChars) return m;
-          return { ...m, content: m.content.slice(0, judgeHistoryChars) + '\n…(以下省略)' };
+          if (typeof m.content !== 'string') return m;
+          const cap = isLast ? judgeLastChars : judgeHistoryChars;
+          if (cap <= 0 || m.content.length <= cap) return m;
+          return { ...m, content: m.content.slice(0, cap) + '\n…(以下省略)' };
         });
         // 初回ツール判断用プロンプト
         let judgeMessages = [{ role: 'system', content: judgeSystem }, ...judgeHistory];
@@ -3229,6 +3288,69 @@ function App() {
           executedToolCalls.add(`search_persistent_documents:${forcedArgs}`);
         }
 
+        // ─── 高速ツールルーティング (System-1 の即決) ───
+        //
+        // 毎ターン判断LLMに聞くと、それだけで数秒〜数十秒かかる。Claude Code 等の
+        // エージェントも「毎回モデルに聞く」のではなく、明白な分岐はハーネス側の
+        // 規則で即決している。ここでも同じ方針を取る:
+        //   1. どのツールのキーワードにも当たらない質問 → 判断LLMをスキップして直接応答
+        //      (雑談・コード作成・知識質問がすべてここに落ち、体感が大きく変わる)
+        //   2. 1つのツールだけが明白 → 判断LLMを省いて即実行し、追加判断も挟まず最終応答へ
+        //   3. 強制RAG検索が既に走った → 検索結果は手元にあるので判断は不要
+        // 判定が粗くて外れても、従来の判断LLMに落ちるか無駄な検索が1回入るだけで、
+        // 回答は壊れない。曖昧なケース (複数ヒット等) は従来どおり判断LLMへ。
+        // agentContext.fastToolRouting = false で従来動作に戻せる。
+        const fastRouting = agentCtx.fastToolRouting !== false;
+        let skipToolJudge = false;   // 判断LLMもツールも省略して最終応答へ直行
+        let fastDirectCall = null;   // { name, args }: 判断LLMを省いてこのツールを即実行
+        if (fastRouting) {
+          // どのツール群に「らしさ」があるか (無効なツールは常に false)
+          const toolHints = {
+            web: webSearchActive && !!text && (FAST_WEB_HINT_RE.test(text) || FAST_WEB_CMD_RE.test(text)),
+            doc: documents.length > 0 && !!text && (FAST_DOC_HINT_RE.test(text)
+              // 添付したファイル名 (拡張子抜き) を本文中で呼んでいる場合も資料の話
+              || documents.some(d => text.includes(d.name.replace(/\.[^.]+$/, '')))),
+            gdrive: gdriveActive && !!text && FAST_GDRIVE_HINT_RE.test(text),
+            tts: !!appConfig.ttsGen && !!text && FAST_TTS_HINT_RE.test(text),
+            imageGen: !!appConfig.imageGen && !!text && FAST_IMGGEN_HINT_RE.test(text),
+            // 画像添付時は detect_objects の可能性があるので判断LLMに回す (安全側)
+            detect: hasImages && !!appConfig.ml?.enabled,
+            serverFile: appConfig.fileAccess !== false && wantsServerFileOps,
+            // MLツールはプリフィルタ通過後も tools に残っている = キーワード該当あり
+            ml: tools.some(t => /^(ml|rl)_/.test(t?.function?.name || '')),
+          };
+          const hintKeys = Object.keys(toolHints).filter(k => toolHints[k]);
+          const forcedRagDone = isSourceQuestion || alwaysSearchRag;
+
+          if (forcedRagDone && hintKeys.length === 0) {
+            // 強制検索済み。追加で使いたそうなツールも無いので、結果を持って直接回答へ
+            skipToolJudge = true;
+            console.log('[高速ルート] 永続RAGは強制検索済み・他ツールの示唆なし → 判断LLMを省略して最終応答へ');
+          } else if (hintKeys.length === 0 && !persistentRagActive && documents.length === 0) {
+            // どのツールも示唆されていない。ただし資料 (永続RAG・添付ドキュメント) が
+            // ある時は、専門的な質問ほど一般語で来てキーワード判定が効かないため、
+            // 従来どおり判断LLMに回す (検索漏れの方がスキップの節約より高くつく)
+            skipToolJudge = true;
+            console.log('[高速ルート] ツール示唆キーワードなし → 判断LLMを省略して直接応答');
+          } else if (hintKeys.length === 1 && !persistentRagActive && !forcedRagDone) {
+            // 1ツールだけが明白なら、引数もヒューリスティクスで決めて即実行する。
+            // クエリの言い換えは検索エンジン/embedding側が吸収するので生文で十分。
+            // 長文はクエリとして筋が悪いので、その時は判断LLMに任せる
+            if (hintKeys[0] === 'web' && text.length <= 100 && documents.length === 0) {
+              // 添付ドキュメントがある時は「最新の仕様書は？」のように
+              // web と資料の両方に読める質問があるので即決しない
+              fastDirectCall = { name: 'web_search', args: { query: text } };
+            } else if (hintKeys[0] === 'doc' && text.length <= 200) {
+              fastDirectCall = { name: 'search_documents', args: { query: text } };
+            }
+            // gdrive/画像生成/音声合成/サーバーファイル/ML は引数の組み立てに
+            // 判断が要る (ID特定・プロンプト英訳・パス指定) ので即決しない
+            if (fastDirectCall) {
+              console.log(`[高速ルート] ${fastDirectCall.name} が明白 → 判断LLMを省略して即実行`);
+            }
+          }
+        }
+
         // ─── ツール実行ループ ───
         // Gemma系モデルはマルチターンのツール呼び出しが不安定（テキスト形式の<|tool_call|>を出力することがある）
         // → 1ターンのみに制限。Qwen系等は3ターンまで
@@ -3244,7 +3366,7 @@ function App() {
         let toolTurn = 0;
         let lastAssistantMsg = null;
 
-        while (toolTurn < MAX_TOOL_TURNS) {
+        while (!skipToolJudge && toolTurn < MAX_TOOL_TURNS) {
           toolTurn++;
           // 2周目以降は、最新のapiMessagesを使う（ツール結果を含んだ会話）
           const turnMessages = toolTurn === 1 ? judgeMessages : [{ role: 'system', content: judgeSystem }, ...apiMessages.slice(1)];
@@ -3273,7 +3395,22 @@ function App() {
             ?? Math.max(largePredict, smallPredict * 4);
           let judgeBudget = judgeNumPredict;
 
-          for (let budgetAttempt = 0; ; budgetAttempt++) {
+          // 高速ルートで即実行が決まっている場合、初回の判断LLM呼び出しを省き、
+          // 判断結果 (choice) をこちらで組み立てて既存の実行コードへ流す
+          const fastDirectTurn = toolTurn === 1 && !!fastDirectCall;
+          if (fastDirectTurn) {
+            choice = {
+              message: {
+                content: '',
+                tool_calls: [{
+                  id: 'call_fast_route',
+                  type: 'function',
+                  function: { name: fastDirectCall.name, arguments: JSON.stringify(fastDirectCall.args) },
+                }],
+              },
+            };
+          }
+          for (let budgetAttempt = 0; !fastDirectTurn; budgetAttempt++) {
             let retryCount = 0;
             const MAX_RETRIES = 3;
             while (retryCount <= MAX_RETRIES) {
@@ -4320,6 +4457,14 @@ function App() {
               }
             }
           }
+          // 高速ルートの即実行は単発で完結させる。通常経路はツール結果を見て
+          // もう一周判断LLMを回す (=1回の検索に判断が2回かかる) が、
+          // 「天気を検索して答える」のような単発検索では2周目は冗長で遅いだけ。
+          // 結果が不十分でも最終応答側のプロンプトが「分かった範囲で答える」を促す
+          if (toolTurn === 1 && fastDirectCall) {
+            console.log('[高速ルート] 即実行の結果を取得 → 追加判断を省略して最終応答へ');
+            break;
+          }
           // ループ先頭に戻って次のツール判断を試みる
         } // end while tool turn
 
@@ -5033,7 +5178,27 @@ function App() {
       } else {
         const reader = new FileReader();
         reader.onload = (e) => {
-          addDocument(file.name, e.target.result);
+          const content = String(e.target.result || '');
+          // 小さいテキスト (数KBのconfig・ソースコード等) はRAG登録せず、
+          // メッセージ本文へ直接埋め込む「インライン添付」にする。
+          // embedding生成もベクトル検索も不要になり、全文が文脈として届くので
+          // 速くて正確 (チャンク分割で文脈が切れない)。閾値は config.json の
+          // inlineFileMaxChars / inlineFileTotalMaxChars で調整できる
+          const perMax = appConfig.inlineFileMaxChars ?? 12000;
+          const totalMax = appConfig.inlineFileTotalMaxChars ?? 24000;
+          const curTotal = chatTextFilesRef.current.reduce((s, f) => s + f.text.length, 0);
+          const looksBinary = content.includes('\u0000');  // NUL入り = テキストではない
+          if (perMax > 0 && !looksBinary
+              && content.length <= perMax
+              && curTotal + content.length <= totalMax) {
+            console.log(`[インライン添付] ${file.name} (${content.length}文字) をチャットに直接添付 (RAG登録なし)`);
+            setChatTextFiles(prev => [...prev, { name: file.name, text: content }]);
+          } else {
+            if (perMax > 0 && !looksBinary) {
+              console.log(`[インライン添付] ${file.name} (${content.length}文字) はサイズ超過のためRAG登録へ`);
+            }
+            addDocument(file.name, content);
+          }
         };
         reader.readAsText(file);
       }
@@ -5092,7 +5257,7 @@ function App() {
       const base64 = dataUrl.split(',')[1];
       setChatImages(prev => [...prev, { name: file.name, base64, preview: dataUrl }]);
     }
-    // その他 → ドキュメントに取り込む（配列を直接渡す）
+    // その他 → handleFiles が振り分け（小さいテキストはチャット直接添付、それ以外はドキュメント登録）
     if (others.length > 0) {
       handleFiles(others);
     }
@@ -5876,10 +6041,12 @@ function App() {
         .filter(m => m.role !== 'compaction')
         .map(m => {
         const hasImages = m.images && m.images.length > 0;
-        if (!hasImages) return { role: m.role, content: m.content };
+        // インライン添付ファイルは表示用 content に含まれないので、送信前に全文を展開する
+        const contentText = expandInlineTextFiles(m, m.content);
+        if (!hasImages) return { role: m.role, content: contentText };
         // OpenAI互換: content配列形式
         const content = [];
-        if (m.content) content.push({ type: 'text', text: m.content });
+        if (contentText) content.push({ type: 'text', text: contentText });
         for (const img of m.images) {
           const dataUrl = img.base64.startsWith('data:')
             ? img.base64
@@ -6042,6 +6209,7 @@ function App() {
     setShowRoleEditor(false);
     setMessages([]);
     setDocuments([]);
+    setChatTextFiles([]);  // 送信前のインライン添付も破棄
     // 登録資料の検索は「そのチャットで明示的にONにするもの」なので、
     // 新規チャットでは既定値（通常OFF）に戻す
     setPersistentRagEnabled(appConfig.ragEnabledByDefault === true);
@@ -7148,6 +7316,19 @@ ${conversationText}
                           ))}
                         </div>
                       )}
+                      {msg.textFiles && msg.textFiles.length > 0 && (
+                        <div className="msg-textfiles">
+                          {msg.textFiles.map((f, fi) => (
+                            <span
+                              key={fi}
+                              className="textfile-chip"
+                              title={`${f.name}（${(f.text || '').length.toLocaleString()}文字）— 全文をメッセージに添付済み`}
+                            >
+                              📄 {f.name}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                       <div className="msg-bubble user-bubble">{msg.content}</div>
                     </React.Fragment>
                   )}
@@ -7287,6 +7468,24 @@ ${conversationText}
                 ))}
               </div>
             )}
+            {chatTextFiles.length > 0 && (
+              <div className="textfile-preview-bar">
+                {chatTextFiles.map((f, idx) => (
+                  <div
+                    key={idx}
+                    className="textfile-chip"
+                    title={`${f.name}（${f.text.length.toLocaleString()}文字）\n送信時にメッセージへ全文が添付されます（RAG登録なし）`}
+                  >
+                    <span className="textfile-chip-name">📄 {f.name}</span>
+                    <span className="textfile-chip-size">{(f.text.length / 1000).toFixed(1)}K</span>
+                    <button
+                      className="textfile-chip-remove"
+                      onClick={() => setChatTextFiles(prev => prev.filter((_, j) => j !== idx))}
+                    >×</button>
+                  </div>
+                ))}
+              </div>
+            )}
             <textarea
               ref={inputRef}
               className="input-box"
@@ -7302,7 +7501,8 @@ ${conversationText}
             <div className="input-toolbar">
               <div className="input-toolbar-left">
                 {/* ドキュメントと画像で入口を分けない。handleFiles が種類で振り分け、
-                    画像はVision添付、それ以外はドキュメント(RAG)登録になる */}
+                    画像はVision添付、小さいテキストはチャット直接添付 (インライン)、
+                    大きいテキスト・PDFはドキュメント(RAG)登録になる */}
                 <button className="toolbar-btn" title="ドキュメント・画像を追加" onClick={() => fileInputRef.current?.click()}>
                   📎
                 </button>
@@ -7370,7 +7570,7 @@ ${conversationText}
                 <button
                   className="send-btn"
                   onClick={sendMessage}
-                  disabled={(!input.trim() && chatImages.length === 0) || !connected || embeddingJobs.length > 0
+                  disabled={(!input.trim() && chatImages.length === 0 && chatTextFiles.length === 0) || !connected || embeddingJobs.length > 0
                     || (!orchWorkflowId && !modelReady && !firstLoadPending && !autoUnloadedName)}
                   title={
                     orchWorkflowId ? '送信時に必要なモデルを順次ロードします'
