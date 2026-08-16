@@ -537,7 +537,7 @@ systemd経由で `systemctl stop` した時もクリーンに終了する。
 
 | Method | Path | 説明 |
 |:--|:--|:--|
-| GET | /models | `{ models: [{name, ctx, ngl, loaded}, ...], current, starting, embeddingReady, autoUnloaded, idleUnloadMs }` |
+| GET | /models | `{ models: [{name, ctx, ngl, loaded}, ...], current, currentCtx, starting, embeddingReady, autoUnloaded, idleUnloadMs }`。`currentCtx` はロード完了時に llama-server の `/props` から実測したスロットあたり n_ctx（未ロード時は null）。フロントのトークン使用率・コンパクション判定はこの実測値を優先し、無ければ config の ctx を使う |
 | POST | /models/load | `{ name }` で指定モデルをロード（再起動）。自動アンロード状態をクリア |
 | POST | /models/unload | 現在のチャットモデルをアンロード（停止） |
 
@@ -1937,9 +1937,6 @@ loadChat() で setChatRole(data.role || '')
 
 // クリア
 newChat() で setChatRole('') / setShowRoleEditor(false)
-
-// 継続チャット（RAG引き継ぎ）
-chatRoleはリセットせず維持（役割は継続が自然）
 ```
 
 ### 動作フロー
@@ -1990,7 +1987,6 @@ def sieve_of_eratosthenes(limit: int) -> Iterator[int]:
 
 - **chatRoleは長すぎないこと**: コンテキスト消費するため500文字以内推奨
 - **モデルによる効果の差**: Qwen3.6 > Gemma4 > Gemma3 > Qwen2.5 0.5B（小さいモデルは指示追従性が低い）
-- **継続チャットでの引き継ぎ**: RAGドキュメントとして要約された会話に加え、役割も維持されるため「過去の文脈+役割」を完全継続できる
 
 ---
 
@@ -2446,96 +2442,6 @@ llama.cpp が内部で使う cpp-httplib < 0.43.3 では、`Transfer-Encoding: c
 1. **クライアント側で `Content-Length` 明示** （多くのHTTPライブラリは自動で付ける）
 2. **llama.cpp b9030 以降** に更新
 3. **Nginx前段でリバースプロキシ**（`proxy_request_buffering on` で chunked → Content-Length 変換）
-
----
-
-## 💬 継続チャット（過去会話のRAG化）
-
-長期的な対話を継続する仕組み。LLMのコンテキストウィンドウは有限ですが、過去会話を要約してRAGドキュメントとして保存することで、次のチャットから検索的に参照できます。
-
-### フロー
-
-```
-[現在のチャット]
-  ↓ ヘッダー「💬 継続チャット」クリック
-  ↓
-[LLMで詳細要約]
-  System: あなたは優秀なドキュメンテーションのプロです。
-  User:   会話履歴をmarkdownで詳細に要約（検索しやすく）
-  options: max_tokens=8192, temperature=0.3, thinking=false
-  ↓
-[markdown抽出]
-  ```markdown ... ``` で囲まれていれば中身を取り出す
-  ↓
-[ヘッダー付与]
-  # チャットタイトル
-  _作成日時: 2026/05/01 16:42_
-  _元チャットID: xyzabc_
-  ---
-  [本文]
-  ↓
-[ドキュメントとして自動アップロード]
-  ファイル名: {title}_{YYYYMMDD-HHMM}.md
-  既存ドキュメントは引き継がれる
-  ↓
-[新規チャット状態に切替]
-  チャットIDリセット、メッセージクリア
-  ドキュメントは前のものを保持＋新規追加
-```
-
-### 実装のポイント
-
-```javascript
-async function createRagDocument() {
-  // メッセージなしなら単純に新規チャット
-  if (userMsgs.length === 0 || assistantMsgs.length === 0) {
-    newChat();
-    return;
-  }
-
-  // 会話履歴を整形
-  const conversationText = messages
-    .filter(m => m.content && (m.role === 'user' || m.role === 'assistant'))
-    .map(m => `## ${m.role === 'user' ? 'ユーザー' : 'アシスタント'}\n\n${m.content.trim()}\n`)
-    .join('\n---\n\n');
-
-  // LLMに要約を依頼（thinking無効化で高速）
-  const res = await fetch('/v1/chat/completions', {
-    method: 'POST',
-    body: JSON.stringify({
-      model: chatModel,
-      messages: [{ role: 'system', content: 'ドキュメンテーションのプロ...' }, { role: 'user', content: prompt }],
-      stream: false,
-      max_tokens: 8192,
-      temperature: 0.3,
-      chat_template_kwargs: { enable_thinking: false },
-    }),
-  });
-  
-  const summaryMd = res.choices[0].message.content;
-  
-  // 新規チャット切替（既存ドキュメントは引き継ぐ）
-  const prevDocs = [...documents];
-  setMessages([]);
-  setDocuments(prevDocs);
-  
-  // 新ドキュメント追加
-  await addDocument(docName, fullMd);
-}
-```
-
-### 利点
-
-- LLMのコンテキスト超過を回避できる
-- 重要な情報を構造化したmarkdownとして保存
-- 検索可能なため、後から「○○について何と言ったか」を探せる
-- 複数のチャットを連結して長期プロジェクトを進められる
-
-### 留意点
-
-- 要約の品質は使用するモデルに依存（temperatureを0.3に下げて一貫性重視）
-- `<think>...</think>` が入らないよう `enable_thinking: false` 必須
-- 既存ドキュメントの引き継ぎロジックで `prevDocs = [...documents]` のスナップショットを忘れずに
 
 ---
 

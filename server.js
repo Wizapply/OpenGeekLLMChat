@@ -387,6 +387,7 @@ const chatModels = (appConfig.chatModels || []).map((m, i) => ({
 
 let chatProc = null;          // 現在起動中のチャットモデルプロセス
 let chatProcModel = null;     // 起動中のモデル名
+let chatProcCtx = null;       // ロード完了時に llama-server /props から実測したスロットあたり n_ctx
 let chatProcStarting = false; // 起動中フラグ
 let chatLastUsed = 0;         // 最終使用時刻（idleUnload用）
 let firstChatLoadDone = false; // 起動後の初回チャットモデルロード完了フラグ
@@ -1230,9 +1231,21 @@ async function startChatModel(modelName) {
       await stopChatModel();
       throw new Error(`チャットモデル起動タイムアウト: ${model.name}`);
     }
+    // 実際に確保されたコンテキストサイズを /props から読み取る。
+    // llama-server は -np で n_ctx をスロット数で分割するほか、モデル側の上限で
+    // 調整されることもあるため、config の ctx（起動引数の希望値）と一致するとは限らない
+    try {
+      const propsRes = await fetch(`http://${ls.chatHost}:${ls.chatPort}/props`);
+      if (propsRes.ok) {
+        const props = await propsRes.json();
+        const n = props?.default_generation_settings?.n_ctx ?? props?.n_ctx;
+        if (Number.isFinite(n) && n > 0) chatProcCtx = n;
+      }
+    } catch {}
+    if (!chatProcCtx) chatProcCtx = model.ctx;
     chatLastUsed = Date.now();
     firstChatLoadDone = true;
-    log('-', `チャットモデル起動完了: ${model.name}`);
+    log('-', `チャットモデル起動完了: ${model.name} (実測ctx=${chatProcCtx})`);
   } finally {
     chatProcStarting = false;
   }
@@ -1244,6 +1257,7 @@ function stopChatModel() {
     const p = chatProc;
     chatProc = null;
     chatProcModel = null;
+    chatProcCtx = null;
     p.once('exit', () => resolve());
     try { p.kill('SIGTERM'); } catch {}
     setTimeout(() => { try { p.kill('SIGKILL'); } catch {} resolve(); }, 5000);
@@ -2111,6 +2125,7 @@ app.get('/models', requireAuth, (req, res) => {
       loaded: m.name === chatProcModel,
     })),
     current: chatProcModel,
+    currentCtx: chatProcCtx,  // ロード中モデルの実測コンテキストサイズ（未ロード時はnull）
     starting: chatProcStarting,
     embeddingReady: !!embedProc,
     autoUnloaded: chatProcAutoUnloaded,  // アイドルでアンロード済みのモデル名（次のリクエストで再ロードされる）

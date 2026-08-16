@@ -1401,10 +1401,19 @@ function App() {
 
   const [documents, setDocuments] = useState([]); // { name, text, chunks, embeddings }
   const ragEnabled = true; // RAGはドキュメントがあれば常に有効
-  // 現在ロード中のチャットモデルのコンテキストサイズ（config.json由来、読み取り専用）
+  // 現在ロード中のチャットモデルのコンテキストサイズ（/props実測値。未ロード時は0）
   const [currentModelCtx, setCurrentModelCtx] = useState(0);
-  // numCtxはトークン使用率(◯/32K)の表示用。currentModelCtxと連動する
-  const numCtx = currentModelCtx || 32768;
+  // numCtxはトークン使用率(◯/32K)の表示とコンパクション判定に使う。
+  // 「現在選択中のモデル」のコンテキストサイズを表す:
+  //   1) 選択中モデルがロード済み → /props の実測値 (currentModelCtx)
+  //   2) 未ロード → config 定義の ctx（送信時にこのサイズでロードされる）
+  //   3) モデル情報が取れない → 実測値があればそれ、無ければ32K仮定
+  const numCtx = (() => {
+    const selInfo = availableModelsInfo.find(x => x.name === chatModel);
+    if (selInfo?.loaded && currentModelCtx > 0) return currentModelCtx;
+    if (selInfo?.ctx > 0) return selInfo.ctx;
+    return currentModelCtx || 32768;
+  })();
 
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -1657,14 +1666,21 @@ function App() {
       setModelReady(!!data.current && !data.starting && !data.autoUnloaded);
       setAutoUnloadedName(data.autoUnloaded || null);
       setFirstLoadPending(!!data.firstLoadPending);
-      // 現在ロード中モデルのctxを反映（読み取り専用）
-      const loaded = (data.models || []).find(m => m.loaded);
-      if (loaded && loaded.ctx) {
-        setCurrentModelCtx(loaded.ctx);
-      } else if (data.current) {
-        // currentがあるがloadedフラグが立っていないケース
-        const m = (data.models || []).find(mm => mm.name === data.current);
-        if (m && m.ctx) setCurrentModelCtx(m.ctx);
+      // 現在ロード中モデルのctxを反映（読み取り専用）。
+      // currentCtx はロード完了時にサーバーが llama-server の /props から実測した
+      // スロットあたりの n_ctx。-np 分割やモデル側の上限調整を反映した実値なので最優先。
+      // 取得できない場合のみ config 定義値へフォールバックする
+      if (data.currentCtx > 0) {
+        setCurrentModelCtx(data.currentCtx);
+      } else {
+        const loaded = (data.models || []).find(m => m.loaded);
+        if (loaded && loaded.ctx) {
+          setCurrentModelCtx(loaded.ctx);
+        } else if (data.current) {
+          // currentがあるがloadedフラグが立っていないケース
+          const m = (data.models || []).find(mm => mm.name === data.current);
+          if (m && m.ctx) setCurrentModelCtx(m.ctx);
+        }
       }
       // 現在ロード中モデルを自動選択（指定がなければ）
       // 優先: 1) ロード中(current), 2) 自動アンロード状態(autoUnloaded=前回モデル), 3) 一覧先頭
@@ -4614,7 +4630,7 @@ function App() {
         });
 
         if (!finalRes.ok) throw new Error(`API Error: ${finalRes.status}`);
-        await streamResponse(finalRes, contextInfo, searchQueries, { audios: generatedAudios, images: generatedImages });
+        await streamResponse(finalRes, contextInfo, searchQueries, { audios: generatedAudios, images: generatedImages }, finalMessages);
 
         // ─── 空応答の救済処理 ───
         // ツール呼び出し後の最終応答が空になることがある (Qwen3 系で稀に発生)
@@ -4691,7 +4707,7 @@ function App() {
                 };
                 return copy;
               });
-              await streamResponse(retryRes, contextInfo, searchQueries, { audios: generatedAudios, images: generatedImages });
+              await streamResponse(retryRes, contextInfo, searchQueries, { audios: generatedAudios, images: generatedImages }, retryMessages);
 
               // それでも空なら、固定メッセージにフォールバック
               const afterMsg = await new Promise(resolve => {
@@ -4833,7 +4849,7 @@ function App() {
           });
 
           if (!retryRes.ok) break;
-          await streamResponse(retryRes, contextInfo, searchQueries, { audios: generatedAudios, images: generatedImages });
+          await streamResponse(retryRes, contextInfo, searchQueries, { audios: generatedAudios, images: generatedImages }, apiMessages);
           // 次のループで再度<|tool_call|>が出ていないかチェック
         }
 
@@ -4848,12 +4864,13 @@ function App() {
         // ユーザー設定の役割（システムプロンプト先頭に置き、汎用ルールより優先させる）
         fullSystemPrompt = applyRolePrompt(fullSystemPrompt, chatRole);
 
+        const sentMessages = [{ role: 'system', content: fullSystemPrompt }, ...history];
         const res = await fetchWithRetry('/v1/chat/completions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             model: chatModel,
-            messages: [{ role: 'system', content: fullSystemPrompt }, ...history],
+            messages: sentMessages,
             stream: true,
             stream_options: { include_usage: true },
             ...llamaCommonOptions,
@@ -4873,7 +4890,7 @@ function App() {
 
         const contextInfo = contexts.length > 0 ? contexts : null;
         setMessages(prev => [...prev, { role: 'assistant', content: '', thinking: '', contexts: contextInfo }]);
-        await streamResponse(res, contextInfo, null);
+        await streamResponse(res, contextInfo, null, undefined, sentMessages);
       }
     } catch (e) {
       if (e.name === 'AbortError') {
@@ -4916,8 +4933,35 @@ function App() {
     }
   }
 
+  // 送信メッセージ列からプロンプトの内訳（システムプロンプト/会話メッセージ/ツール）を
+  // 文字数ベースで見積もる。llama-server の usage は prompt_tokens の合計しか返さないため、
+  // この見積もり比率で実測値を按分して内訳表示に使う（コンパクションの estTok と同じ
+  // 2字≒1トークンの概算。厳密なトークナイズではない）
+  function estimatePromptBreakdown(msgs) {
+    const est = (s) => Math.ceil(String(s || '').length / 2);
+    const bd = { system: 0, messages: 0, tools: 0 };
+    for (const m of (msgs || [])) {
+      let n = 0;
+      if (typeof m.content === 'string') {
+        n = est(m.content);
+      } else if (Array.isArray(m.content)) {
+        for (const part of m.content) {
+          if (part.type === 'text') n += est(part.text);
+          else if (part.type === 'image_url') n += 800;  // 画像1枚の概算（コンパクション見積もりと同値）
+        }
+      }
+      if (m.tool_calls) n += est(JSON.stringify(m.tool_calls));
+      if (m.role === 'tool' || m.tool_calls) bd.tools += n;
+      else if (m.role === 'system') bd.system += n;
+      else bd.messages += n;
+    }
+    return bd;
+  }
+
   // ─── ストリーミング応答の共通処理 ───
-  async function streamResponse(res, contextInfo, searchQueries, genMedia) {
+  // sentMessages: このリクエストで実際に送ったメッセージ列。渡すと usage の
+  // prompt_tokens を「システム/メッセージ/ツール」に按分した内訳が tokenInfo に付く
+  async function streamResponse(res, contextInfo, searchQueries, genMedia, sentMessages) {
     // 日本語で聞かれた時だけ「先頭の英語ブロック = 漏れた思考」を疑う。
     // 英語で質問された場合は英語で答えるのが正しいので判定しない
     const expectJapanese = HAS_JA_RE.test(lastUserTextRef.current || '');
@@ -5007,6 +5051,20 @@ function App() {
               promptTokens: json.usage.prompt_tokens || 0,
               completionTokens: json.usage.completion_tokens || 0,
             };
+            // 送信内容が分かる場合は、実測 prompt_tokens を文字数見積もりの比率で
+            // 「システム/メッセージ/ツール」に按分する（表示用の概算）
+            if (sentMessages && tokenInfo.promptTokens > 0) {
+              const bd = estimatePromptBreakdown(sentMessages);
+              const estTotal = bd.system + bd.messages + bd.tools;
+              if (estTotal > 0) {
+                const scale = tokenInfo.promptTokens / estTotal;
+                tokenInfo.systemTokens = Math.round(bd.system * scale);
+                tokenInfo.toolTokens = Math.round(bd.tools * scale);
+                // 丸め誤差は最大成分のメッセージ側に寄せ、合計を実測値に一致させる
+                tokenInfo.messageTokens = Math.max(0,
+                  tokenInfo.promptTokens - tokenInfo.systemTokens - tokenInfo.toolTokens);
+              }
+            }
             // トークン速度の計算（最初のトークンから最終までの実時間ベース）
             const evalMs = Date.now() - (firstTokenTime || startTime);
             if (json.usage.completion_tokens > 0 && evalMs > 0) {
@@ -6321,173 +6379,6 @@ function App() {
     messagesDirtyRef.current = false;  // 新規チャット時もクリア
   }
 
-  // ─── RAG作成: 現在のチャットをLLMで要約してmdドキュメントとしてアップロード→新規チャット ───
-  async function createRagDocument() {
-    // メッセージが少ない場合は単純に新規チャットに切替
-    const userMsgs = messages.filter(m => m.role === 'user');
-    const assistantMsgs = messages.filter(m => m.role === 'assistant' && m.content);
-    if (userMsgs.length === 0 || assistantMsgs.length === 0) {
-      newChat();
-      return;
-    }
-
-    // モデル準備確認
-    if (!modelReady && !firstLoadPending && !autoUnloadedName) {
-      setError('モデルがロードされていません。少し待ってから再度お試しください。');
-      return;
-    }
-    if (isLoading) {
-      setError('現在の応答を待ってから実行してください。');
-      return;
-    }
-
-    // 会話履歴をテキストに整形
-    const conversationText = messages
-      .filter(m => m.content && (m.role === 'user' || m.role === 'assistant'))
-      .map(m => {
-        const speaker = m.role === 'user' ? 'ユーザー' : 'アシスタント';
-        return `## ${speaker}\n\n${m.content.trim()}\n`;
-      })
-      .join('\n---\n\n');
-
-    setLoadingMessage('継続チャット準備中（過去の会話を要約中）...');
-    setIsLoading(true);
-
-    // モデル状態確認・必要ならロード待機（sendMessageと同じロジックの簡略版）
-    try {
-      const mres = await fetch('/models');
-      if (mres.ok) {
-        const mdata = await mres.json();
-        if (!mdata.current || mdata.starting || mdata.autoUnloaded) {
-          if (mdata.autoUnloaded) {
-            // pingで再ロード起動
-            fetch('/v1/chat/completions', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ model: chatModel, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1, stream: false }),
-            }).catch(() => {});
-          }
-          // ロード完了をポーリング
-          const startWait = Date.now();
-          let ready = false;
-          while (Date.now() - startWait < 120000) {
-            await new Promise(r => setTimeout(r, 2000));
-            try {
-              const pres = await fetch('/models');
-              if (!pres.ok) continue;
-              const pdata = await pres.json();
-              if (pdata.current && !pdata.starting && !pdata.autoUnloaded) { ready = true; break; }
-            } catch {}
-          }
-          if (!ready) {
-            setError('モデルのロードがタイムアウトしました。');
-            setIsLoading(false);
-            setLoadingMessage('');
-            return;
-          }
-        }
-      }
-    } catch {}
-
-    // LLMに要約を依頼
-    const summaryPrompt = `以下は私とアシスタントの会話履歴です。これを後でRAG（検索拡張生成）で参照できるよう、詳細な要約のmarkdownドキュメントを作成してください。
-
-要件:
-- 会話のトピック・テーマを整理し、見出し構造で整理してください
-- 重要な事実、数値、コード、決定事項、結論はそのまま残してください
-- 検索しやすいよう、キーワードを豊富に含めてください
-- 単なる要約ではなく、後から「○○について何と言ったか」を検索したときに見つかるよう詳細に記述してください
-- markdown形式で、コードブロック・表・箇条書きを適切に使ってください
-- 余計な前置き・後書きは不要、本文のmarkdownだけを出力してください
-
-会話履歴:
-
-${conversationText}
-
-上記の会話を詳細に要約したmarkdownドキュメントを作成してください。`;
-
-    let summaryMd = '';
-    try {
-      const ctrl = new AbortController();
-      abortRef.current = ctrl;
-      const res = await fetch('/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: chatModel,
-          messages: [
-            { role: 'system', content: 'あなたは優秀なドキュメンテーションのプロです。会話履歴から後で検索しやすいmarkdownドキュメントを作成します。' },
-            { role: 'user', content: summaryPrompt },
-          ],
-          stream: false,
-          max_tokens: 8192,
-          temperature: 0.3,
-          chat_template_kwargs: { enable_thinking: false },
-        }),
-        signal: ctrl.signal,
-      });
-      if (!res.ok) throw new Error(`API Error: ${res.status}`);
-      const data = await res.json();
-      summaryMd = data?.choices?.[0]?.message?.content || '';
-      // ```markdown ... ``` で囲まれている場合は中身を取り出す
-      const mdMatch = summaryMd.match(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```\s*$/);
-      if (mdMatch) summaryMd = mdMatch[1];
-      summaryMd = summaryMd.trim();
-    } catch (e) {
-      setError(`RAGドキュメント作成に失敗: ${e.message}`);
-      setIsLoading(false);
-      setLoadingMessage('');
-      return;
-    } finally {
-      abortRef.current = null;
-    }
-
-    if (!summaryMd) {
-      setError('要約結果が空でした。RAGドキュメントを作成できません。');
-      setIsLoading(false);
-      setLoadingMessage('');
-      return;
-    }
-
-    // ヘッダー情報を付与
-    const now = new Date();
-    const dateStr = now.toLocaleString('ja-JP');
-    const titleForDoc = chatTitle || '無題のチャット';
-    const fullMd = `# ${titleForDoc}\n\n_作成日時: ${dateStr}_\n_元チャットID: ${chatId}_\n\n---\n\n${summaryMd}\n`;
-
-    // ファイル名: タイトル + 日付
-    const safeTitle = titleForDoc.replace(/[\\/:*?"<>|]/g, '').slice(0, 30);
-    const tsStr = now.getFullYear()
-      + String(now.getMonth() + 1).padStart(2, '0')
-      + String(now.getDate()).padStart(2, '0')
-      + '-'
-      + String(now.getHours()).padStart(2, '0')
-      + String(now.getMinutes()).padStart(2, '0');
-    const docName = `${safeTitle}_${tsStr}.md`;
-
-    setLoadingMessage('Embedding生成中...');
-
-    // 既存のドキュメントを保持して新規チャットに切替
-    const prevDocs = [...documents];
-    setIsLoading(false);
-
-    // 新規チャット状態にして、ドキュメントを引き継ぐ
-    if (window.speechSynthesis) window.speechSynthesis.cancel();
-    setSpeakingIndex(-1);
-    setChatId(Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
-    setChatTitle('');
-    setMessages([]);
-    setDocuments(prevDocs);  // 既存ドキュメントは引き継ぐ
-    // 注: chatRoleは引き継ぎ（継続チャットなので役割設定は維持）
-
-    // 新ドキュメントを追加（addDocument 内で waitForEmbedding が呼ばれる）
-    try {
-      await addDocument(docName, fullMd);
-    } catch (e) {
-      setError(`ドキュメント追加に失敗: ${e.message}`);
-    }
-    setLoadingMessage('');
-  }
-
   async function deleteChat(id) {
     try {
       await fetch(`/chats/${id}`, { method: 'DELETE' });
@@ -7113,16 +7004,6 @@ ${conversationText}
             )}
           </div>
           <div className="chat-header-right">
-            <button
-              className="clear-btn"
-              onClick={createRagDocument}
-              disabled={isLoading}
-              title={messages.length > 0
-                ? '現在のチャットを要約してRAGドキュメントとして保存し、新規チャットを開始（過去の文脈を継続）'
-                : '新規チャットを開始'}
-            >
-              💬 継続チャット
-            </button>
             <button className={`clear-btn ${gpuPanelOpen && rightPanelTab === 'files' ? 'gpu-btn-active' : ''}`} onClick={() => { setRightPanelTab('files'); setGpuPanelOpen(rightPanelTab !== 'files' || !gpuPanelOpen); loadFileList(); }}>
               📁 ファイル{fileList.length > 0 && ` (${fileList.length})`}
             </button>
@@ -7513,10 +7394,30 @@ ${conversationText}
                     return (
                       <div className="token-info">
                         <div className="token-info-items">
-                          <div className="token-info-item">
-                            <span className="token-info-label">入力:</span>
-                            <span className="token-info-value">{msg.tokenInfo.promptTokens.toLocaleString()}</span>
-                          </div>
+                          {msg.tokenInfo.messageTokens != null ? (
+                            <>
+                              {/* 入力(prompt_tokens)の内訳。文字数見積もりで按分した概算値 */}
+                              <div className="token-info-item" title="会話メッセージ（履歴＋今回の質問）のトークン数（概算）">
+                                <span className="token-info-label">メッセージ:</span>
+                                <span className="token-info-value">{msg.tokenInfo.messageTokens.toLocaleString()}</span>
+                              </div>
+                              <div className="token-info-item" title="システムプロンプト（役割・ツール案内など）のトークン数（概算）">
+                                <span className="token-info-label">システム:</span>
+                                <span className="token-info-value">{msg.tokenInfo.systemTokens.toLocaleString()}</span>
+                              </div>
+                              {msg.tokenInfo.toolTokens > 0 && (
+                                <div className="token-info-item" title="ツール呼び出し・実行結果（Web検索/RAG等）のトークン数（概算）">
+                                  <span className="token-info-label">ツール:</span>
+                                  <span className="token-info-value">{msg.tokenInfo.toolTokens.toLocaleString()}</span>
+                                </div>
+                              )}
+                            </>
+                          ) : (
+                            <div className="token-info-item">
+                              <span className="token-info-label">入力:</span>
+                              <span className="token-info-value">{msg.tokenInfo.promptTokens.toLocaleString()}</span>
+                            </div>
+                          )}
                           <div className="token-info-item">
                             <span className="token-info-label">出力:</span>
                             <span className="token-info-value">{msg.tokenInfo.completionTokens.toLocaleString()}</span>
@@ -7531,7 +7432,12 @@ ${conversationText}
                           <div className="ctx-bar-wrap">
                             <div className="ctx-bar-fill" style={{ width: `${Math.min(pct, 100)}%`, background: barColor }} />
                           </div>
-                          <span className="token-info-label">{(numCtx / 1024).toFixed(0)}K</span>
+                          <span
+                            className="token-info-label"
+                            title={`選択中モデルのコンテキストサイズ: ${numCtx.toLocaleString()}トークン`}
+                          >
+                            {(numCtx / 1024).toFixed(0)}K
+                          </span>
                         </div>
                       </div>
                     );
