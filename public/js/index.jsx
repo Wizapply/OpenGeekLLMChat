@@ -743,14 +743,22 @@ function normalizeMath(s) {
   return String(s || '')
     // 式番号 (\tag{5.3}) は資料側にしか無いことが多く、比較の邪魔になる
     .replace(/\\tag\*?\{[^}]*\}/g, '')
+    // \text{ のとき, } のような説明文は式そのものではないので中身ごと落とす。
+    // 資料側は式だけが載っているため、残すと必ず不一致になる
+    .replace(/\\(?:text|textrm|textbf|mathrm)\{[^}]*\}/g, '')
     .replace(/\\left|\\right|\\displaystyle|\\quad|\\qquad|\\cdot|\\[,;:!]/g, '')
+    // 添字・上付きの記号は落とす。OCR は n1 / n_1 / n^{1} を揺れて出すので、
+    // ここを区別すると同じ式が不一致になる ($k_1\{s_0(X)\}^{n_1}$ と ^{n1} など)。
+    // 位置の情報は文字の並び順として残るので、式の取り違えは検出できる
+    .replace(/[_^]/g, '')
     .replace(/[{}\s]/g, '');
 }
 
 // 短い式は何にでも一致してしまい情報量が無いので対象外にする。
 // ただしブロック数式 ($$…$$) は「これが式です」という主張なので、
 // 文中で記号に触れているだけのインラインより短くても判定する。
-// p_m = \frac{W}{2BD} は正規化して14字。25字では取りこぼしていた
+// p_m = \frac{W}{2BD} は正規化して12字 (添字記号を落とすので14字→12字)。
+// 25字では取りこぼしていた
 const MATH_MIN_LEN = 25;          // インライン数式
 const MATH_MIN_LEN_DISPLAY = 10;  // ブロック数式
 
@@ -805,11 +813,25 @@ function checkMathAgainstSources(content, ragSources) {
     .filter(f => f.key.length >= (f.display ? MATH_MIN_LEN_DISPLAY : MATH_MIN_LEN));
   if (!spans.length) return null;
 
+  // 条件と式を1本の数式に詰め込んだ回答への保険:
+  //   $$0 \leq s_0(X) \leq H \text{ のとき, } \quad p_0(X) = k_1\{s_0(X)\}^{n_1}$$
+  // 資料側は式ごとに分かれて載っているので、丸ごとでは決して一致しない。
+  // \text{…} と \quad を切れ目として分解し、断片が全て資料にあれば一致とみなす
+  const mathParts = (raw) => String(raw)
+    .split(/\\(?:text|textrm|textbf|mathrm)\{[^}]*\}|\\q?quad/g)
+    .map(normalizeMath)
+    .filter(k => k.length >= MATH_MIN_LEN_DISPLAY);
+
   const matched = [];    // 資料の本文にそのまま在る
   const unmatched = [];  // 在らず、かつ「本来こうだ」と示せる
   const unverified = []; // 在らず、示すものも無い (判定を保留する)
   for (const f of spans) {
     if (srcNorm.some(src => src.includes(f.key))) { matched.push(f.raw); continue; }
+    // 丸ごとでは無くても、条件と式に分解した断片が全て資料にあるなら一致
+    const parts = mathParts(f.raw);
+    if (parts.length > 1 && parts.every(k => srcNorm.some(src => src.includes(k)))) {
+      matched.push(f.raw); continue;
+    }
     // 一番近い資料側の式を探す。無関係な式を並べると却って混乱するので閾値を置く
     let best = null, bestScore = 0;
     for (const c of srcSpans) {
@@ -1624,6 +1646,11 @@ function App() {
   // 単に履歴を「開いた」だけでは true にならない。これにより updatedAt が無駄に更新されて
   // 順序が変わってしまうのを防ぐ
   const messagesDirtyRef = useRef(false);
+  // isLoading の同期ミラー。beforeunload はイベントハンドラの中で「今生成中か」を
+  // 即座に判定する必要があり、state のクロージャでは1テンポ古い値を見てしまう。
+  // stopGeneration が同期で false にするので、こちらの確認ダイアログでOKした直後に
+  // ブラウザ標準のダイアログが二重で出ることもない
+  const isLoadingRef = useRef(false);
 
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
@@ -1939,7 +1966,27 @@ function App() {
     }
     // llama-server: HTTPストリーム切断でリクエストはキャンセルされる。
     // GPU使用率は生成中だったスロット分は次のサンプリング後に解放される。
+    isLoadingRef.current = false;   // beforeunload 用に同期で落とす
     setIsLoading(false);
+  }
+
+  // ─── 生成中の離脱ガード ───
+  // 思考・回答の途中でチャットを切り替えると、進行中のストリームが
+  // 「切り替えた後のチャット」に書き込まれる (setMessages(prev => ...) の prev が
+  // 読み込み直後のメッセージ配列になるため)。生成中は自動保存を止めているので、
+  // 生成が終わった瞬間に、別のチャットの続きとして丸ごと保存されてしまう。
+  // 移動の前に必ず確認し、続行するなら先に生成を中断してから移動する。
+  //
+  // 呼び出し側は「移動する = true」「やめる = false」で分岐する。
+  function confirmLeaveWhileGenerating(action) {
+    if (!isLoading && !isLoadingRef.current) return true;
+    const ok = window.confirm(
+      `⏳ まだ生成中です。\n`
+      + `${action}すると生成は中断され、途中まで書かれた応答は保存されません。`
+      + `${action}しますか？（キャンセルすると、そのまま生成を続けます）`);
+    if (!ok) return false;
+    stopGeneration();
+    return true;
   }
 
   // ─── チャット送信 ───
@@ -6520,6 +6567,8 @@ function App() {
   }
 
   async function deleteChat(id) {
+    // 生成中のチャットを消すと、進行中のストリームが行き場を失う
+    if (id === chatId && !confirmLeaveWhileGenerating('このチャットを削除')) return;
     try {
       await fetch(`/chats/${id}`, { method: 'DELETE' });
       if (chatId === id) newChat();
@@ -6642,11 +6691,32 @@ function App() {
     }
   }, [chatId, authenticated]);
 
+  // 生成中のページ離脱 (リロード・タブを閉じる・別ページへのリンク) を確認する。
+  // 表示される文言はブラウザ標準のもので、こちらからは変えられない
+  // (Chrome/Firefox とも独自メッセージは無視する仕様)。
+  // preventDefault と returnValue の両方を設定するのは、仕様の新旧どちらの
+  // ブラウザでもダイアログを出すため
+  useEffect(() => {
+    const onBeforeUnload = (e) => {
+      if (!isLoadingRef.current) return;
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, []);
+
   // ブラウザの戻る・進むボタン対応
   useEffect(() => {
     if (!authenticated) return;
     const onPopState = () => {
       const urlId = getChatIdFromUrl();
+      // 戻る/進むは popstate が飛んできた時点で既にURLが変わっているので、
+      // 事前に止められない。中止を選んだ場合はURLを押し戻して元のチャットに留まる
+      if (isLoadingRef.current && !confirmLeaveWhileGenerating('チャットを移動')) {
+        window.history.pushState({ chatId }, '', `/chat/${chatId}`);
+        return;
+      }
       if (urlId && urlId !== chatId) {
         loadChat(urlId).catch(() => {
           // ロード失敗（存在しないIDなど）→ ルートへリダイレクト
@@ -6923,16 +6993,19 @@ function App() {
               )}
             </div>
             <div className="nav-link-row">
-              <a className="tuning-link" href="/tuning.html" title="ファインチューニング管理画面を開く">
+              <a className="tuning-link" href="/tuning.html" title="ファインチューニング管理画面を開く"
+                onClick={e => { if (!confirmLeaveWhileGenerating('他の画面へ移動')) e.preventDefault(); }}>
                 🧠 ファインチューニング
               </a>
               {appConfig.ml?.enabled && (
-                <a className="tuning-link" href="/ml.html" title="機械学習データテーブル管理を開く">
+                <a className="tuning-link" href="/ml.html" title="機械学習データテーブル管理を開く"
+                  onClick={e => { if (!confirmLeaveWhileGenerating('他の画面へ移動')) e.preventDefault(); }}>
                   🤖 機械学習
                 </a>
               )}
               {appConfig.ocr?.enabled && (
-                <a className="tuning-link" href="/ocr.html" title="PDFをOCRして永続RAGに登録する画面を開く">
+                <a className="tuning-link" href="/ocr.html" title="PDFをOCRして永続RAGに登録する画面を開く"
+                  onClick={e => { if (!confirmLeaveWhileGenerating('他の画面へ移動')) e.preventDefault(); }}>
                   📄 永続RAG(OCR登録)
                 </a>
               )}
@@ -6944,7 +7017,10 @@ function App() {
         <div className="chat-history-panel" style={{ height: chatHistoryHeight }}>
           <div className="chat-history-header">
             <span className="chat-history-title">チャット履歴</span>
-            <button className="new-chat-btn" onClick={() => { newChat(); if (window.innerWidth <= 768) setSidebarOpen(false); }}>+ 新規</button>
+            <button className="new-chat-btn" onClick={() => {
+              if (!confirmLeaveWhileGenerating('新しいチャットを開始')) return;
+              newChat(); if (window.innerWidth <= 768) setSidebarOpen(false);
+            }}>+ 新規</button>
           </div>
           <div className="chat-history-list">
             {chatList.length === 0 ? (
@@ -6954,7 +7030,10 @@ function App() {
                 <div
                   key={c.id}
                   className={`chat-history-item ${c.id === chatId ? 'active' : ''}`}
-                  onClick={() => { loadChat(c.id); if (window.innerWidth <= 768) setSidebarOpen(false); }}
+                  onClick={() => {
+                    if (!confirmLeaveWhileGenerating('チャットを移動')) return;
+                    loadChat(c.id); if (window.innerWidth <= 768) setSidebarOpen(false);
+                  }}
                 >
                   <div className="chat-history-item-info">
                     <div className="chat-history-item-title">{c.title}</div>
@@ -7086,6 +7165,7 @@ function App() {
           className="sidebar-settings-btn"
           href="/editconfig.html"
           title="config.json 編集"
+          onClick={e => { if (!confirmLeaveWhileGenerating('他の画面へ移動')) e.preventDefault(); }}
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <circle cx="12" cy="12" r="3"></circle>
