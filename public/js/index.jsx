@@ -936,7 +936,20 @@ function renderLatex(text, verdicts) {
     (_, expr) => placeholder(renderKatex(expr.trim(), true)));
 
   // インライン数式: $ ... $ or \( ... \)（ただし $5 や $10 のような通貨表記は除外）
-  text = text.replace(/(?<!\$)\$(?!\$)(?!\d+\s)(.+?)(?<!\$)\$(?!\$)/g, (_, expr) => placeholder(renderKatex(expr.trim(), false)));
+  //
+  // 通貨の除外を「開き $ の直後が数字＋空白なら数式でない」で判定すると、
+  // $0 \leq s_0(X) \leq H$ のように数字で始まる式まで弾かれる。しかも弾かれた
+  // 開き $ の次に見つかる $ が「開き」として使われるため、以降の $ の対応が
+  // 1つずつずれ、式の間の日本語 (「のとき」等) が数式として描画される。
+  // そこで除外はコールバック側で内容を見て決める:
+  //   数字で始まり、空白を含み、LaTeX らしい文字を1つも含まないものだけ通貨とみなす
+  //   ("5 と " → 通貨 / "0 \leq s_0(X) \leq H" → 数式 / "1/6" → 数式)
+  const looksLikeCurrency = (e) => /^\d/.test(e) && /\s/.test(e) && !/[\\^_={}<>/]/.test(e);
+  text = text.replace(/(?<!\$)\$(?!\$)([^\n$]+?)\$(?!\$)/g, (m, expr) => {
+    const e = expr.trim();
+    if (!e || looksLikeCurrency(e)) return m;
+    return placeholder(renderKatex(e, false));
+  });
   text = text.replace(/\\\(([\s\S]+?)\\\)/g, (_, expr) => placeholder(renderKatex(expr.trim(), false)));
 
   // コードブロック・インラインコードを復元
@@ -3045,6 +3058,11 @@ function App() {
         if (sp.python) {
           agentSystem += '\n\n' + sp.python;
         }
+        // 数式の書き方 (KaTeX で描画できる LaTeX にさせる)。meta の直前 = 末尾寄りに
+        // 置くのは、直近の指示ほど強く効くため
+        if (sp.math) {
+          agentSystem += '\n\n' + sp.math;
+        }
         if (sp.meta) {
           agentSystem += '\n\n' + sp.meta;
         }
@@ -4826,6 +4844,7 @@ function App() {
         // ─── 従来モード（always）: 常にRAG検索してプロンプト注入 ───
         const contexts = await retrieveContext(text);
         let fullSystemPrompt = systemPrompt;
+        if (sp.math) fullSystemPrompt += '\n\n' + sp.math;
         if (contexts.length > 0) {
           const ctxText = contexts.map((c, i) => `[資料${i + 1}: ${c.docName}]\n${c.chunk}`).join('\n\n');
           fullSystemPrompt += `\n\n以下の参考資料に基づいて回答してください。資料に無い情報は推測であることを明示してください。\n\n${ctxText}`;
@@ -6281,7 +6300,10 @@ function App() {
       // システムプロンプトは config.systemPrompts.base を使用（{date}を展開）
       const sp = appConfig.systemPrompts || {};
       const fillTemplate = (str, vars) => (str || '').replace(/\{(\w+)\}/g, (_, k) => vars[k] != null ? vars[k] : '');
-      const systemPrompt = fillTemplate(sp.base || '', { date: dateStr });
+      let systemPrompt = fillTemplate(sp.base || '', { date: dateStr });
+      // 続きの生成でも数式の書き方は保つ（前半だけ LaTeX で後半が地の文になると、
+      // 1つの回答の中で数式の見た目が食い違う）
+      if (sp.math) systemPrompt += '\n\n' + sp.math;
 
       // idxまでの会話履歴 + thinking情報を引き継ぎ、続きを促す
       // コンパクション済みの会話では、最後のマーカーより前は要約で置き換える

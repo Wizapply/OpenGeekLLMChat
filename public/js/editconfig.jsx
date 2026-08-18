@@ -1637,6 +1637,7 @@ const CONFIG_HINTS = {
   'systemPrompts.googleDrive': 'Google Drive が有効かつ接続済みの時の追記',
   'systemPrompts.rag': '永続RAGが使える時の追記。原文の数式・記号をそのまま引用させ、出典ページを添えさせる',
   'systemPrompts.python': 'Python実行の案内',
+  'systemPrompts.math': '数式を KaTeX 用の LaTeX（$ ... $ / $$ ... $$）で書かせる指示。常時付加、空文字で無効',
   'systemPrompts.meta': 'メタ的な独り言を抑制する指示',
   'systemPrompts.judge': 'ツール判断専用の軽量プロンプト（{toolList}）',
   'agentContext': 'ツール判断フェーズの生成量チューニング',

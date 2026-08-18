@@ -1591,6 +1591,7 @@ isStreaming={isLoading && i === messages.length - 1}
 | `systemPrompts.fileAccess` | string | (同上) | サーバーファイル操作案内 |
 | `systemPrompts.googleDrive` | string | (同上) | Google Drive 案内（連携有効かつ接続済みの時のみ付加） |
 | `systemPrompts.python` | string | (同上) | Python実行案内 |
+| `systemPrompts.math` | string | (同上) | 数式を KaTeX 用の LaTeX で書かせる指示（常時付加、空文字で無効） |
 | `systemPrompts.meta` | string | (同上) | メタ抑制指示 |
 | `systemPrompts.judge` | string | (同上) | ツール判断用プロンプト（{toolList}展開） |
 
@@ -1654,6 +1655,7 @@ if (documents.length > 0 && sp.documents) {
 if (appConfig.webSearch && sp.webSearch) agentSystem += '\n\n' + sp.webSearch;
 if (appConfig.fileAccess && sp.fileAccess) agentSystem += '\n\n' + sp.fileAccess;
 if (sp.python) agentSystem += '\n\n' + sp.python;
+if (sp.math) agentSystem += '\n\n' + sp.math;    // 数式の LaTeX 化 (末尾寄り = 効きやすい)
 if (sp.meta) agentSystem += '\n\n' + sp.meta;
 ```
 
@@ -3236,6 +3238,30 @@ body, .app-layout, .chat-area {
 
 117. **自前 ZIP 生成 (外部 `zip` コマンド非依存)**
      モデルダウンロードで外部 `zip` コマンドに依存すると、本番に未インストールだと 500 エラー。Node 標準の `zlib.deflateRawSync` だけで ZIP を手書き生成する (`buildZipBuffer`)。CRC32 テーブル + ローカルファイルヘッダ + セントラルディレクトリ + EOCD を構築。DEFLATE/STORE 自動選択、UTF-8 ファイル名 (bit11)。一時ファイルも不要でメモリ上で完結するため `/tmp` 制限の影響も受けない。
+
+118. **回答の数式が地の文のままだと、KaTeX も数式照合も効かない**
+     画面は `$ ... $` / `$$ ... $$` を KaTeX で描画するが、指示が無いとモデルは
+     `pm = W / (2BD)` `p0(X) = k1 {s0(X)}^n1` のように地の文で書く。添字と分数が
+     潰れて読めないうえ、`checkMathAgainstSources` は数式区切りのある箇所しか
+     抽出しないため「数式0本」と判定され、`✓ 資料と一致` の照合バッジも出ない
+     (誤りを検出する仕組みが、静かに無効化される)。
+     対策は `systemPrompts.math` の追加 (常時付加・空文字で無効) と、
+     `systemPrompts.rag` の「1文字も変えずに写す」が **LaTeX 化の禁止** と
+     読まれないための明確化 — 「変えてよいのは区切り記号と添字の体裁だけ、
+     記号・添字・係数・項の並びは原文どおり」。RAG 併用時にこの2つが衝突すると、
+     モデルは忠実さを優先して地の文のまま書くので、片方だけでは直らない。
+
+119. **通貨除外の否定先読みが、数字で始まる数式を壊し `$` の対応をずらす**
+     インライン数式の抽出は `/(?<!\$)\$(?!\$)(?!\d+\s)(.+?)\$/` で
+     「`$` の直後が数字＋空白なら通貨 ($5 や $10)」と除外していたが、これでは
+     `$0 \leq s_0(X) \leq H$` のような **数字で始まる数式まで弾かれる**。
+     しかも弾かれるのは開き `$` の候補だけなので、本来の閉じ `$` が次の開きとして
+     使われ、以降の対応が1つずつずれる。結果、式の間の「のとき」が数式として
+     描画され、肝心の式は生の LaTeX のまま残った。
+     判定は正規表現ではなくコールバック側で内容を見る:
+     **数字で始まり・空白を含み・`\ ^ _ = { } < > /` を1つも含まない** ものだけを
+     通貨とみなす (`"5 と "` → 通貨 / `"0 \leq H"` → 数式 / `"1/6"` → 数式)。
+     内側の `$` を許さない `[^\n$]+?` にしたので、対応がずれることも無くなった。
 
 ---
 
