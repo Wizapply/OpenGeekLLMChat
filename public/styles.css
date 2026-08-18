@@ -2060,6 +2060,60 @@
   .msg-bubble a:hover { text-decoration: underline; }
 
   /* ── Message Actions ── */
+  /* ── コンテキストサイズ不足の警告（常時表示。ホバー依存にしない） ── */
+  .ctx-error {
+    margin-top: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--orange);
+    border-left-width: 3px;
+    border-radius: var(--radius-sm);
+    background: rgba(251, 146, 60, 0.08);
+  }
+
+  .ctx-error-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--orange);
+    margin-bottom: 4px;
+  }
+
+  .ctx-error-body {
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+  }
+
+  .ctx-error-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+    flex-wrap: wrap;
+  }
+
+  .ctx-error-btn {
+    background: var(--orange);
+    border: 1px solid var(--orange);
+    color: #1a1a26;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 5px 12px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-family: var(--font-sans);
+    transition: all 0.15s;
+  }
+
+  .ctx-error-btn:hover:not(:disabled) { filter: brightness(1.12); }
+  .ctx-error-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .ctx-error-btn-ghost {
+    background: transparent;
+    color: var(--orange);
+  }
+
+  .ctx-error-btn-ghost:hover:not(:disabled) { background: rgba(251, 146, 60, 0.15); }
+
   .msg-actions {
     display: flex;
     gap: 6px;

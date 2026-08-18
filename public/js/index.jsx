@@ -2422,38 +2422,7 @@ function App() {
           try {
             const target = allMessages.slice(liveStart, allMessages.length - keepRecent)
               .filter(m => (m.role === 'user' || m.role === 'assistant') && resolveStaleSourceKeys(m));
-            const convoText = target.map(m =>
-              `[${m.role === 'user' ? 'ユーザー' : 'アシスタント'}] ${resolveStaleSourceKeys(m)}`
-            ).join('\n\n');
-            const compactSystem = 'あなたは会話履歴の要約担当です。以下の会話を、続きの会話でモデルが文脈として使うための要約にまとめてください。\n'
-              + '- 事実・決定事項・数値・固有名詞・ファイル名・コードの要点は正確に残す\n'
-              + '- ユーザーの目的と、未解決の課題・宿題を明記する\n'
-              + '- 挨拶や相づちなど冗長な部分は省く\n'
-              + '- 800字程度の日本語で、箇条書き中心でまとめる\n'
-              + '- 要約本文のみを出力する（前置きや説明は不要）';
-            const compactUser = (summaryText
-              ? `これまでの要約:\n${summaryText}\n\n上記の要約の続きの会話:\n${convoText}\n\n要約と続きの会話を統合した新しい要約を作成してください。`
-              : convoText);
-            const sumRes = await fetchWithRetry('/v1/chat/completions', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                model: chatModel,
-                messages: [
-                  { role: 'system', content: compactSystem },
-                  { role: 'user', content: compactUser },
-                ],
-                stream: false,
-                temperature: 0.2,
-                max_tokens: cc.summaryMaxTokens ?? 1024,
-                cache_prompt: true,
-              }),
-              signal: controller.signal,
-            });
-            if (!sumRes.ok) throw new Error(`API Error: ${sumRes.status}`);
-            const sumData = await sumRes.json();
-            const newSummary = String(sumData.choices?.[0]?.message?.content || '')
-              .replace(/<think>[\s\S]*?(<\/think>|$)/gi, '').trim();
+            const newSummary = await requestConversationSummary(target, summaryText, controller.signal);
             if (newSummary) {
               summaryText = newSummary;
               liveStart = allMessages.length - keepRecent;
@@ -4933,6 +4902,96 @@ function App() {
     }
   }
 
+  // ─── 会話履歴の要約（コンパクション本体） ───
+  // 自動コンパクション（閾値超過時）と、手動の「コンテキストを圧縮」ボタンの両方から使う。
+  // target = 要約対象のメッセージ配列、prevSummary = 既存の要約（あれば統合する）
+  // 戻り値は要約本文（空文字なら失敗扱い）
+  async function requestConversationSummary(target, prevSummary, signal) {
+    const cc = appConfig.contextCompaction || {};
+    const convoText = target.map(m =>
+      `[${m.role === 'user' ? 'ユーザー' : 'アシスタント'}] ${resolveStaleSourceKeys(m)}`
+    ).join('\n\n');
+    const compactSystem = 'あなたは会話履歴の要約担当です。以下の会話を、続きの会話でモデルが文脈として使うための要約にまとめてください。\n'
+      + '- 事実・決定事項・数値・固有名詞・ファイル名・コードの要点は正確に残す\n'
+      + '- ユーザーの目的と、未解決の課題・宿題を明記する\n'
+      + '- 挨拶や相づちなど冗長な部分は省く\n'
+      + '- 800字程度の日本語で、箇条書き中心でまとめる\n'
+      + '- 要約本文のみを出力する（前置きや説明は不要）';
+    const compactUser = (prevSummary
+      ? `これまでの要約:\n${prevSummary}\n\n上記の要約の続きの会話:\n${convoText}\n\n要約と続きの会話を統合した新しい要約を作成してください。`
+      : convoText);
+    const sumRes = await fetchWithRetry('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: chatModel,
+        messages: [
+          { role: 'system', content: compactSystem },
+          { role: 'user', content: compactUser },
+        ],
+        stream: false,
+        temperature: 0.2,
+        max_tokens: cc.summaryMaxTokens ?? 1024,
+        cache_prompt: true,
+      }),
+      signal,
+    });
+    if (!sumRes.ok) throw new Error(`API Error: ${sumRes.status}`);
+    const sumData = await sumRes.json();
+    return String(sumData.choices?.[0]?.message?.content || '')
+      .replace(/<think>[\s\S]*?(<\/think>|$)/gi, '').trim();
+  }
+
+  // ─── 手動コンテキスト圧縮（「コンテキストを圧縮」ボタン） ───
+  // コンテキスト不足で生成が途中で止まったとき、ユーザー操作で会話履歴を要約して
+  // 圧縮マーカーを挿入する。以降のターンはマーカー以前の原文ではなく要約が送られる
+  async function compactContextNow() {
+    if (isLoading) return;
+    const cc = appConfig.contextCompaction || {};
+    const keepRecent = Math.max(2, cc.keepRecent ?? 4);
+    const cur = await new Promise(resolve => {
+      setMessages(prev => { resolve(prev); return prev; });
+    });
+    // 直近の圧縮マーカー以降が今回の圧縮対象
+    let markerIdx = -1;
+    for (let i = cur.length - 1; i >= 0; i--) {
+      if (cur[i].role === 'compaction') { markerIdx = i; break; }
+    }
+    const prevSummary = markerIdx >= 0 ? cur[markerIdx].content : '';
+    const liveStart = markerIdx + 1;
+    const target = cur.slice(liveStart, Math.max(liveStart, cur.length - keepRecent))
+      .filter(m => (m.role === 'user' || m.role === 'assistant') && resolveStaleSourceKeys(m));
+    if (target.length < 2) {
+      setError(`圧縮できる会話がありません（直近${keepRecent}件は原文のまま残す設定のため、対象が2件未満です）。`
+        + 'この場合はコンテキストを消費しているのが会話履歴ではないので、'
+        + 'config の ragTopK / ragNeighborChunks を下げるか、モデルの ctx を大きくしてください。');
+      return;
+    }
+    setIsLoading(true);
+    setLoadingMessage('会話を要約してコンテキストを圧縮中...');
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    try {
+      const newSummary = await requestConversationSummary(target, prevSummary, ctrl.signal);
+      if (!newSummary) throw new Error('要約結果が空でした');
+      setMessages(prev => {
+        const cut = prev.length - keepRecent;
+        if (cut < 0) return prev;
+        // 圧縮できたので、コンテキスト不足の警告は解除する
+        const cleared = prev.map(m => (m.ctxExhausted ? { ...m, ctxExhausted: false } : m));
+        return [...cleared.slice(0, cut), { role: 'compaction', content: newSummary }, ...cleared.slice(cut)];
+      });
+      messagesDirtyRef.current = true;
+      console.log(`[手動圧縮] 完了: ${target.length}件 → 要約${newSummary.length}文字`);
+    } catch (e) {
+      if (e.name !== 'AbortError') setError(`コンテキスト圧縮に失敗しました: ${e.message}`);
+    } finally {
+      abortRef.current = null;
+      setIsLoading(false);
+      setLoadingMessage('');
+    }
+  }
+
   // 送信メッセージ列からプロンプトの内訳（システムプロンプト/会話メッセージ/ツール）を
   // 文字数ベースで見積もる。llama-server の usage は prompt_tokens の合計しか返さないため、
   // この見積もり比率で実測値を按分して内訳表示に使う（コンパクションの estTok と同じ
@@ -5205,6 +5264,65 @@ function App() {
         }
       }
       if (loopDetected) break;
+    }
+
+    // ─── コンテキスト不足の判定 ───
+    // 生成が途中で切れる原因のうち、ユーザーが自分で対処できるのは「コンテキストが
+    // 埋まった」ケース。黙って切れると原因も復帰手段も分からないため明示的に知らせる。
+    // 判定は2経路:
+    //   1) usage が届いた場合  … 入力(+生成)が上限に達していれば不足
+    //   2) usage が届かず切れた場合 … llama-server がコンテキスト超過で応答を
+    //      打ち切ると最終チャンクごと来ないので、送信プロンプトの見積もりで判断する
+    let ctxExhausted = false;
+    let ctxErrorDetail = '';
+    if (numCtx > 0) {
+      let promptTok = 0;
+      let toolTok = 0;
+      const measured = !!tokenInfo;
+      if (tokenInfo) {
+        promptTok = tokenInfo.promptTokens || 0;
+        toolTok = tokenInfo.toolTokens || 0;
+      } else if (sentMessages) {
+        const bd = estimatePromptBreakdown(sentMessages);
+        promptTok = bd.system + bd.messages + bd.tools;
+        toolTok = bd.tools;
+      }
+      const totalTok = promptTok + (tokenInfo ? (tokenInfo.completionTokens || 0) : 0);
+      const brokeOff = !tokenInfo && !!assistantContent;   // usage が来ないまま切れた
+      // 上限近くでも正常に書き終えた回答を「途中で終了」と誤って警告しないよう、
+      // 実際に打ち切られた証拠 (finish_reason=length / usage欠落) がある場合に限る。
+      // ただしプロンプト自体が上限超過なら、完走して見えても内容は切り捨てられている
+      if (promptTok > 0 && (
+        promptTok >= numCtx                                     // プロンプトだけで上限超過
+        || (lengthCapped && totalTok >= numCtx * 0.97)          // 使い切って打ち切られた
+        || (brokeOff && promptTok >= numCtx * 0.9)              // 上限間際で異常終了
+      )) {
+        ctxExhausted = true;
+        const fmt = (v) => Math.round(v).toLocaleString();
+        // 何がコンテキストを食っているかで打つ手が変わるので、内訳から助言を変える。
+        // 検索結果が大半なら会話を圧縮しても効かない（ツール結果は毎ターン作り直されるため）
+        const toolHeavy = toolTok > promptTok * 0.5;
+        ctxErrorDetail = `入力 ${fmt(promptTok)} トークン / コンテキスト上限 ${fmt(numCtx)} トークン`
+          + (measured ? '' : '（概算）')
+          + 'に達したため、回答が途中で終了しました。'
+          + (toolHeavy
+            ? `\n検索結果がコンテキストの大半（約${fmt(toolTok)}トークン）を占めています。`
+              + '会話の圧縮では減らないため、config.json の ragTopK / ragNeighborChunks を'
+              + '下げるか、モデルの ctx を大きくしてください。'
+            : '\n過去の会話を圧縮すると空きができ、続きを生成できます。');
+        console.warn(`[コンテキスト不足] ${ctxErrorDetail.replace(/\n/g, ' ')}`);
+      }
+    }
+    if (ctxExhausted) {
+      setMessages(prev => {
+        const copy = [...prev];
+        const last = copy[copy.length - 1];
+        if (last && last.role === 'assistant') {
+          // agentStatus の「最大出力トークンに達した」案内は原因が違うので消す
+          copy[copy.length - 1] = { ...last, agentStatus: null, ctxExhausted: true, ctxErrorDetail };
+        }
+        return copy;
+      });
     }
 
     // ─── ストリーミング完了後の救済処理 ───
@@ -7320,6 +7438,34 @@ function App() {
                       <div className="msg-bubble user-bubble">{msg.content}</div>
                     </React.Fragment>
                   )}
+                  {/* コンテキスト不足で生成が途中終了した時の警告と復帰手段。
+                      黙って切れると原因が分からないので、数値と対処をその場に出す */}
+                  {msg.ctxExhausted && (
+                    <div className="ctx-error">
+                      <div className="ctx-error-title">⚠️ コンテキストサイズ不足</div>
+                      <div className="ctx-error-body">{msg.ctxErrorDetail}</div>
+                      <div className="ctx-error-actions">
+                        <button
+                          className="ctx-error-btn"
+                          onClick={compactContextNow}
+                          disabled={isLoading}
+                          title="過去の会話をLLMで要約して1つにまとめ、コンテキストの空きを作ります"
+                        >
+                          📦 コンテキストを圧縮
+                        </button>
+                        {i === messages.length - 1 && (
+                          <button
+                            className="ctx-error-btn ctx-error-btn-ghost"
+                            onClick={() => continueGeneration(i)}
+                            disabled={isLoading}
+                            title="途中で終わった回答の続きを生成します"
+                          >
+                            🔄 続きを生成
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
                   {msg.role === 'assistant' && !(isLoading && i === messages.length - 1) && (msg.content || msg.thinking || msg.loopDetected || msg.lengthCapped) && (
                     <div className="msg-actions">
                       {msg.content && (
@@ -7342,7 +7488,7 @@ function App() {
                           ループ検出時 (loopDetected) も同様: 本文側でループした場合は
                           content があり thinking が空なので、この条件に入れないと
                           「ボタンで回答を要求できます」の案内だけ出てボタンが無い状態になる */}
-                      {i === messages.length - 1 && (!msg.content || msg.thinking || msg.lengthCapped || msg.loopDetected) && (
+                      {i === messages.length - 1 && !msg.ctxExhausted && (!msg.content || msg.thinking || msg.lengthCapped || msg.loopDetected) && (
                         <button className="msg-action-btn continue-btn" onClick={() => continueGeneration(i)}>
                           {msg.loopDetected ? '⚠️ 思考ループを中断・回答を要求'
                             : msg.lengthCapped ? '✂️ 途中で終了 — 続きを生成'
