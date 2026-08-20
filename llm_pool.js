@@ -470,6 +470,42 @@ function createLlmPool(deps) {
     return cfg().gpuPlacement || 'spread';
   }
 
+  // 可視デバイスを1枚に絞ると、デバイスの名前や枚数を前提にした引数は必ず壊れる。
+  // 例: commonArgs に --device ROCm0,ROCm1 があると、ROCR_VISIBLE_DEVICES=1 で
+  // 起動したワーカーからは1枚しか見えず、その1枚は ROCm0 と名乗るので
+  // 「invalid device: ROCm1」で落ちる。固定する時はこれらを落とす
+  const DEVICE_SELECT_ARGS = [
+    '--device', '-dev',
+    '--tensor-split', '-ts',
+    '--main-gpu', '-mg',
+    '--split-mode', '-sm',
+  ];
+
+  /**
+   * --device で使うデバイスが明示されていれば、そのインデックス集合を返す。
+   * 「学習用に1枚空けておく」といった意図で絞っている環境で、
+   * こちらが勝手に別のGPUへ載せてしまわないようにする。
+   *
+   * @returns {Set<number>|null} null = 指定なし(全GPUが候補) / 空Set = 固定しない
+   */
+  function deviceAllowlist(model) {
+    const args = [...(getConfig().llamaServer?.commonArgs || []), ...((model && model.extraArgs) || [])];
+    let spec = null;
+    for (let i = 0; i < args.length - 1; i++) {
+      if (args[i] === '--device' || args[i] === '-dev') spec = args[i + 1];  // 後勝ち
+    }
+    if (spec == null) return null;
+    // "none" は「オフロードしない」の意味。GPUを選ぶ話ではないので固定もしない
+    if (String(spec).trim().toLowerCase() === 'none') return new Set();
+    const idx = new Set();
+    // ROCm0 / CUDA1 / Vulkan0 … 末尾の数字がデバイス番号
+    for (const name of String(spec).split(',')) {
+      const m = name.trim().match(/(\d+)\s*$/);
+      if (m) idx.add(parseInt(m[1], 10));
+    }
+    return idx;
+  }
+
   // 配置を決めてから実測VRAMに現れるまでのラグ。GPU情報は1秒間隔で更新されるが、
   // llama-server は起動中に少しずつ確保するので、readyになった直後もまだ足りない
   const GPU_SETTLE_MS = 15000;
@@ -490,17 +526,19 @@ function createLlmPool(deps) {
    * モデルを丸ごと載せられるGPUを1枚選ぶ。空きが最も多いものを選ぶ。
    * 選べなければ null を返し、呼び出し側は従来どおり llama.cpp の分散に任せる。
    */
-  function pickGpu(requiredMB) {
+  function pickGpu(requiredMB, allowed) {
     if (gpuPlacementMode() !== 'auto') return null;
     const backend = getGpuBackend();
     if (!backend || backend === 'none') return null;   // 環境変数の名前が決められない
     const gpus = getGpuInfo() || [];
     if (gpus.length < 2) return null;                  // 1枚しかないなら固定する意味がない
     if (!(requiredMB > 0)) return null;                // 見積れないモデルは分散のまま
+    if (allowed && allowed.size === 0) return null;    // --device none 等、選ぶ余地がない
 
     const margin = Number.isFinite(cfg().vramSafetyMarginMB) ? cfg().vramSafetyMarginMB : 2048;
     let best = null;
     for (let i = 0; i < gpus.length; i++) {
+      if (allowed && !allowed.has(i)) continue;        // 使うなと言われているGPUには載せない
       const total = gpus[i].vramTotalMB || 0;
       const used = gpus[i].vramUsedMB || 0;
       if (total <= 0) continue;
@@ -662,7 +700,7 @@ function createLlmPool(deps) {
       // 1リクエストあたりの文脈が狭くなる（同一モデルへの並列が要るときだけ上げる）
       const np = model.nParallel ?? cfg().workerParallel ?? 1;
 
-      const args = [
+      let args = [
         '-m', model.path,
         '-c', String(model.ctx),
         '-ngl', String(model.ngl),
@@ -677,8 +715,19 @@ function createLlmPool(deps) {
       // 丸ごと載るGPUが1枚あればそこに固定する。無ければ null で従来どおり分散。
       // 予約 (reservedOnGpu) が効くよう、workers に入れる前に決めておく
       const est = estimateModelVram(model);
-      const placement = pickGpu(est.totalMB);
+      const placement = pickGpu(est.totalMB, deviceAllowlist(model));
       const env = placement ? gpuEnv(placement.index) : null;
+
+      // 固定するなら、絞る前のデバイス一覧を前提にした引数は残せない。
+      // --device ROCm0,ROCm1 のまま1枚だけ見せると ROCm1 が存在せず起動に失敗する
+      if (placement) {
+        const dropped = args.filter((a, i) => DEVICE_SELECT_ARGS.includes(a) || DEVICE_SELECT_ARGS.includes(args[i - 1]));
+        args = filterPairArgs(args, DEVICE_SELECT_ARGS);
+        if (dropped.length) {
+          log('-', `[LLMプール] GPU固定のため引数を除外: ${dropped.join(' ')}`
+            + ` (可視デバイスを GPU${placement.index} の1枚に絞るため)`);
+        }
+      }
 
       const worker = {
         modelName, host, port,
