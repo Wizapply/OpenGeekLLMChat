@@ -1,0 +1,35 @@
+  /* ─── 永続RAG登録 (統合画面) 固有のスタイル ───
+     OCRタブ・HTMLタブの中身は ocr-styles.css / htmlrag-styles.css をそのまま使う。
+     ここには「タブ切り替えバー」だけを足す。 */
+
+  .rag-tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .rag-tab {
+    appearance: none;
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;              /* 下線をタブバーの罫線に重ねる */
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    padding: 10px 16px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+    white-space: nowrap;
+  }
+  .rag-tab:hover { color: var(--text-primary); background: var(--bg-hover); border-radius: var(--radius-sm) var(--radius-sm) 0 0; }
+  .rag-tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+    font-weight: 600;
+  }
+
+  @media (max-width: 768px) {
+    .rag-tab { padding: 10px 10px; font-size: 12px; }
+  }

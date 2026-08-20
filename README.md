@@ -64,7 +64,7 @@ LLMが直接サーバーのファイルシステムに `.py` / `.xml` / `.json` 
 
 ### 📄 PDF OCR（Vision LLM → Markdown → RAG自動登録）
 
-紙の技術書をスキャンしたPDFを `/ocr.html`（サイドバーの **「📄 永続RAG(OCR登録)」**）にドロップするだけで、**Vision LLM が1ページずつ Markdown に起こし、完了後そのまま永続RAGに登録**されます。以降はチャット画面で「あの資料の◯◯について」と普通に聞けます（フロントエンドの追加操作は不要）。
+紙の技術書をスキャンしたPDFを `/rag.html`（サイドバーの **「📚 永続RAG(OCR、HTML登録)」**）の **「📄 PDF OCR登録」タブ**にドロップするだけで、**Vision LLM が1ページずつ Markdown に起こし、完了後そのまま永続RAGに登録**されます。以降はチャット画面で「あの資料の◯◯について」と普通に聞けます（フロントエンドの追加操作は不要）。
 
 **流れ**
 
@@ -110,7 +110,7 @@ poppler-utils（`pdftoppm` / `pdfinfo`）。npm の依存追加はありませ�
 | macOS | `brew install poppler` |
 | Windows | [poppler-windows](https://github.com/oschwartz10612/poppler-windows/releases) のZIPを展開し `Library\bin` を PATH に追加。PATHを通さない場合は `ocr.pdfToImageCmd` / `ocr.pdfInfoCmd` にフルパスを指定（例 `"C:/poppler/Library/bin/pdftoppm.exe"`） |
 
-未導入のまま `/ocr.html` を開くと、**動作中のOSに合わせた導入手順**が画面上部に警告として出ます。
+未導入のまま `/rag.html` のOCRタブを開くと、**動作中のOSに合わせた導入手順**が画面上部に警告として出ます。
 
 加えて Vision LLM が要ります。**2つのやり方**があり、どちらかを選びます。
 
@@ -164,6 +164,75 @@ curl -X POST 'http://localhost:3000/ocr/upload?name=book.pdf' \
 ```
 
 **セキュリティ**: 拡張子・MIMEタイプ・ファイル先頭の `%PDF-` を三重にチェックし、ファイル名はサニタイズして `uploads` 直下に固定します。300MB（`ocr.maxUploadMB`）を超えるものとディスク残量不足は受信時に弾きます。
+
+### 🌐 HTML / RAG登録（HtmlRAG: Webページ・HTMLファイル → クリーニング → RAG自動登録）
+
+WebページのURLを入れるか、ローカルの `.html` ファイルを `/rag.html`（サイドバーの **「📚 永続RAG(OCR、HTML登録)」**）の **「🌐 HTML / Web登録」タブ**にドロップするだけで、**HTMLのノイズを落として本文だけを抽出し、構造を保った Markdown にして永続RAGへ自動登録**します。以降はチャット画面で「あの記事の◯◯について」と普通に聞けます。GPUは使わないので数秒〜十数秒で終わります。
+
+論文 [HtmlRAG: HTML is Better Than Plain Text for Modeling Retrieved Knowledge in RAG Systems](https://arxiv.org/abs/2411.02959)（WWW 2025、[日本語解説](https://zenn.dev/knowledgesense/articles/e35011933152e2)）の知見に基づく実装です。RAGでHTMLを単純にプレーンテキスト化すると**見出し・表・コード・強調などの構造情報が失われる**一方、生のHTMLはCSS/JS/属性などのノイズが本文の何十倍もあります。そこで論文の「HTMLクリーニング」を実装し、意味を保ったままサイズを圧縮します。
+
+**流れ**
+
+```
+URL指定 or HTMLアップロード
+  → (URLの場合) サーバーがページを取得 (charset自動判定: UTF-8/Shift_JIS/EUC-JP)
+  → (🔗 リンク先も取り込む 選択時) 同一パス配下のリンクを1階層クロール
+      上限 crawlMaxPages ページ / 取得間隔 crawlDelayMs / robots.txt 尊重
+  → HTMLクリーニング (HtmlRAG論文の手法):
+      ① <script>/<style>/コメント等、本文と無関係なノードの除去
+      ② 属性の除去 (href/alt など最小限だけ残す)
+      ③ 空タグの除去、冗長な入れ子 (<div><div><p>) の統合
+      + nav/header/footer/aside (サイトの枠) の除去、<main>/<article> の本文優先
+  → (describeImages 有効時) ページ内の画像を Vision LLM で説明・文字起こし (OCR)
+      モデルは ocr.vlmPoolModel / ocr.vlmEndpoint を共用
+  → 構造を保った Markdown 化 (見出し→#、表→テーブル、コード→フェンス、リスト→箇条書き)
+  → public/uploads/<タイトル>.md に保存 (クロール時はページごとに出典URL付きセクション)
+  → ragIngestFile() で RAG 登録 → search_persistent_documents から参照可能
+```
+
+**特徴**
+
+- **URLとローカルの両対応**: 社内WikiのURLでも、ブラウザで保存したHTMLでも同じ流れで登録できます。JavaScriptで描画されるページ（SPA等）はURL取得では本文が取れないので、ブラウザで「ページを保存」したHTMLをアップロードしてください
+- **リンク先の同時取り込み（1階層クロール）**: URL取り込みで **「🔗 リンク先も取り込む」** を選ぶと、起点ページと**同一パス配下**（例: `/docs/manual/` 以下）のリンクを**1階層だけ**辿り、まとめて1つのドキュメントとして登録します。上限ページ数（`crawlMaxPages`、既定20）・取得間隔（`crawlDelayMs`、既定1秒/ページ）・**robots.txt の尊重**（`crawlRespectRobots`、`User-agent: *` の Disallow に従う）付き。各ページの取り込み結果には出典URLが残るので、回答から元ページを辿れます。深さ2以上には意図的に対応しません（ページ数が際限なく増えてRAGを汚すため）
+- **画像の内容もRAGに載る**: ページ内の `<img>` をダウンロードし、**OCR機能と同じ Vision LLM**（`ocr.vlmPoolModel` / `ocr.vlmEndpoint` の設定を共用）で**説明と文字起こし（OCR）**を生成して、Markdownに `[図: alt]` + `> 画像の内容: …` として埋め込みます。図表・スクリーンショットの中身が検索・引用できるようになります。Vision LLM が未設定・停止中でもジョブは止まらず、画像説明なしで登録されます（スキップ理由をジョブに記録）。アイコン等の小さい画像（`imageMinKB` 未満）と data:URI は対象外
+- **文字コード自動判定**: Content-Type ヘッダ → `<meta charset>` → UTF-8 の順で判定。Shift_JIS / EUC-JP の古いページも化けません
+- **本文抽出**: `<main>` / `<article>` があればそこだけを取り込み、「関連記事」「コメント欄」がRAGを汚すのを防ぎます（`htmlRag.preferMainContent` で無効化可）
+- **再取り込み**: 完了ジョブの「🔄 再取り込み」で、URLジョブはページを取得し直して再登録します。更新される社内ドキュメントの追従に使えます
+- **出典の保存**: 生成Markdownの冒頭に取得元URLと取得日時を記録するので、チャットの回答から元ページを辿れます
+- **論文準拠モード**: `htmlRag.registerFormat` を `"html"` にすると、Markdown変換せず**クリーニング済みHTMLをタグごと登録**します（論文の主張そのまま。タグを読めるモデル向け）
+- **依存パッケージ追加なし**: HTMLのパースも自前の軽量トークナイザで行い、npm 依存は増えません（jsdom/cheerio 不使用）
+- 論文の「ブロックツリー剪定」（検索時に文書をコンテキスト長へ収める処理）は、このアプリではチャンク単位の embedding 検索が同じ役割を担うため実装していません
+
+**API**（認証は既存の `requireAuth` + 参照系 `ml:read` / 更新系 `ml:write`）
+
+| Method | Path | 説明 |
+|---|---|---|
+| `POST` | `/htmlrag/upload` | HTML を受信 → ジョブ登録（既定でそのまま開始。`?autostart=0` で保留） |
+| `POST` | `/htmlrag/url` | URL指定でジョブ登録。ボディ `{"url":"https://...", "title":"任意", "crawl":true}`（`crawl` で同一パス配下の1階層クロール） |
+| `GET` | `/htmlrag/jobs` | 全ジョブの状態一覧 |
+| `GET` | `/htmlrag/jobs/:jobId` | 個別ジョブの詳細 |
+| `GET` | `/htmlrag/jobs/:jobId/stream` | SSE でリアルタイム進捗配信 |
+| `POST` | `/htmlrag/jobs/:jobId/start` | 開始 / 失敗ジョブの再実行。ボディ `{"redo":true}` で完了済みの取り込み直し |
+| `POST` | `/htmlrag/jobs/:jobId/cancel` | 実行中ジョブの中断 |
+| `DELETE` | `/htmlrag/jobs/:jobId` | ジョブ削除（元HTML・Markdown・RAG登録もまとめて） |
+| `GET` | `/htmlrag/status` | 機能の状態（URL取得可否・embedding の有無） |
+
+`curl` からも使えます。
+
+```bash
+# URLを取り込む
+curl -X POST 'http://localhost:3000/htmlrag/url' \
+  -H 'Authorization: Bearer <APIトークン>' \
+  -H 'Content-Type: application/json' \
+  -d '{"url": "https://example.com/article"}'
+
+# ローカルHTMLを取り込む
+curl -X POST 'http://localhost:3000/htmlrag/upload' \
+  -H 'Authorization: Bearer <APIトークン>' \
+  -F 'file=@page.html'
+```
+
+**セキュリティ**: URL取得は http/https のみ。`htmlRag.blockPrivateHosts` を true にすると、ループバック・プライベートIPリテラルへの取得を拒否します（サーバーを外部公開していて、URL指定でイントラネットを覗かれたくない場合）。アップロードは拡張子とタグの存在を確認し、ファイル名はサニタイズして `uploads` 直下に固定します。
 
 ### 🎯 ドラッグ&ドロップ統合UI
 3つのドロップゾーンが状況に応じて自動で振り分け:
@@ -387,7 +456,7 @@ config.json から HTTPサーバーや llama-server の細かな設定を調整�
 - **再起動状態のポーリング表示**: 再起動完了まで自動で監視、復活したら「✓ 再起動完了」と通知
 - **PID / 起動時間表示**: サーバープロセスの状態が一目でわかる
 - **⬇ HuggingFace GGUF ワンボタン導入**: HuggingFace の GGUF リンクを貼って1ボタンで、モデルディレクトリへダウンロード → `config.json` の `chatModels` へ自動登録（進捗バー表示、mmproj / ctx / ngl / HFトークンも任意指定可）
-- **ナビゲーション統一**: サイドバーから 💬 チャット / 🧠 ファインチューニング / 🤖 機械学習 / 📄 永続RAG(OCR登録) へ相互遷移
+- **ナビゲーション統一**: サイドバーから 💬 チャット / 🧠 ファインチューニング / 🤖 機械学習 / 📚 永続RAG(OCR、HTML登録) へ相互遷移
 
 ### 🎨 画像生成（stable-diffusion.cpp 連携）
 チャットで「猫の絵を描いて」と頼むと、LLMが自動的に `generate_image` ツールを呼び出して画像を生成する。stable-diffusion.cpp の `sd-server` を内部プロセスとして管理し、ROCm/CUDA GPU で高速推論。
@@ -460,7 +529,8 @@ config.json から HTTPサーバーや llama-server の細かな設定を調整�
 - **通常チャットでの自動有効化**: 登録ドキュメントが1件以上あれば、UI 操作なしで自動的にツールがLLMに提供される。左サイドバーのドキュメント欄には出さない (そこはチャット添付RAG専用)
 - **embedding 未設定時の自動 OFF**: 4層防御 (UI非表示 / 起動時自動除外 / API 503 / agent_proxy ツール除外)
 - **Python REST 経由で管理**: `/rag/documents` 等のエンドポイントで登録・一覧・削除
-- **PDFからの登録**: スキャンPDFはサイドバーの **「📄 永続RAG(OCR登録)」** ([📄 PDF OCR](#-pdf-ocrvision-llm--markdown--rag自動登録)) を使えば、Markdown化から登録まで自動で行われる
+- **PDFからの登録**: スキャンPDFはサイドバーの **「📚 永続RAG(OCR、HTML登録)」** の「📄 PDF OCR登録」タブ ([📄 PDF OCR](#-pdf-ocrvision-llm--markdown--rag自動登録)) を使えば、Markdown化から登録まで自動で行われる
+- **Webページ・HTMLからの登録**: URLやローカルHTMLは同じ画面の「🌐 HTML / Web登録」タブ ([🌐 HTML / RAG登録](#-html--rag登録htmlrag-webページhtmlファイル--クリーニング--rag自動登録)) を使えば、HtmlRAG方式のクリーニングから登録まで自動で行われる
 
 ### 🖼️ 画像物体検出 (torchvision)
 `/ml.html` の「画像」タブで、画像内の物体を検出できる。COCO事前学習モデルでの即時検出と、独自クラスのカスタムモデル学習の両方に対応。**追加パッケージは torchvision のみ** (YOLO等の外部依存なし、BSDライセンス)。
@@ -992,6 +1062,7 @@ opengeek-llm-chat/
 ├── gguf_info.js                # GGUFのVRAM見積り診断ツール (node gguf_info.js で全モデル診断)
 ├── orchestrator.js             # マルチLLMオーケストレーション実行エンジン (ワークフローDAG実行)
 ├── ocr.js                      # PDF OCR パイプライン (pdftoppm + Vision LLM + ジョブキュー、依存なし)
+├── html_rag.js                 # HTML / RAG登録パイプライン (HtmlRAGクリーニング + Markdown変換、依存なし)
 ├── public/
 │   ├── index.html              # React SPA（チャットUI）
 │   ├── styles.css              # メインスタイルシート (CSS変数, レイアウト, コンポーネント)
@@ -999,8 +1070,12 @@ opengeek-llm-chat/
 │   ├── tuning-styles.css       # ファインチューニングUI用スタイル
 │   ├── ml.html                 # React SPA（機械学習UI）
 │   ├── ml-styles.css           # 機械学習UI用スタイル
-│   ├── ocr.html                # React SPA（PDF OCR / RAG登録UI）
-│   ├── ocr-styles.css          # OCR UI用スタイル（レイアウトは tuning-styles.css を共用）
+│   ├── rag.html                # React SPA（永続RAG登録UI: PDF OCRタブ + HTML/Webタブの統合画面）
+│   ├── rag-styles.css          # 統合画面のタブ用スタイル
+│   ├── ocr.html                # /rag.html#ocr へのリダイレクト（旧URL互換）
+│   ├── ocr-styles.css          # OCRタブ用スタイル（レイアウトは tuning-styles.css を共用）
+│   ├── htmlrag.html            # /rag.html#html へのリダイレクト（旧URL互換）
+│   ├── htmlrag-styles.css      # HTML/Webタブ用スタイル（大半は ocr-styles.css を共用）
 │   ├── editconfig.html         # React SPA（config.json編集UI、本体再起動も可能）
 │   ├── editconfig-styles.css   # config編集UI用スタイル
 │   ├── aiicon.jpg              # アイコン（任意）
@@ -1038,10 +1113,12 @@ opengeek-llm-chat/
 │   ├── rag/                    # 外部API用 永続RAGドキュメント
 │   │   ├── index.json          # 登録ドキュメント一覧
 │   │   └── <docId>.json        # チャンク + embeddingベクトル
-│   └── ocr/                    # PDF OCR の作業データ（自動生成）
-│       ├── jobs.json           # OCRジョブの状態（再起動しても復元される）
-│       └── cache/<jobId>/      # ページ単位のMarkdownキャッシュ（中断ジョブの再開用）
-│           └── pXXXX.md        # 1ページぶんのOCR結果
+│   ├── ocr/                    # PDF OCR の作業データ（自動生成）
+│   │   ├── jobs.json           # OCRジョブの状態（再起動しても復元される）
+│   │   └── cache/<jobId>/      # ページ単位のMarkdownキャッシュ（中断ジョブの再開用）
+│   │       └── pXXXX.md        # 1ページぶんのOCR結果
+│   └── htmlrag/                # HTML / RAG登録の作業データ（自動生成）
+│       └── jobs.json           # 取り込みジョブの状態（再起動しても復元される）
 ├── chats/                      # チャット履歴JSON（自動生成）
 ├── settings.json               # ユーザー設定（自動生成）
 ├── DESIGN.md                   # 設計ドキュメント
@@ -1232,6 +1309,27 @@ opengeek-llm-chat/
 | `ocr.autoRegisterToRag` | 完了後に生成Markdownを自動でRAG登録するか（既定true） |
 | `ocr.keepPdf` | 完了後もアップロードしたPDFを `uploads/` に残すか（既定true） |
 | `ocr.prompt` | Vision LLM に渡すOCR指示。表・数式・図の扱いをここで調整する |
+| `htmlRag.enabled` | HTML / RAG登録機能 ON/OFF（依存パッケージ・GPU不要） |
+| `htmlRag.allowUrlFetch` | URL指定の取り込みを許可するか（false でローカルHTMLのアップロードのみ） |
+| `htmlRag.maxUploadMB` / `maxFetchMB` | HTMLアップロード / URL取得のサイズ上限（既定 各20MB） |
+| `htmlRag.fetchTimeoutSec` | URL取得のタイムアウト（秒、既定60） |
+| `htmlRag.userAgent` | 取得時の User-Agent。空ならWeb検索機能と同じブラウザUA（botとして弾かれにくい） |
+| `htmlRag.blockPrivateHosts` | ループバック・プライベートIPリテラルへの取得を拒否（サーバー外部公開時のイントラネット保護。既定 false） |
+| `htmlRag.dropBoilerplate` | `nav` / `header` / `footer` / `aside`（サイトの枠）を捨てるか（既定 true） |
+| `htmlRag.preferMainContent` | `<main>` / `<article>` があればそこだけ取り込むか（既定 true） |
+| `htmlRag.registerFormat` | `"markdown"`（既定。構造をMarkdown記法へ変換して登録）か `"html"`（クリーン済みHTMLをタグごと登録する、HtmlRAG論文に忠実なモード） |
+| `htmlRag.maxConcurrentJobs` | 同時実行ジョブ数（GPU不要なので既定2） |
+| `htmlRag.autoRegisterToRag` | 完了後に自動でRAG登録するか（既定true） |
+| `htmlRag.keepHtml` | 取得/アップロードした元HTMLを `uploads/` に残すか（既定true） |
+| `htmlRag.crawlEnabled` | UIに「🔗 リンク先も取り込む」（1階層クロール）の選択肢を出すか（既定true） |
+| `htmlRag.crawlMaxPages` | 1ジョブの最大ページ数（起点ページ含む。既定20、20〜30程度を推奨） |
+| `htmlRag.crawlDelayMs` | クロール時のページ間の取得間隔（ms、既定1000。相手サイトへの負荷配慮） |
+| `htmlRag.crawlRespectRobots` | robots.txt（`User-agent: *`）の Disallow を尊重するか（既定true） |
+| `htmlRag.describeImages` | ページ内の画像を Vision LLM で説明・文字起こしして登録内容に含めるか（既定true。モデルは `ocr.vlmPoolModel` / `ocr.vlmEndpoint` を共用） |
+| `htmlRag.imageMaxPerPage` | 1ページで解析する画像の上限（既定8） |
+| `htmlRag.imageMinKB` / `imageMaxMB` | 解析対象の画像サイズ（既定: 10KB未満スキップ / ダウンロード上限8MB） |
+| `htmlRag.imageMaxTokens` / `imageTimeoutSec` | 1枚あたりの説明の生成上限と解析タイムアウト（既定 1024 / 180秒） |
+| `htmlRag.imagePrompt` | Vision LLM への指示。空なら既定（説明＋文字起こし＋表＋グラフ） |
 | `imageGen` | 画像生成（stable-diffusion.cpp連携）ON/OFF。`imageModels[]` を定義した上で `true` にして有効化 |
 | `stableDiffusion.binPath` | sd-server バイナリの絶対パス |
 | `stableDiffusion.port` | sd-server HTTP ポート（内部通信用、デフォルト 7860） |
@@ -2148,7 +2246,7 @@ LLM は質問に応じて両方のツールを使い分けられます。例え�
 ### 通常チャットでの自動利用
 
 - **登録済みドキュメントがあれば自動的にツールが追加** されます (UI操作不要)
-- 左サイドバーのドキュメント欄には**表示されません**。あの欄はチャット添付RAG専用です。登録済みの永続RAGはサイドバーの **「📄 永続RAG(OCR登録)」** (`/ocr.html`) と `/rag/documents` で確認します
+- 左サイドバーのドキュメント欄には**表示されません**。あの欄はチャット添付RAG専用です。登録済みの永続RAGはサイドバーの **「📚 永続RAG(OCR、HTML登録)」** (`/rag.html`) と `/rag/documents` で確認します
 - embedding サーバーが利用できない場合や、登録ドキュメントが0件の場合は**自動的に無効化** されます
 
 ### 登録方法 (Pythonから)

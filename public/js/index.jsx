@@ -7003,10 +7003,10 @@ function App() {
                   🤖 機械学習
                 </a>
               )}
-              {appConfig.ocr?.enabled && (
-                <a className="tuning-link" href="/ocr.html" title="PDFをOCRして永続RAGに登録する画面を開く"
+              {(appConfig.ocr?.enabled || appConfig.htmlRag?.enabled) && (
+                <a className="tuning-link" href="/rag.html" title="PDFのOCR登録とHTML/Webページ登録で永続RAGにドキュメントを追加する画面を開く"
                   onClick={e => { if (!confirmLeaveWhileGenerating('他の画面へ移動')) e.preventDefault(); }}>
-                  📄 永続RAG(OCR登録)
+                  📚 永続RAG(OCR、HTML登録)
                 </a>
               )}
             </div>

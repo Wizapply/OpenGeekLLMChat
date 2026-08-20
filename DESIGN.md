@@ -5982,8 +5982,11 @@ evict とアイドルアンロードの両方が同じ判定を使う。
 ## 📄 PDF OCR パイプライン (ocr.js)
 
 スキャンPDFを Vision LLM で Markdown 化し、そのまま永続RAGに載せるまでを1本の
-ジョブとして扱う機構。UI は `/ocr.html`、実処理は `ocr.js` に閉じ込め、`server.js`
+ジョブとして扱う機構。UI は `/rag.html`（永続RAG登録画面）の「📄 PDF OCR登録」タブ、
+実処理は `ocr.js` に閉じ込め、`server.js`
 には HTTP エンドポイントだけを置く（`google_drive.js` / `llm_pool.js` と同じ構成）。
+HTML/Webページを同じ流れで登録する `html_rag.js`（HtmlRAG方式のクリーニング →
+Markdown 変換）も同型の構成で、同じ画面の「🌐 HTML / Web登録」タブから使う。
 
 ### なぜこの構成なのか
 

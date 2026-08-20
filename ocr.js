@@ -145,7 +145,7 @@ function receiveMultipartToFile(req, { maxBytes, destPath }) {
 
     function done() {
       if (finished) return;
-      if (!fileInfo) return cleanupAndReject(new Error('ファイルパートが見つかりません (name="file" で PDF を送ってください)'));
+      if (!fileInfo) return cleanupAndReject(new Error('ファイルパートが見つかりません (name="file" でファイルを送ってください)'));
       finished = true;
       if (ws) ws.end(() => resolve({ file: fileInfo, fields }));
       else resolve({ file: fileInfo, fields });
@@ -1222,6 +1222,9 @@ function createOcrManager({
     health,
     checkDeps,
     checkVlm,
+    // html_rag.js の画像解析が同じ Vision LLM 設定 (vlmPoolModel / vlmEndpoint) を
+    // 共用するために公開する。返り値の release() を必ず呼ぶこと
+    acquireVlm,
     receiveUpload,
     listJobs,
     getJob,
@@ -1237,4 +1240,7 @@ module.exports = {
   createOcrManager,
   sanitizePdfName,
   humanBytes,
+  // html_rag.js が同じアップロード受信機構を使う (実装を二重に持たないため)
+  receiveMultipartToFile,
+  uniqueName,
 };

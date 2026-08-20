@@ -1,0 +1,99 @@
+  /* ─── HTML / RAG登録 画面固有のスタイル ───
+     レイアウト・ボタン等の共通部品は tuning-styles.css、
+     ドロップ領域・ジョブカード・進捗バーは ocr-styles.css (ocr-*) を共用する。
+     ここには「URL入力フォーム」と「取り込み元バッジ」だけを足す。 */
+
+  /* ─── URL入力フォーム ─── */
+  .hrag-url-form {
+    display: flex;
+    gap: 8px;
+    align-items: stretch;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  .hrag-url-input {
+    flex: 1 1 320px;
+    min-width: 200px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-active);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-size: 13px;
+    font-family: var(--font-mono);
+    padding: 10px 12px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .hrag-url-input:focus { border-color: var(--accent); }
+  .hrag-url-input::placeholder { color: var(--text-muted); font-family: var(--font-main); }
+  .hrag-title-input {
+    flex: 0 1 200px;
+    min-width: 140px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-active);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-size: 13px;
+    padding: 10px 12px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .hrag-title-input:focus { border-color: var(--accent); }
+  .hrag-title-input::placeholder { color: var(--text-muted); }
+  .hrag-url-form .btn { white-space: nowrap; }
+
+  /* リンク先も取り込む (1階層クロール) のチェックボックス */
+  .hrag-crawl-opt {
+    flex-basis: 100%;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+  }
+  .hrag-crawl-opt:hover { color: var(--text-primary); }
+  .hrag-crawl-opt input { accent-color: var(--accent); cursor: pointer; }
+
+  /* ドロップ領域とURLフォームの間の区切り */
+  .hrag-or {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 14px 0;
+    color: var(--text-muted);
+    font-size: 11px;
+  }
+  .hrag-or::before, .hrag-or::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  /* ─── 取り込み元バッジ (📁ローカル / 🌐URL) ─── */
+  .hrag-source {
+    font-size: 11px;
+    padding: 3px 9px;
+    border-radius: 20px;
+    white-space: nowrap;
+    background: var(--bg-hover);
+    color: var(--text-secondary);
+  }
+  .hrag-source.url { background: var(--blue-dim); color: var(--blue); }
+
+  /* ジョブカード内の元URL表示 */
+  .hrag-job-url {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    word-break: break-all;
+    margin-bottom: 8px;
+  }
+  .hrag-job-url a { color: var(--text-muted); text-decoration: none; }
+  .hrag-job-url a:hover { color: var(--accent); text-decoration: underline; }
+
+  @media (max-width: 768px) {
+    .hrag-title-input { flex: 1 1 100%; }
+  }

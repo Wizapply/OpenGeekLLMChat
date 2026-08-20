@@ -12,6 +12,7 @@ const { createLlmPool } = require('./llm_pool');
 const { createOrchestrator, validateWorkflow } = require('./orchestrator');
 const { createGoogleDrive } = require('./google_drive');
 const { createOcrManager } = require('./ocr');
+const { createHtmlRagManager } = require('./html_rag');
 
 // systemd等で起動された際、カレントディレクトリをserver.jsと同じに固定する
 // これにより相対パスでアクセスされるリソース(モデルキャッシュ等)も安定動作する
@@ -202,6 +203,55 @@ const DEFAULT_CONFIG = {
     keepPdf: true,              // 完了後もアップロードしたPDFを uploads に残すか
     prompt: 'この画像は書籍のスキャンページです。以下の形式で出力してください:\n1. 本文はレイアウトを保ちつつ Markdown で出力\n2. 見出しは # / ## / ### を使う\n3. 表は Markdown テーブルで出力\n4. 数式は $ ... $ (インライン) / $$ ... $$ (ブロック) の LaTeX で出力\n5. 図・写真がある場合は [図: 説明] のように記載\n6. ヘッダ・フッタ・ノンブル (ページ番号) は無視してよい\n7. 原文の言語と字体をそのまま保つこと。日本語のページは日本語 (日本の漢字) で出力し、簡体字・繁体字に置き換えないでください\n余計な前置きや解説は一切不要、本文のみ出力してください。',
   },
+  // ─── HTML / RAG登録 (HtmlRAG) 設定 ───
+  // Webページやローカルの HTML を、HtmlRAG (WWW 2025) 流の「HTMLクリーニング」
+  // (script/style/コメント除去 → 属性除去 → 空タグ除去・冗長な入れ子の統合) で
+  // ノイズを落とし、構造を保った Markdown にして永続RAGへ自動登録する。
+  // 入力はローカルの .html アップロードと URL 指定の2系統。GPUは使わない。
+  // 実装: html_rag.js (依存ライブラリなし)
+  htmlRag: {
+    enabled: true,
+    allowUrlFetch: true,        // URL指定の取り込みを許可するか (falseでアップロードのみ)
+    maxUploadMB: 20,            // 1ファイルのアップロード上限(MB)
+    maxFetchMB: 20,             // URL取得のダウンロード上限(MB)
+    fetchTimeoutSec: 60,        // URL取得のタイムアウト(秒)
+    // 取得時の User-Agent。既定はWeb検索機能と同じブラウザUA (botとして弾かれにくい)
+    userAgent: '',
+    // ループバック/プライベートIPリテラルへの取得を拒否する (サーバーを外部公開して
+    // いて、URL指定でイントラネットを覗かれたくない場合に true)。ホスト名の
+    // DNS解決先までは検査しない簡易ガードなので、本気の隔離はネットワーク側で行うこと
+    blockPrivateHosts: false,
+    dropBoilerplate: true,      // nav / header / footer / aside (サイトの枠) を捨てるか
+    preferMainContent: true,    // <main> / <article> があればそこだけ取り込むか
+    // 登録フォーマット: 'markdown' (既定。構造をMarkdown記法へ変換して登録) か
+    // 'html' (クリーン済みHTMLをタグごと登録する、HtmlRAG論文に忠実なモード)
+    registerFormat: 'markdown',
+    maxConcurrentJobs: 2,       // 同時実行ジョブ数 (GPU不要なので2並列を既定に)
+    jobsFile: 'ml/htmlrag/jobs.json',  // ジョブ状態の永続化先
+    autoRegisterToRag: true,    // 完了後に自動でRAG登録するか
+    keepHtml: true,             // 取得/アップロードした元HTMLを uploads に残すか
+    // ── 1階層クロール (リンク先の同時取り込み) ──
+    // URL取り込みで「リンク先も取り込む」を選ぶと、起点ページと同一パス配下の
+    // リンクを1階層だけ辿ってまとめて登録する。深さ2以上はページ数が際限なく
+    // 増えてRAGを汚すので対応しない。ページごとのサイズ上限は maxFetchMB が効く
+    crawlEnabled: true,         // UIに「リンク先も取り込む」の選択肢を出すか
+    crawlMaxPages: 20,          // 1ジョブの最大ページ数 (起点ページ含む。20〜30程度を推奨)
+    crawlDelayMs: 1000,         // ページ間の取得間隔(ms)。相手サイトへの負荷配慮
+    crawlRespectRobots: true,   // robots.txt (User-agent: *) の Disallow を尊重する
+    // ── 画像の内容解析 (Vision LLM / OCR) ──
+    // ページ内の <img> をダウンロードし、OCR機能と同じ Vision LLM
+    // (ocr.vlmPoolModel または ocr.vlmEndpoint) で説明・文字起こしを作って
+    // Markdown に「> 画像の内容: ...」として含める。Vision LLM が未設定・
+    // 停止中の場合はジョブを止めず、スキップした旨を記録する
+    describeImages: true,       // 画像の内容解析を行うか
+    imageMaxPerPage: 8,         // 1ページで解析する画像の上限
+    imageMinKB: 10,             // これ未満の画像 (アイコン・トラッカー等) はスキップ
+    imageMaxMB: 8,              // 1枚のダウンロード上限(MB)
+    imageMaxTokens: 1024,       // 1枚あたりの説明の生成上限トークン
+    imageTimeoutSec: 180,       // 1枚の解析タイムアウト(秒)
+    // Vision LLM への指示。空なら html_rag.js の既定 (説明+OCR+表+グラフ) を使う
+    imagePrompt: '',
+  },
   ragTopK: 10,
   ragMode: 'agentic',
   // ─── 永続RAG のチャンク分割 / 文脈拡張 ───
@@ -356,7 +406,7 @@ function loadConfig() {
     if (fs.existsSync(CONFIG_FILE)) {
       const userConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
       const merged = { ...DEFAULT_CONFIG, ...userConfig };
-      ['systemPrompts', 'agentContext', 'contextCompaction', 'transcribe', 'llamaServer', 'embeddingModel', 'ml', 'irodoriTts', 'orchestration', 'googleDrive', 'ocr'].forEach(key => {
+      ['systemPrompts', 'agentContext', 'contextCompaction', 'transcribe', 'llamaServer', 'embeddingModel', 'ml', 'irodoriTts', 'orchestration', 'googleDrive', 'ocr', 'htmlRag'].forEach(key => {
         if (DEFAULT_CONFIG[key] && typeof DEFAULT_CONFIG[key] === 'object') {
           merged[key] = { ...DEFAULT_CONFIG[key], ...(userConfig[key] || {}) };
         }
@@ -4080,7 +4130,7 @@ function requirePermission(perm) {
 app.get('/config', (req, res) => {
   // 公開しない: password, llamaServer内のbinPath, embeddingModelの実体パス, ml.apiTokens(機密),
   //             googleDrive の clientId/clientSecret/サービスアカウント鍵(機密)
-  const { password, llamaServer, embeddingModel, ml, irodoriTts, googleDrive, ocr: ocrCfg, ...rest } = appConfig;
+  const { password, llamaServer, embeddingModel, ml, irodoriTts, googleDrive, ocr: ocrCfg, htmlRag: htmlRagCfg, ...rest } = appConfig;
   const safeConfig = {
     ...rest,
     // llamaServer情報は最小限のみ
@@ -4092,6 +4142,13 @@ app.get('/config', (req, res) => {
       enabled: ocrCfg ? ocrCfg.enabled !== false : false,
       maxUploadMB: parseInt(ocrCfg?.maxUploadMB) || 300,
       autoRegisterToRag: ocrCfg ? ocrCfg.autoRegisterToRag !== false : true,
+    },
+    // HTML/RAG も UI の出し分けに要るぶんだけ
+    htmlRag: {
+      enabled: htmlRagCfg ? htmlRagCfg.enabled !== false : false,
+      allowUrlFetch: htmlRagCfg ? htmlRagCfg.allowUrlFetch !== false : true,
+      maxUploadMB: parseInt(htmlRagCfg?.maxUploadMB) || 20,
+      autoRegisterToRag: htmlRagCfg ? htmlRagCfg.autoRegisterToRag !== false : true,
     },
   };
   // Google Drive は「使えるか / 書けるか」だけ公開。認証情報は一切出さない
@@ -9537,6 +9594,175 @@ app.delete('/ocr/jobs/:jobId', requireAuth, requirePermission('ml:write'), (req,
   try {
     const r = ocr.deleteJob(req.params.jobId, { keepFiles: req.query.keepFiles === '1' });
     log(ip, `[OCR] ジョブ削除: ${req.params.jobId}`);
+    res.json(r);
+  } catch (e) { ocrError(res, e); }
+});
+
+// ════════════════════════════════════════════════
+// HTML / RAG登録 (HtmlRAG: HTML → クリーニング → Markdown → RAG登録)
+// ════════════════════════════════════════════════
+// ローカルの HTML ファイル、または URL で指定した Web ページを、HtmlRAG 流の
+// クリーニングでノイズを落とし、構造を保った Markdown にして永続RAGへ自動登録する。
+// チャット側は追加実装なしで search_persistent_documents から参照できる。
+// 実処理は html_rag.js (パーサ・クリーニング・ジョブキュー) に閉じ込めてある。
+
+const htmlRag = createHtmlRagManager({
+  getConfig: () => appConfig.htmlRag,
+  baseDir: __dirname,
+  uploadsDir: UPLOADS_DIR,
+  log: (ip, msg) => log(ip, msg),
+  ragIngestFile: (filename) => ragIngestFile(filename),
+  ragDeleteDoc: (docId) => ragDeleteDocById(docId),
+  ensureEmbedding: () => ensureEmbeddingLoaded(),
+  checkEmbedding: () => isEmbeddingAvailable(),
+  // 画像の内容解析 (htmlRag.describeImages) は OCR と同じ Vision LLM 設定
+  // (ocr.vlmPoolModel / ocr.vlmEndpoint) を共用する。プール管理なら解析中だけ
+  // ロードされ、終わればアイドルアンロードに任せる (OCRジョブと同じ挙動)
+  vlm: {
+    check: () => ocr.checkVlm(),
+    acquire: () => ocr.acquireVlm(),
+  },
+});
+
+// 起動時: 実行中のまま落ちたジョブを「待機中」に戻す
+htmlRag.restoreOnBoot();
+
+// HTML/RAG機能が無効なら以降に進ませないゲート
+function requireHtmlRag(req, res, next) {
+  if (!htmlRag.isEnabled()) {
+    return res.status(503).json({ error: 'HTML/RAG機能が無効です (config.json の htmlRag.enabled を true にしてください)' });
+  }
+  next();
+}
+
+// jobId の形式チェック (パス要素としてそのまま使うので厳格に)
+function validHtmlRagJobId(id) {
+  return typeof id === 'string' && /^hrag_\d+_[a-z0-9]+$/.test(id);
+}
+
+// 機能の状態 (URL取得可否・embedding・クロール・画像解析の有無)。UIが事前に警告を出すために使う
+app.get('/htmlrag/status', requireAuth, requirePermission('ml:read'), async (req, res) => {
+  try { res.json(await htmlRag.health()); }
+  catch (e) { ocrError(res, e); }
+});
+
+// HTML アップロード → ジョブ登録
+// multipart/form-data (name は任意) か、Content-Type: text/html の生ボディ。
+// 生ボディの場合はファイル名を ?name= か X-Filename ヘッダーで渡す。
+// autostart=0 を付けない限り、登録後そのまま実行キューに載せる。
+app.post('/htmlrag/upload', requireAuth, requirePermission('ml:write'), requireHtmlRag, async (req, res) => {
+  const ip = getIP(req);
+  let job;
+  try {
+    job = await htmlRag.receiveUpload(req, { ip });
+  } catch (e) {
+    return ocrError(res, e);
+  }
+  if (req.query.autostart !== '0') {
+    try {
+      job = htmlRag.startJob(job.jobId);
+    } catch (e) {
+      return res.status(202).json({ job, started: false, warning: e.message });
+    }
+    return res.json({ job, started: true });
+  }
+  res.json({ job, started: false });
+});
+
+// URL 指定でのジョブ登録 (取得はジョブ実行時に行う)
+// body: { url: "https://...", title?: "任意の表示名", crawl?: true }
+//   crawl: 同一パス配下のリンクを1階層だけ辿ってまとめて取り込む (htmlRag.crawl* 設定に従う)
+app.post('/htmlrag/url', requireAuth, requirePermission('ml:write'), requireHtmlRag, jsonParser, (req, res) => {
+  const ip = getIP(req);
+  const { url, title, crawl } = req.body || {};
+  if (!url) return res.status(400).json({ error: 'url が必要です' });
+  let job;
+  try {
+    job = htmlRag.addUrlJob(url, { title, crawl: crawl === true, ip });
+  } catch (e) {
+    return ocrError(res, e);
+  }
+  if (req.query.autostart !== '0') {
+    try {
+      job = htmlRag.startJob(job.jobId);
+    } catch (e) {
+      return res.status(202).json({ job, started: false, warning: e.message });
+    }
+    return res.json({ job, started: true });
+  }
+  res.json({ job, started: false });
+});
+
+// ジョブ一覧
+app.get('/htmlrag/jobs', requireAuth, requirePermission('ml:read'), (req, res) => {
+  res.json({ jobs: htmlRag.listJobs() });
+});
+
+// 個別ジョブ
+app.get('/htmlrag/jobs/:jobId', requireAuth, requirePermission('ml:read'), (req, res) => {
+  if (!validHtmlRagJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const job = htmlRag.getJob(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'ジョブが見つかりません' });
+  res.json({ job });
+});
+
+// 進捗のリアルタイム配信 (SSE)。フェーズが進むごとに status イベントが飛ぶ
+app.get('/htmlrag/jobs/:jobId/stream', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const jobId = req.params.jobId;
+  if (!validHtmlRagJobId(jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const job = htmlRag.getJob(jobId);
+  if (!job) return res.status(404).json({ error: 'ジョブが見つかりません' });
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+
+  const send = (event) => {
+    if (!res.writableEnded) res.write(`data: ${JSON.stringify(event)}\n\n`);
+  };
+  send({ type: 'status', job });
+
+  const unsubscribe = htmlRag.subscribe(jobId, send);
+  const ping = setInterval(() => { if (!res.writableEnded) res.write(': ping\n\n'); }, 15000);
+
+  req.on('close', () => {
+    clearInterval(ping);
+    unsubscribe();
+  });
+});
+
+// ジョブ開始 (失敗・中断したジョブの再実行もこれ)。完了済みを取り込み直す時は {redo: true}
+// (URLジョブはページを取得し直すので、更新されたページの再取り込みになる)
+app.post('/htmlrag/jobs/:jobId/start', requireAuth, requirePermission('ml:write'), requireHtmlRag, jsonParser, (req, res) => {
+  if (!validHtmlRagJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const body = req.body || {};
+  try {
+    res.json({ job: htmlRag.startJob(req.params.jobId, { redo: body.redo === true }) });
+  } catch (e) { ocrError(res, e); }
+});
+
+// 実行中ジョブの中断 (URL取得中なら fetch を打ち切る)
+app.post('/htmlrag/jobs/:jobId/cancel', requireAuth, requirePermission('ml:write'), (req, res) => {
+  if (!validHtmlRagJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const ip = getIP(req);
+  try {
+    const job = htmlRag.cancelJob(req.params.jobId);
+    log(ip, `[HTML-RAG] キャンセル要求: ${job.title}`);
+    res.json({ job });
+  } catch (e) { ocrError(res, e); }
+});
+
+// ジョブ削除 (元HTML・生成Markdown・RAG登録をまとめて削除)
+// ?keepFiles=1 でジョブ記録だけ消してファイルは残す
+app.delete('/htmlrag/jobs/:jobId', requireAuth, requirePermission('ml:write'), (req, res) => {
+  if (!validHtmlRagJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const ip = getIP(req);
+  try {
+    const r = htmlRag.deleteJob(req.params.jobId, { keepFiles: req.query.keepFiles === '1' });
+    log(ip, `[HTML-RAG] ジョブ削除: ${req.params.jobId}`);
     res.json(r);
   } catch (e) { ocrError(res, e); }
 });
