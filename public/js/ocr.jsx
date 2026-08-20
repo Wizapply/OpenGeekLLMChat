@@ -554,10 +554,11 @@ function JobCard({ job, onStart, onCancel, onRedo, onDelete }) {
         )}
         {job.status === 'completed' && job.mdFilename && (
           <>
-            <a className="btn small" href={`/files/${encodeURIComponent(job.mdFilename)}?raw=1`} download={job.mdFilename}>
+            {/* ジョブファイルは uploads/ragfiles (永続RAGの管理フォルダ、認証付き配信) に置かれている */}
+            <a className="btn small" href={`/uploads/ragfiles/${encodeURIComponent(job.mdFilename)}`} download={job.mdFilename}>
               ⬇ Markdown
             </a>
-            <a className="btn small" href={`/uploads/${encodeURIComponent(job.filename)}`} target="_blank" rel="noreferrer">
+            <a className="btn small" href={`/uploads/ragfiles/${encodeURIComponent(job.filename)}`} target="_blank" rel="noreferrer">
               📕 元PDF
             </a>
           </>

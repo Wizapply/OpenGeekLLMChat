@@ -30,8 +30,12 @@
  * 入力は2系統:
  *   - ローカルの .html/.htm ファイルのアップロード
  *   - URL 指定 (サーバーが Web ページを取得する)
- * どちらも元 HTML を public/uploads/ に保存し、生成物を ragIngestFile() で
- * 永続RAGへ登録する。チャットは追加実装なしで search_persistent_documents から参照できる。
+ * どちらも元 HTML を public/uploads/ragfiles/ (永続RAGの管理フォルダ) に保存し、
+ * 生成物を ragIngestFile() で永続RAGへ登録する。チャットは追加実装なしで
+ * search_persistent_documents から参照できる。
+ * 管理フォルダはユーザーのサーバーファイル一覧・LLMのファイルツールから隠されている
+ * (server.js 側で遮断)。旧バージョンが uploads 直下に置いたジョブファイルは、
+ * 起動時 (restoreOnBoot) に管理フォルダへ自動移行する。
  *
  * 方針:
  * - 依存を増やさない。HTML のパースも自前の軽量トークナイザで行う
@@ -853,7 +857,8 @@ function titleFromUrl(rawUrl) {
  * @param {object}   deps
  * @param {function} deps.getConfig         () => appConfig.htmlRag
  * @param {string}   deps.baseDir           サーバーのルート (相対パス解決の基準)
- * @param {string}   deps.uploadsDir        public/uploads の絶対パス
+ * @param {string}   deps.uploadsDir        ジョブファイル置き場 (public/uploads/ragfiles) の絶対パス
+ * @param {string}   [deps.legacyUploadsDir] 旧バージョンの置き場 (public/uploads)。起動時にここから移行する
  * @param {function} deps.log               (ip, message) => void
  * @param {function} [deps.ragIngestFile]   (filename) => Promise<{docId, chunkCount}>
  * @param {function} [deps.ragDeleteDoc]    (docId) => void
@@ -867,6 +872,7 @@ function createHtmlRagManager({
   getConfig,
   baseDir,
   uploadsDir,
+  legacyUploadsDir = null,
   log = () => {},
   ragIngestFile = null,
   ragDeleteDoc = null,
@@ -889,6 +895,7 @@ function createHtmlRagManager({
 
   function ensureDirs() {
     try { fs.mkdirSync(path.dirname(jobsFile()), { recursive: true }); } catch {}
+    try { fs.mkdirSync(uploadsDir, { recursive: true }); } catch {}
   }
 
   function loadJobs() {
@@ -1665,9 +1672,40 @@ function createHtmlRagManager({
     return { ok: true };
   }
 
+  /**
+   * 旧バージョンが uploads 直下に置いたジョブファイル (元HTML / 成果物) を
+   * 管理フォルダ (uploads/ragfiles) へ移す。起動時に一度だけ呼ばれる。
+   * ジョブはファイル名しか持たないので、置き場を変えるだけで参照はそのまま生きる。
+   */
+  function migrateLegacyFiles() {
+    if (!legacyUploadsDir || path.resolve(legacyUploadsDir) === path.resolve(uploadsDir)) return 0;
+    let moved = 0;
+    for (const job of loadJobs()) {
+      for (const key of ['filename', 'mdFilename']) {
+        const name = job[key];
+        // ジョブ由来の名前はサニタイズ済みの basename のはずだが、
+        // 手で編集された jobs.json に備えてパス要素を含む名前は触らない
+        if (!name || typeof name !== 'string') continue;
+        if (name !== path.basename(name) || name.startsWith('.')) continue;
+        const from = path.join(legacyUploadsDir, name);
+        const to = path.join(uploadsDir, name);
+        try {
+          if (!fs.existsSync(from) || fs.existsSync(to)) continue;
+          fs.renameSync(from, to);
+          moved++;
+        } catch {}
+      }
+    }
+    if (moved > 0) {
+      log('-', `[HTML-RAG] 既存ジョブのファイル ${moved} 件を uploads 直下から管理フォルダ (uploads/ragfiles) へ移動しました`);
+    }
+    return moved;
+  }
+
   /** 起動時の復元。実行中のまま落ちたジョブは「待機中」に戻す */
   function restoreOnBoot() {
     ensureDirs();
+    migrateLegacyFiles();
     const list = loadJobs();
     let n = 0;
     for (const job of list) {

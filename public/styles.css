@@ -2414,11 +2414,19 @@
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    width: min(1200px, 96vw);
-    height: min(820px, 92vh);
+    /* 画面端から最低40pxの余白を確保する (端いっぱいまで広がると圧迫感があるため) */
+    width: min(1200px, calc(100vw - 80px));
+    height: min(820px, calc(100vh - 80px));
     display: flex;
     flex-direction: column;
     box-shadow: var(--shadow);
+  }
+  /* 狭い画面では余白を欲張らず表示領域を優先する */
+  @media (max-width: 700px) {
+    .src-modal {
+      width: calc(100vw - 32px);
+      height: calc(100vh - 32px);
+    }
   }
   .src-modal-body {
     flex: 1;

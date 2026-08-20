@@ -69,13 +69,15 @@ LLMが直接サーバーのファイルシステムに `.py` / `.xml` / `.json` 
 **流れ**
 
 ```
-PDF アップロード
+PDF アップロード → public/uploads/ragfiles/<名前>.pdf に保存
   → pdftoppm で1ページずつ 300dpi PNG 化
   → Vision LLM (Qwen2.5-VL 等) に投げて Markdown 化
   → ページ単位でキャッシュ (ml/ocr/cache/<jobId>/pXXXX.md)
-  → 全ページ結合 → public/uploads/<名前>.md
+  → 全ページ結合 → public/uploads/ragfiles/<名前>.md
   → ragIngestFile() で RAG 登録 → search_persistent_documents から参照可能
 ```
+
+元PDFと生成Markdownは `uploads` 直下ではなく**管理フォルダ `public/uploads/ragfiles/`** に保存されます。サーバーファイル一覧（右サイドバー / `GET /files`）や LLM のファイルツール（`list_files` / `read_file` / `write_file`）、Drive連携には出てこないので、RAG登録を重ねてもユーザーのファイル置き場が散らかりません（ダウンロードはRAG登録画面のボタンから、認証付きの `/uploads/ragfiles/*` ルートで配信）。ジョブを削除すればファイルも一緒に片付きます。旧バージョンが `uploads` 直下に保存したジョブファイルは、サーバー起動時に自動で `ragfiles/` へ移動されます。
 
 **特徴**
 
@@ -163,7 +165,7 @@ curl -X POST 'http://localhost:3000/ocr/upload?name=book.pdf' \
   -H 'Content-Type: application/pdf' --data-binary @book.pdf
 ```
 
-**セキュリティ**: 拡張子・MIMEタイプ・ファイル先頭の `%PDF-` を三重にチェックし、ファイル名はサニタイズして `uploads` 直下に固定します。300MB（`ocr.maxUploadMB`）を超えるものとディスク残量不足は受信時に弾きます。
+**セキュリティ**: 拡張子・MIMEタイプ・ファイル先頭の `%PDF-` を三重にチェックし、ファイル名はサニタイズして管理フォルダ `uploads/ragfiles` 直下に固定します。300MB（`ocr.maxUploadMB`）を超えるものとディスク残量不足は受信時に弾きます。
 
 ### 🌐 HTML / RAG登録（HtmlRAG: Webページ・HTMLファイル → クリーニング → RAG自動登録）
 
@@ -186,7 +188,8 @@ URL指定 or HTMLアップロード
   → (describeImages 有効時) ページ内の画像を Vision LLM で説明・文字起こし (OCR)
       モデルは ocr.vlmPoolModel / ocr.vlmEndpoint を共用
   → 構造を保った Markdown 化 (見出し→#、表→テーブル、コード→フェンス、リスト→箇条書き)
-  → public/uploads/<タイトル>.md に保存 (クロール時はページごとに出典URL付きセクション)
+  → public/uploads/ragfiles/<タイトル>.md に保存 (クロール時はページごとに出典URL付きセクション)
+      ※元HTML・成果物とも管理フォルダ uploads/ragfiles/ に置かれ、ファイル一覧やLLMツールには出ない (OCRと同じ)
   → ragIngestFile() で RAG 登録 → search_persistent_documents から参照可能
 ```
 
@@ -232,7 +235,7 @@ curl -X POST 'http://localhost:3000/htmlrag/upload' \
   -F 'file=@page.html'
 ```
 
-**セキュリティ**: URL取得は http/https のみ。`htmlRag.blockPrivateHosts` を true にすると、ループバック・プライベートIPリテラルへの取得を拒否します（サーバーを外部公開していて、URL指定でイントラネットを覗かれたくない場合）。アップロードは拡張子とタグの存在を確認し、ファイル名はサニタイズして `uploads` 直下に固定します。
+**セキュリティ**: URL取得は http/https のみ。`htmlRag.blockPrivateHosts` を true にすると、ループバック・プライベートIPリテラルへの取得を拒否します（サーバーを外部公開していて、URL指定でイントラネットを覗かれたくない場合）。アップロードは拡張子とタグの存在を確認し、ファイル名はサニタイズして管理フォルダ `uploads/ragfiles` 直下に固定します。
 
 ### 🎯 ドラッグ&ドロップ統合UI
 3つのドロップゾーンが状況に応じて自動で振り分け:
@@ -1307,7 +1310,7 @@ opengeek-llm-chat/
 | `ocr.cacheDir` / `jobsFile` | ページキャッシュとジョブ状態の保存先（中断ジョブの再開・再起動復元に使う） |
 | `ocr.pdfToImageCmd` / `pdfInfoCmd` | poppler-utils のコマンド名。PATHが通っていなければ絶対パスを指定（Windows は `"C:/poppler/Library/bin/pdftoppm.exe"` のように `/` 区切りが書きやすい） |
 | `ocr.autoRegisterToRag` | 完了後に生成Markdownを自動でRAG登録するか（既定true） |
-| `ocr.keepPdf` | 完了後もアップロードしたPDFを `uploads/` に残すか（既定true） |
+| `ocr.keepPdf` | 完了後もアップロードしたPDFを `uploads/ragfiles/` に残すか（既定true） |
 | `ocr.prompt` | Vision LLM に渡すOCR指示。表・数式・図の扱いをここで調整する |
 | `htmlRag.enabled` | HTML / RAG登録機能 ON/OFF（依存パッケージ・GPU不要） |
 | `htmlRag.allowUrlFetch` | URL指定の取り込みを許可するか（false でローカルHTMLのアップロードのみ） |
@@ -1320,7 +1323,7 @@ opengeek-llm-chat/
 | `htmlRag.registerFormat` | `"markdown"`（既定。構造をMarkdown記法へ変換して登録）か `"html"`（クリーン済みHTMLをタグごと登録する、HtmlRAG論文に忠実なモード） |
 | `htmlRag.maxConcurrentJobs` | 同時実行ジョブ数（GPU不要なので既定2） |
 | `htmlRag.autoRegisterToRag` | 完了後に自動でRAG登録するか（既定true） |
-| `htmlRag.keepHtml` | 取得/アップロードした元HTMLを `uploads/` に残すか（既定true） |
+| `htmlRag.keepHtml` | 取得/アップロードした元HTMLを `uploads/ragfiles/` に残すか（既定true） |
 | `htmlRag.crawlEnabled` | UIに「🔗 リンク先も取り込む」（1階層クロール）の選択肢を出すか（既定true） |
 | `htmlRag.crawlMaxPages` | 1ジョブの最大ページ数（起点ページ含む。既定20、20〜30程度を推奨） |
 | `htmlRag.crawlDelayMs` | クロール時のページ間の取得間隔（ms、既定1000。相手サイトへの負荷配慮） |
@@ -2271,6 +2274,8 @@ requests.post(f"{BASE}/rag/documents", headers=H, verify=False, json={
 # 登録一覧
 print(requests.get(f"{BASE}/rag/documents", headers=H, verify=False).json())
 ```
+
+OCR / HTML取り込みが管理フォルダ `uploads/ragfiles/` に置いたファイル（自動登録に失敗した生成Markdownなど）を手動で登録し直す場合は、`"filename": "ragfiles/<名前>.md"` のように `ragfiles/` プレフィックスを付けて指定します（docId はプレフィックスを除いた名前で計算されるので、自動登録と同じドキュメントとして上書きされます）。
 
 ### 対応ファイル形式
 

@@ -200,7 +200,7 @@ const DEFAULT_CONFIG = {
     pdfToImageCmd: 'pdftoppm',  // PDF→PNG 変換コマンド (poppler-utils)
     pdfInfoCmd: 'pdfinfo',      // ページ数取得コマンド (poppler-utils)
     autoRegisterToRag: true,    // 完了後に自動でRAG登録するか
-    keepPdf: true,              // 完了後もアップロードしたPDFを uploads に残すか
+    keepPdf: true,              // 完了後もアップロードしたPDFを uploads/ragfiles に残すか
     prompt: 'この画像は書籍のスキャンページです。以下の形式で出力してください:\n1. 本文はレイアウトを保ちつつ Markdown で出力\n2. 見出しは # / ## / ### を使う\n3. 表は Markdown テーブルで出力\n4. 数式は $ ... $ (インライン) / $$ ... $$ (ブロック) の LaTeX で出力\n5. 図・写真がある場合は [図: 説明] のように記載\n6. ヘッダ・フッタ・ノンブル (ページ番号) は無視してよい\n7. 原文の言語と字体をそのまま保つこと。日本語のページは日本語 (日本の漢字) で出力し、簡体字・繁体字に置き換えないでください\n余計な前置きや解説は一切不要、本文のみ出力してください。',
   },
   // ─── HTML / RAG登録 (HtmlRAG) 設定 ───
@@ -229,7 +229,7 @@ const DEFAULT_CONFIG = {
     maxConcurrentJobs: 2,       // 同時実行ジョブ数 (GPU不要なので2並列を既定に)
     jobsFile: 'ml/htmlrag/jobs.json',  // ジョブ状態の永続化先
     autoRegisterToRag: true,    // 完了後に自動でRAG登録するか
-    keepHtml: true,             // 取得/アップロードした元HTMLを uploads に残すか
+    keepHtml: true,             // 取得/アップロードした元HTMLを uploads/ragfiles に残すか
     // ── 1階層クロール (リンク先の同時取り込み) ──
     // URL取り込みで「リンク先も取り込む」を選ぶと、起点ページと同一パス配下の
     // リンクを1階層だけ辿ってまとめて登録する。深さ2以上はページ数が際限なく
@@ -649,6 +649,8 @@ function buildAgentDeps() {
         for (const name of fs.readdirSync(dir)) {
           // 隠しファイル・隠しディレクトリ (.で始まる) は除外
           if (name.startsWith('.')) continue;
+          // 永続RAG管理フォルダ (uploads/ragfiles) はLLMにも見せない
+          if (!base && name.toLowerCase() === RAGFILES_DIRNAME) continue;
           const full = path.join(dir, name);
           const rel = base ? `${base}/${name}` : name;
           try {
@@ -4600,11 +4602,18 @@ app.post('/auth', jsonParser, (req, res) => {
 
 // ─── ユーザーファイルストレージ (public/uploads) ───
 const UPLOADS_DIR = path.join(__dirname, 'public', 'uploads');
+// 永続RAG関連ファイル (OCRの元PDF/生成Markdown、HTML取り込みの元HTML/成果物) の管理フォルダ。
+// ユーザーのサーバーファイルと混ざって一覧を埋め尽くさないよう uploads/ragfiles に隔離し、
+// ファイル一覧・LLMのファイルツール・Drive連携からは見えないようにする
+// (隠しファイルと同じ「一覧に出さないものは読み書きもさせない」方針。配信は認証付き専用ルートのみ)
+const RAGFILES_DIRNAME = 'ragfiles';
+const RAGFILES_DIR = path.join(UPLOADS_DIR, RAGFILES_DIRNAME);
 // アップロードファイル1個あたりの上限（config.jsonの maxFileSize で変更可能、デフォルト 50MB）
 const MAX_FILE_SIZE = (appConfig.maxFileSize || 50) * 1024 * 1024;
 
-// uploadsディレクトリ作成
+// uploads / ragfiles ディレクトリ作成
 try { fs.mkdirSync(UPLOADS_DIR, { recursive: true }); } catch {}
+try { fs.mkdirSync(RAGFILES_DIR, { recursive: true }); } catch {}
 
 // パス安全性チェック（ディレクトリトラバーサル対策）
 function safeUploadPath(relativePath) {
@@ -4618,10 +4627,28 @@ function safeUploadPath(relativePath) {
   // 隠しファイル・隠しディレクトリ (パス中のどこかのセグメントが . で始まる) を拒否
   // 一覧に出さないものは読み書きもさせない (整合性とセキュリティのため)
   if (clean.split(/[\/\\]/).some(seg => seg.startsWith('.'))) return null;
+  // 永続RAG管理フォルダは隠しフォルダと同じ扱いで遮断する
+  // (RAG側の読み書きは safeRagFilePath で解決する。Windows は大文字小文字を
+  //  区別しないため、判定も小文字化して行う)
+  if ((clean.split(/[\/\\]/)[0] || '').toLowerCase() === RAGFILES_DIRNAME) return null;
   // 絶対パスに解決
   const abs = path.resolve(UPLOADS_DIR, clean);
   // UPLOADS_DIR配下であることを確認
   if (!abs.startsWith(UPLOADS_DIR + path.sep) && abs !== UPLOADS_DIR) return null;
+  return abs;
+}
+
+// 永続RAG管理フォルダ (uploads/ragfiles) 内のパス解決。
+// safeUploadPath と同じトラバーサル/隠しファイル対策を、基準を RAGFILES_DIR にして行う
+function safeRagFilePath(relativePath) {
+  if (!relativePath || typeof relativePath !== 'string') return null;
+  let clean = relativePath.replace(/^[\/\\]+/, '');
+  clean = clean.replace(/^(public\/)?uploads[\/\\]/, '');
+  clean = clean.replace(/^ragfiles[\/\\]/i, '');
+  if (clean.includes('\0')) return null;
+  if (clean.split(/[\/\\]/).some(seg => seg.startsWith('.'))) return null;
+  const abs = path.resolve(RAGFILES_DIR, clean);
+  if (!abs.startsWith(RAGFILES_DIR + path.sep)) return null;
   return abs;
 }
 
@@ -4633,6 +4660,8 @@ app.get('/files', requireAuth, (req, res) => {
       for (const name of fs.readdirSync(dir)) {
         // 隠しファイル・隠しディレクトリ (.で始まる) は除外
         if (name.startsWith('.')) continue;
+        // 永続RAG管理フォルダ (uploads/ragfiles) はユーザーに見せない
+        if (!base && name.toLowerCase() === RAGFILES_DIRNAME) continue;
         const full = path.join(dir, name);
         const rel = base ? `${base}/${name}` : name;
         try {
@@ -5345,6 +5374,29 @@ app.get('/plots/*', requireAuth, (req, res) => {
   };
   res.setHeader('Content-Type', mimes[ext] || 'application/octet-stream');
   res.setHeader('Cache-Control', 'private, max-age=300');
+  fs.createReadStream(abs).pipe(res);
+});
+
+// ─── 永続RAG管理ファイルの配信（認証必須） ───
+// OCR/HTML取り込みの元ファイルと生成物は uploads/ragfiles に隔離してあり、
+// ファイル一覧 (/files) や LLM のファイルツールには出さない。
+// RAG登録画面 (rag.html) のダウンロード/プレビューだけがこのルートを使う。
+// 静的配信ミドルウェアより先に登録してあるので、こちら (要認証) が必ず勝つ。
+app.get('/uploads/ragfiles/*', requireAuth, (req, res) => {
+  const abs = safeRagFilePath(req.params[0]);
+  if (!abs) return res.status(400).json({ error: 'Invalid path' });
+  let stat = null;
+  try { stat = fs.statSync(abs); } catch {}
+  if (!stat || !stat.isFile()) return res.status(404).json({ error: 'Not found' });
+  const ext = path.extname(abs).toLowerCase();
+  const mimes = {
+    '.pdf': 'application/pdf',
+    '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8',
+    '.md': 'text/markdown; charset=utf-8', '.markdown': 'text/markdown; charset=utf-8',
+    '.txt': 'text/plain; charset=utf-8',
+  };
+  res.setHeader('Content-Type', mimes[ext] || 'application/octet-stream');
+  res.setHeader('Cache-Control', 'private, max-age=60');
   fs.createReadStream(abs).pipe(res);
 });
 
@@ -9075,7 +9127,8 @@ app.post('/ml/models/:name/predict', requireAuth, requirePermission('ml:read'), 
 // ════════════════════════════════════════════════
 // 外部API(ツール対応モード)用 永続RAGストア
 // ════════════════════════════════════════════════
-// 既存 uploads フォルダのファイルを embedding 化して保存し、
+// uploads フォルダのファイル (手動登録) や、OCR/HTML取り込みが管理フォルダ
+// uploads/ragfiles に置いた生成物を embedding 化して保存し、
 // agent_proxy の search_documents ツールから検索できるようにする。
 
 // テキストをチャンクに分割
@@ -9189,9 +9242,17 @@ function ragDocId(filename) {
   return crypto.createHash('sha1').update(filename).digest('hex').slice(0, 16);
 }
 
-// uploads のファイルを RAG 化して保存
-async function ragIngestFile(filename) {
-  const abs = safeUploadPath(filename);
+// uploads のファイルを RAG 化して保存。
+// ragDir: true (または "ragfiles/" プレフィックス付きの filename) は、OCR/HTML取り込みが
+// 生成物を置く管理フォルダ (uploads/ragfiles) 内のファイルを指す。
+// docId・表示名は管理フォルダのプレフィックスを除いた名前で計算するので、
+// 旧バージョン (uploads直下に保存) で登録済みのドキュメントとIDが揺れない。
+async function ragIngestFile(filename, { ragDir = false } = {}) {
+  let name = String(filename || '');
+  const m = name.match(/^ragfiles[\/\\](.+)$/i);
+  if (m) { ragDir = true; name = m[1]; }
+  filename = name;
+  const abs = ragDir ? safeRagFilePath(filename) : safeUploadPath(filename);
   if (!abs) throw new Error('無効なファイルパス');
   if (!fs.existsSync(abs)) throw new Error(`ファイルが見つかりません: ${filename}`);
   const stat = fs.statSync(abs);
@@ -9441,9 +9502,12 @@ function ragDeleteDocById(docId) {
 const ocr = createOcrManager({
   getConfig: () => appConfig.ocr,
   baseDir: __dirname,
-  uploadsDir: UPLOADS_DIR,
+  // 元PDF・生成Markdownは uploads 直下ではなく管理フォルダ (uploads/ragfiles) に置く。
+  // ユーザーのファイル一覧やLLMのファイルツールにRAG素材が混ざらないようにするため
+  uploadsDir: RAGFILES_DIR,
+  legacyUploadsDir: UPLOADS_DIR,   // 旧バージョンが uploads 直下に置いたファイルの移行元
   log: (ip, msg) => log(ip, msg),
-  ragIngestFile: (filename) => ragIngestFile(filename),
+  ragIngestFile: (filename) => ragIngestFile(filename, { ragDir: true }),
   ragDeleteDoc: (docId) => ragDeleteDocById(docId),
   ensureEmbedding: () => ensureEmbeddingLoaded(),
   // ocr.vlmPoolModel が設定されている時だけ使われる。OCRジョブの間だけ
@@ -9609,9 +9673,11 @@ app.delete('/ocr/jobs/:jobId', requireAuth, requirePermission('ml:write'), (req,
 const htmlRag = createHtmlRagManager({
   getConfig: () => appConfig.htmlRag,
   baseDir: __dirname,
-  uploadsDir: UPLOADS_DIR,
+  // 元HTML・成果物は OCR と同じく管理フォルダ (uploads/ragfiles) に置く
+  uploadsDir: RAGFILES_DIR,
+  legacyUploadsDir: UPLOADS_DIR,   // 旧バージョンが uploads 直下に置いたファイルの移行元
   log: (ip, msg) => log(ip, msg),
-  ragIngestFile: (filename) => ragIngestFile(filename),
+  ragIngestFile: (filename) => ragIngestFile(filename, { ragDir: true }),
   ragDeleteDoc: (docId) => ragDeleteDocById(docId),
   ensureEmbedding: () => ensureEmbeddingLoaded(),
   checkEmbedding: () => isEmbeddingAvailable(),

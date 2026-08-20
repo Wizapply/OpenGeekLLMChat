@@ -3234,7 +3234,7 @@ body, .app-layout, .chat-area {
      画像切替の useEffect が `currentImage` オブジェクト参照を依存にし、`if (currentImage)` ガードで `setBoxes` をスキップすると、前の画像の矩形が残留する (別画像にアノテーションが混入する危険)。対策は **(1) `gotoImage` で移動先の boxes を即座にセット (useEffectを待たない)、(2) 依存を `currentImageId` (画像ID) にし無条件で setBoxes**。矩形は `{...b}` でコピーし参照共有も防ぐ。
 
 116. **隠しファイル除外は `safeUploadPath` に集約**
-     uploads の隠しファイル (`.env` 等) を一覧から消すだけでなく、読み書きも遮断する。一覧の `walk` で `name.startsWith('.')` をスキップし、**`safeUploadPath` でパスの各セグメントが `.` 始まりなら null を返す**。後者がread/write/RAG登録など全経路を一元的にカバーするので、ブラウザ・外部API・LLMツールすべてに自動適用される。
+     uploads の隠しファイル (`.env` 等) を一覧から消すだけでなく、読み書きも遮断する。一覧の `walk` で `name.startsWith('.')` をスキップし、**`safeUploadPath` でパスの各セグメントが `.` 始まりなら null を返す**。後者がread/write/RAG登録など全経路を一元的にカバーするので、ブラウザ・外部API・LLMツールすべてに自動適用される。永続RAGの管理フォルダ `uploads/ragfiles` も同じ仕組みで遮断している（先頭セグメントが `ragfiles` なら null。Windows のファイルシステムは大文字小文字を区別しないので判定は小文字化して行う）。RAG側の読み書きは基準を `RAGFILES_DIR` にした `safeRagFilePath` で解決する。
 
 117. **自前 ZIP 生成 (外部 `zip` コマンド非依存)**
      モデルダウンロードで外部 `zip` コマンドに依存すると、本番に未インストールだと 500 エラー。Node 標準の `zlib.deflateRawSync` だけで ZIP を手書き生成する (`buildZipBuffer`)。CRC32 テーブル + ローカルファイルヘッダ + セントラルディレクトリ + EOCD を構築。DEFLATE/STORE 自動選択、UTF-8 ファイル名 (bit11)。一時ファイルも不要でメモリ上で完結するため `/tmp` 制限の影響も受けない。
@@ -5998,6 +5998,7 @@ Markdown 変換）も同型の構成で、同じ画面の「🌐 HTML / Web登�
 | ジョブは **既定1本ずつ**順次実行 | 単一GPUに Vision LLM (Qwen2.5-VL 7B ≒ 9GB) と embedding (≒1.5GB) を同居させる前提。並列にすると OOM する。`maxConcurrentJobs` で将来のマルチGPUに開けてある |
 | 1ページ失敗しても **ジョブは止めない** | 300ページ中1ページが崩れただけで全部無駄になるのは損。リトライ後スキップし、失敗ページを記録する |
 | RAG登録は **内部関数呼び出し** | `ragIngestFile()` を直接呼ぶ。自分自身に HTTP を投げると認証・タイムアウト・多重プロキシの面倒が増えるだけで得がない |
+| ジョブファイルは **`uploads/ragfiles/` に隔離** | 元PDF/元HTMLと生成Markdownを `uploads` 直下に置くと、登録を重ねるほどユーザーのサーバーファイル一覧 (`/files`) と LLM の `list_files` がRAG素材で埋まる。管理フォルダに隔離し、一覧・ファイルツール・Drive連携からは隠す（`safeUploadPath` が隠しファイルと同じ扱いで遮断）。ダウンロード/プレビューは認証付き専用ルート `/uploads/ragfiles/*` だけが窓口。docId はフォルダ名を含まない素のファイル名から計算するので、旧配置で登録済みのドキュメントとIDが揺れない。旧配置のジョブファイルは起動時 (`restoreOnBoot` → `migrateLegacyFiles`) に自動移行する |
 | Vision LLM は **LLMプールに載せられる** | 外部起動 (`vlmEndpoint`) だけだと、OCRが終わっても9GBが載りっぱなしになる。`ocr.vlmPoolModel` を設定すると `llm_pool.js` の管理下に入り、既存のアイドルアンロード・VRAM判定・退避をそのまま使える。プールを作り直すのではなく**既にある仕組みに相乗りする** |
 
 ### Vision LLM のライフサイクル
@@ -6072,7 +6073,7 @@ llama-server は起動中に少しずつ確保する。実測だけを見て選�
 ```
 POST /ocr/upload (multipart or 生PDFボディ)
   ↓ ストリームのままディスクへ (300MBをメモリに載せない)
-  ↓ 拡張子 / MIME / 先頭5バイト "%PDF-" の三重チェック → uploads/<sanitized>.pdf
+  ↓ 拡張子 / MIME / 先頭5バイト "%PDF-" の三重チェック → uploads/ragfiles/<sanitized>.pdf
   ↓ ジョブ登録 (status: pending) → 既定でそのまま start
   ↓
 [worker]  pdfinfo でページ数取得 (phase: analyze)
@@ -6090,7 +6091,7 @@ POST /ocr/upload (multipart or 生PDFボディ)
   ↓
   Vision LLM を release (以降は使わない)
   ↓
-  全ページ結合 → uploads/<title>.md                     (phase: merge)
+  全ページ結合 → uploads/ragfiles/<title>.md            (phase: merge)
   ↓
   ensureEmbeddingLoaded() → ragIngestFile(<title>.md)   (phase: rag)
   ↓
@@ -6168,7 +6169,7 @@ data: {"type":"progress","pageNo":42,"total":258,"done":42,"elapsed":91234,
 
 | 対策 | 実装 |
 |:--|:--|
-| パストラバーサル | `path.basename()` → 危険文字を `_` へ → 先頭ドット除去。`uploads` 直下に固定（サブディレクトリを作らせない） |
+| パストラバーサル | `path.basename()` → 危険文字を `_` へ → 先頭ドット除去。管理フォルダ `uploads/ragfiles` 直下に固定（サブディレクトリを作らせない） |
 | 拡張子偽装 | 拡張子・`Content-Type`・ファイル先頭 `%PDF-` の三重チェック |
 | サイズ | `Content-Length` で事前に弾き、受信中も累積バイトで打ち切る（既定300MB） |
 | ディスク枯渇 | `fs.statfsSync()` で空き容量を見て、`Content-Length + 512MB` を下回れば 507 |

@@ -7286,9 +7286,10 @@ function App() {
                   <div className="src-pane">
                     <div className="src-pane-title">
                       元のPDF
+                      {/* 元PDFは永続RAGの管理フォルダ (uploads/ragfiles、認証付き配信) に置かれている */}
                       {sourceViewer.pdf && (
                         <a className="src-copy-btn"
-                          href={`/uploads/${encodeURIComponent(sourceViewer.pdf)}${sourceViewer.pdfPage ? `#page=${sourceViewer.pdfPage}` : ''}`}
+                          href={`/uploads/ragfiles/${encodeURIComponent(sourceViewer.pdf)}${sourceViewer.pdfPage ? `#page=${sourceViewer.pdfPage}` : ''}`}
                           target="_blank" rel="noreferrer noopener">別タブで開く</a>
                       )}
                     </div>
@@ -7296,7 +7297,7 @@ function App() {
                       <iframe
                         className="src-pdf"
                         title="出典PDF"
-                        src={`/uploads/${encodeURIComponent(sourceViewer.pdf)}${sourceViewer.pdfPage ? `#page=${sourceViewer.pdfPage}&view=FitH` : ''}`}
+                        src={`/uploads/ragfiles/${encodeURIComponent(sourceViewer.pdf)}${sourceViewer.pdfPage ? `#page=${sourceViewer.pdfPage}&view=FitH` : ''}`}
                       />
                     ) : (
                       <div className="src-text">この資料には対応するPDFがありません。</div>
@@ -7305,7 +7306,7 @@ function App() {
                 </div>
                 <div className="role-editor-hint">
                   💡 ページ番号はPDFの物理ページです（本に印刷されたノンブルとずれることがあります）。
-                  PDFが表示されない場合は、元ファイルが uploads から削除されています。
+                  PDFが表示されない場合は、元のPDFがサーバーから削除されています。
                 </div>
               </div>
             </div>

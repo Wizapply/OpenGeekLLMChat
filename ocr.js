@@ -4,12 +4,17 @@
  * 技術書などのスキャンPDFを、UIにドロップするだけで検索可能な知識にするための機構。
  *
  * 流れ:
- *   1. PDF を public/uploads/ に保存 (ジョブ登録)
+ *   1. PDF を public/uploads/ragfiles/ (永続RAGの管理フォルダ) に保存 (ジョブ登録)
  *   2. pdftoppm で 1ページずつ PNG 化 (300dpi、1枚ずつ作って消すのでディスクを食わない)
  *   3. Vision LLM (Qwen2.5-VL 等の OpenAI互換サーバー) に base64 画像を投げて Markdown を得る
  *   4. ページ単位で ml/ocr/cache/<jobId>/pXXXX.md にキャッシュ (中断しても続きから再開できる)
- *   5. 全ページ結合 → public/uploads/<basename>.md
+ *   5. 全ページ結合 → public/uploads/ragfiles/<basename>.md
  *   6. 既存の ragIngestFile() を内部呼び出しして RAG 登録 → チャットの search_documents から参照可能
+ *
+ * 保存先はどちらも uploads 直下ではなく管理フォルダ (uploads/ragfiles)。
+ * ユーザーのサーバーファイル一覧・LLMのファイルツールにRAG素材が混ざらないようにするため
+ * (server.js 側で一覧・読み書きから隠している)。旧バージョンが uploads 直下に置いた
+ * ジョブファイルは、起動時 (restoreOnBoot) に管理フォルダへ自動移行する。
  *
  * 方針:
  * - 依存を増やさない。PDF→画像は poppler-utils (pdftoppm / pdfinfo) を child_process で叩く。
@@ -288,7 +293,8 @@ function receiveMultipartToFile(req, { maxBytes, destPath }) {
  * @param {object}   deps
  * @param {function} deps.getConfig         () => appConfig.ocr
  * @param {string}   deps.baseDir           サーバーのルート (相対パス解決の基準)
- * @param {string}   deps.uploadsDir        public/uploads の絶対パス
+ * @param {string}   deps.uploadsDir        ジョブファイル置き場 (public/uploads/ragfiles) の絶対パス
+ * @param {string}   [deps.legacyUploadsDir] 旧バージョンの置き場 (public/uploads)。起動時にここから移行する
  * @param {function} deps.log               (ip, message) => void
  * @param {function} [deps.ragIngestFile]   (filename) => Promise<{docId, chunkCount}>
  * @param {function} [deps.ragDeleteDoc]    (docId) => void
@@ -303,6 +309,7 @@ function createOcrManager({
   getConfig,
   baseDir,
   uploadsDir,
+  legacyUploadsDir = null,
   log = () => {},
   ragIngestFile = null,
   ragDeleteDoc = null,
@@ -329,7 +336,7 @@ function createOcrManager({
   // ─── 永続化 ───────────────────────────────────────────────
 
   function ensureDirs() {
-    for (const d of [cacheRoot(), path.dirname(jobsFile())]) {
+    for (const d of [cacheRoot(), path.dirname(jobsFile()), uploadsDir]) {
       try { fs.mkdirSync(d, { recursive: true }); } catch {}
     }
   }
@@ -832,7 +839,7 @@ function createOcrManager({
       job.mdFilename = mdName;
       job.charCount = merged.length;
       saveJobs();
-      log('-', `[OCR] Markdown生成: uploads/${mdName} (${humanBytes(Buffer.byteLength(merged, 'utf-8'))}, ${job.failedPages.length}ページ失敗)`);
+      log('-', `[OCR] Markdown生成: uploads/ragfiles/${mdName} (${humanBytes(Buffer.byteLength(merged, 'utf-8'))}, ${job.failedPages.length}ページ失敗)`);
 
       // ─── RAG 自動登録 ───
       if (c.autoRegisterToRag !== false && ragIngestFile) {
@@ -1162,11 +1169,42 @@ function createOcrManager({
   }
 
   /**
+   * 旧バージョンが uploads 直下に置いたジョブファイル (元PDF / 生成Markdown) を
+   * 管理フォルダ (uploads/ragfiles) へ移す。起動時に一度だけ呼ばれる。
+   * ジョブはファイル名しか持たないので、置き場を変えるだけで参照はそのまま生きる。
+   */
+  function migrateLegacyFiles() {
+    if (!legacyUploadsDir || path.resolve(legacyUploadsDir) === path.resolve(uploadsDir)) return 0;
+    let moved = 0;
+    for (const job of loadJobs()) {
+      for (const key of ['filename', 'mdFilename']) {
+        const name = job[key];
+        // ジョブ由来の名前はサニタイズ済みの basename のはずだが、
+        // 手で編集された jobs.json に備えてパス要素を含む名前は触らない
+        if (!name || typeof name !== 'string') continue;
+        if (name !== path.basename(name) || name.startsWith('.')) continue;
+        const from = path.join(legacyUploadsDir, name);
+        const to = path.join(uploadsDir, name);
+        try {
+          if (!fs.existsSync(from) || fs.existsSync(to)) continue;
+          fs.renameSync(from, to);
+          moved++;
+        } catch {}
+      }
+    }
+    if (moved > 0) {
+      log('-', `[OCR] 既存ジョブのファイル ${moved} 件を uploads 直下から管理フォルダ (uploads/ragfiles) へ移動しました`);
+    }
+    return moved;
+  }
+
+  /**
    * 起動時の復元。実行中のまま落ちたジョブは「待機中」に戻す。
    * ページキャッシュが残っているので、開始し直せば途中から再開される。
    */
   function restoreOnBoot() {
     ensureDirs();
+    migrateLegacyFiles();
     const list = loadJobs();
     let n = 0;
     for (const job of list) {
