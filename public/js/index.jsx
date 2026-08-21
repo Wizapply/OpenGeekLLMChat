@@ -413,6 +413,14 @@ renderer.link = function (arg1, title, text) {
 };
 marked.use({ renderer });
 
+// ─── uploads/ragfiles 配下のファイルURL ───
+// カテゴリ付きの資料は "カテゴリ/名前.pdf" のような相対パスなので、
+// パスの区切りを保ったままセグメント単位でエンコードする
+// (全体を encodeURIComponent すると "/" が %2F になり、プロキシ環境で扱いが揺れる)
+function ragFileUrl(relName) {
+  return '/uploads/ragfiles/' + String(relName || '').split('/').map(encodeURIComponent).join('/');
+}
+
 // ─── コピー関数（グローバル）───
 window.copyCode = function(btn, id) {
   const el = document.getElementById(id);
@@ -1490,12 +1498,23 @@ function App() {
   // 出典ビューア (【S1】をクリックすると、渡された本文と元PDFの該当ページを表示)
   const [sourceViewer, setSourceViewer] = useState(null);
   const [persistentRagAvailable, setPersistentRagAvailable] = useState(false);
-  const [persistentRagDocCount, setPersistentRagDocCount] = useState(0);
-  const [persistentRagDocNames, setPersistentRagDocNames] = useState([]);
-  // チャット欄の📚トグル。資料が登録されていても、ユーザーがONにするまで
+  // 登録ドキュメント全件 [{docId, filename, category, ...}] とカテゴリ一覧 [{name, docCount}]
+  const [persistentRagDocs, setPersistentRagDocs] = useState([]);
+  const [persistentRagCategories, setPersistentRagCategories] = useState([]);
+  // チャット欄の📚プルダウン。資料が登録されていても、ユーザーが選ぶまで
   // 検索ツールを出さない（雑談まで毎回ベクトル検索が走るのを防ぐ）。
-  // 既定はOFF。config.ragEnabledByDefault: true で初期ONにできる
-  const [persistentRagEnabled, setPersistentRagEnabled] = useState(false);
+  //   'off' = 使用しない (既定。config.ragEnabledByDefault: true で初期値が 'all' になる)
+  //   'all' = すべての資料 / '' = 未分類のみ / その他 = カテゴリ名
+  const [persistentRagCategory, setPersistentRagCategory] = useState('off');
+  const persistentRagEnabled = persistentRagCategory !== 'off';
+  // 選択中カテゴリの範囲に入るドキュメント。ツール定義・判断プロンプト・件数表示は
+  // この範囲で数える (カテゴリを絞っているのに全資料名を並べるとモデルが混乱する)
+  const ragDocsInScope = (persistentRagCategory === 'all' || persistentRagCategory === 'off')
+    ? persistentRagDocs
+    : persistentRagDocs.filter(d => (d.category || '') === persistentRagCategory);
+  const persistentRagDocCount = ragDocsInScope.length;
+  const persistentRagDocNames = ragDocsInScope.map(d => d.filename);
+  const persistentRagUncategorized = persistentRagDocs.filter(d => !d.category).length;
   // Google Drive が外部APIのツール対応モードで使えるか
   const [apiGdriveAvailable, setApiGdriveAvailable] = useState(false);
   const [apiGdriveReason, setApiGdriveReason] = useState('');
@@ -1520,7 +1539,8 @@ function App() {
   //   入門シリーズ32 斜面の安定・変形…-.md      → 入門シリーズ32
   //   S.P.Cウォール工法.md                     → S.P.Cウォール工法
   function shortSourceLabel(filename) {
-    let s = String(filename || '').replace(/\.[^.]+$/, '');
+    // カテゴリ付きの資料は "カテゴリ/名前.md" なので、フォルダ部分を落として名前だけ使う
+    let s = String(filename || '').split('/').pop().replace(/\.[^.]+$/, '');
     const cut = s.split(/[-–—―~〜_\s　]/).filter(Boolean)[0];
     if (cut) s = cut;
     if (s.length > 14) s = s.slice(0, 14);
@@ -2561,8 +2581,8 @@ function App() {
       const gdriveCanWrite = gdriveActive && !!gdriveStatus?.allowWrite;
       const gdriveCanDelete = gdriveActive && !!gdriveStatus?.allowDelete;
 
-      // 永続RAGが使えるか: embedding利用可 + 登録資料あり + チャット欄の📚トグルON。
-      // OFFの間は検索ツールもRAG用システムプロンプトも出さないので、
+      // 永続RAGが使えるか: embedding利用可 + 選択範囲に資料あり + 📚プルダウンで検索対象を選択済み。
+      // 「使用しない」の間は検索ツールもRAG用システムプロンプトも出さないので、
       // 雑談やコード生成に無関係なベクトル検索が挟まらない
       const persistentRagActive = persistentRagAvailable
         && persistentRagDocCount > 0
@@ -2601,8 +2621,9 @@ function App() {
         }
 
         // 永続RAG (サーバー側 ml/rag/ に登録済みのドキュメント)
-        // チャット添付ドキュメントとは独立した恒久的な知識ベース
-        // embedding 利用可能 + 登録ドキュメント数 > 0 + チャット欄の📚トグルON のとき追加
+        // チャット添付ドキュメントとは独立した恒久的な知識ベース。
+        // embedding 利用可能 + 選択カテゴリに資料あり + 📚プルダウンで選択済み のとき追加
+        // (検索もツール定義の資料一覧も、プルダウンで選んだカテゴリの範囲に絞られる)
         if (persistentRagActive) {
           const docSummary = summarizePersistentRagDocs(10);
           tools.push({
@@ -3170,7 +3191,14 @@ function App() {
               headers: { 'Content-Type': 'application/json' },
               // topK は config.ragTopK を尊重する (以前は 5 固定で設定が効いていなかった)。
               // neighbors は省略してサーバー側の config.ragNeighborChunks に委ねる。
-              body: JSON.stringify({ query, topK: appConfig.ragTopK || 10 }),
+              // category はプルダウンの選択に従う ('all' は全資料 = パラメータ省略、
+              // '' は未分類のみ、それ以外はそのカテゴリのみを検索する)
+              body: JSON.stringify({
+                query,
+                topK: appConfig.ragTopK || 10,
+                ...(persistentRagCategory !== 'all' && persistentRagCategory !== 'off'
+                  ? { category: persistentRagCategory } : {}),
+              }),
             });
             if (res.ok) {
               const data = await res.json();
@@ -5955,8 +5983,8 @@ function App() {
       // embedding が使えないなら RAG ドキュメントの取得自体スキップ
       if (!embeddingAvailable) {
         setPersistentRagAvailable(false);
-        setPersistentRagDocCount(0);
-        setPersistentRagDocNames([]);
+        setPersistentRagDocs([]);
+        setPersistentRagCategories([]);
         return;
       }
       const docRes = await fetch('/rag/documents');
@@ -5964,8 +5992,12 @@ function App() {
       const list = docs.documents || [];
       const available = list.length > 0;
       setPersistentRagAvailable(available);
-      setPersistentRagDocCount(list.length);
-      setPersistentRagDocNames(list.map(d => d.filename));
+      setPersistentRagDocs(list);
+      // カテゴリ一覧 (プルダウンの選択肢)。失敗しても資料一覧は使えるので握りつぶす
+      try {
+        const catRes = await fetch('/rag/categories');
+        if (catRes.ok) setPersistentRagCategories((await catRes.json()).categories || []);
+      } catch {}
       if (available) {
         console.log(`[永続RAG] 利用可能: ${list.length}件 (${list.map(d => d.filename).join(', ')})`);
       }
@@ -6513,7 +6545,8 @@ function App() {
           //  チャットを切り替えても維持するため)
           toggles: {
             webSearch: webSearchEnabled,
-            persistentRag: persistentRagEnabled,
+            persistentRag: persistentRagEnabled,          // 旧形式 (後方互換のため残す)
+            persistentRagCategory,                        // 新形式: 'off'/'all'/''/カテゴリ名
             gdrive: gdriveEnabled,
           },
         }),
@@ -6540,7 +6573,10 @@ function App() {
       // (残したままだと直前に開いていたチャットの状態を引き継いでしまう)
       const tg = data.toggles || {};
       setWebSearchEnabled(tg.webSearch !== undefined ? !!tg.webSearch : (appConfig.webSearch !== false));
-      setPersistentRagEnabled(tg.persistentRag !== undefined ? !!tg.persistentRag : (appConfig.ragEnabledByDefault === true));
+      // 永続RAG: 新形式 (カテゴリ) を優先し、旧形式 (ON/OFF) は 'all'/'off' に読み替える
+      if (tg.persistentRagCategory !== undefined) setPersistentRagCategory(String(tg.persistentRagCategory));
+      else if (tg.persistentRag !== undefined) setPersistentRagCategory(tg.persistentRag ? 'all' : 'off');
+      else setPersistentRagCategory(appConfig.ragEnabledByDefault === true ? 'all' : 'off');
       setGdriveEnabled(tg.gdrive !== undefined ? !!tg.gdrive : true);
       messagesDirtyRef.current = false;  // ロードしただけでは dirty にしない
     } finally {
@@ -6560,7 +6596,7 @@ function App() {
     setChatTextFiles([]);  // 送信前のインライン添付も破棄
     // チャット欄トグルは既定値に戻す (トグル状態はチャットごとに保存されるため、
     // 新規チャットに前のチャットの状態を引き継がない)
-    setPersistentRagEnabled(appConfig.ragEnabledByDefault === true);
+    setPersistentRagCategory(appConfig.ragEnabledByDefault === true ? 'all' : 'off');
     setWebSearchEnabled(appConfig.webSearch !== false);
     setGdriveEnabled(true);
     messagesDirtyRef.current = false;  // 新規チャット時もクリア
@@ -6586,9 +6622,9 @@ function App() {
           setAppConfig(prev => ({ ...prev, ...cfg }));
           // Web検索ON/OFFのデフォルト値はconfig.webSearchを反映
           setWebSearchEnabled(cfg.webSearch !== false);
-          // 登録資料の検索は既定OFF。毎チャットで検索したい運用向けに
-          // config.ragEnabledByDefault: true で初期ONにできる
-          setPersistentRagEnabled(cfg.ragEnabledByDefault === true);
+          // 登録資料の検索は既定「使用しない」。毎チャットで検索したい運用向けに
+          // config.ragEnabledByDefault: true で初期値を「すべての資料」にできる
+          setPersistentRagCategory(cfg.ragEnabledByDefault === true ? 'all' : 'off');
           document.title = cfg.appName || 'OpenGeekLLMChat';
           if (cfg.accentColor) {
             const hex = cfg.accentColor;
@@ -6855,7 +6891,7 @@ function App() {
       messagesDirtyRef.current = false;  // 保存したらクリア
     }, 1500);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-  }, [messages, documents, isLoading, webSearchEnabled, persistentRagEnabled, gdriveEnabled]);
+  }, [messages, documents, isLoading, webSearchEnabled, persistentRagCategory, gdriveEnabled]);
 
   // ─── エラー自動消去 ───
   useEffect(() => {
@@ -7289,7 +7325,7 @@ function App() {
                       {/* 元PDFは永続RAGの管理フォルダ (uploads/ragfiles、認証付き配信) に置かれている */}
                       {sourceViewer.pdf && (
                         <a className="src-copy-btn"
-                          href={`/uploads/ragfiles/${encodeURIComponent(sourceViewer.pdf)}${sourceViewer.pdfPage ? `#page=${sourceViewer.pdfPage}` : ''}`}
+                          href={`${ragFileUrl(sourceViewer.pdf)}${sourceViewer.pdfPage ? `#page=${sourceViewer.pdfPage}` : ''}`}
                           target="_blank" rel="noreferrer noopener">別タブで開く</a>
                       )}
                     </div>
@@ -7297,7 +7333,7 @@ function App() {
                       <iframe
                         className="src-pdf"
                         title="出典PDF"
-                        src={`/uploads/ragfiles/${encodeURIComponent(sourceViewer.pdf)}${sourceViewer.pdfPage ? `#page=${sourceViewer.pdfPage}&view=FitH` : ''}`}
+                        src={`${ragFileUrl(sourceViewer.pdf)}${sourceViewer.pdfPage ? `#page=${sourceViewer.pdfPage}&view=FitH` : ''}`}
                       />
                     ) : (
                       <div className="src-text">この資料には対応するPDFがありません。</div>
@@ -7420,8 +7456,15 @@ function App() {
                     const unknown = [...used].filter(k => !known.has(k));
                     // 本文に出てくる .md のうち、登録されていないファイル名。
                     // 「テラメカクス/走行力学.md」のような、それらしいだけの
-                    // 存在しないファイル名を名指しで潰す
-                    const knownMd = new Set(persistentRagDocNames);
+                    // 存在しないファイル名を名指しで潰す。
+                    // 判定はカテゴリで絞らず全登録資料で行う (過去メッセージは別カテゴリの
+                    // 資料を引いていることがある)。カテゴリ付きの "フォルダ/名前.md" は
+                    // 名前だけで書かれることもあるので basename も登録名に含める
+                    const knownMd = new Set(persistentRagDocs.flatMap(d => {
+                      const n = String(d.filename || '');
+                      const base = n.split('/').pop();
+                      return base !== n ? [n, base] : [n];
+                    }));
                     const fakeMd = mdNamesIn(body).filter(n => !knownMd.has(n));
                     // 検索していないのに資料を引いたような書きぶりをしている
                     // ragSearched が付く前に保存されたチャットもあるので、
@@ -7790,17 +7833,36 @@ function App() {
                   </button>
                 )}
                 {/* 永続RAG: サーバーに資料が登録されている時だけ出す。
-                    既定OFF — ONにしたチャットでだけ登録資料を検索する */}
-                {persistentRagAvailable && persistentRagDocCount > 0 && (
-                  <button
-                    className={`toolbar-btn rag-toggle ${persistentRagEnabled ? 'active' : ''}`}
+                    ON/OFFトグルではなくカテゴリのプルダウン
+                    (使用しない / すべての資料 / カテゴリ… / 未分類) で検索範囲を選ぶ */}
+                {persistentRagAvailable && persistentRagDocs.length > 0 && (
+                  <select
+                    className={`toolbar-btn rag-toggle rag-category-select ${persistentRagEnabled ? 'active' : ''}`}
+                    value={persistentRagCategory}
                     title={persistentRagEnabled
-                      ? `登録資料の検索: ON（クリックでOFF）/ ${summarizePersistentRagDocs(3)}`
-                      : `登録資料の検索: OFF（クリックでON）/ 登録済み: ${persistentRagDocCount}件`}
-                    onClick={() => { setPersistentRagEnabled(v => !v); messagesDirtyRef.current = true; }}
+                      ? `登録資料の検索: ${persistentRagCategory === 'all' ? 'すべての資料' : (persistentRagCategory === '' ? '未分類' : `カテゴリ「${persistentRagCategory}」`)}（${persistentRagDocCount}件が対象）`
+                      : `登録資料の検索: 使用しない（プルダウンで検索対象を選択 / 登録済み: ${persistentRagDocs.length}件）`}
+                    onChange={(e) => { setPersistentRagCategory(e.target.value); messagesDirtyRef.current = true; }}
                   >
-                    📚
-                  </button>
+                    <option value="off">📚 使用しない</option>
+                    <option value="all">📚 すべての資料 ({persistentRagDocs.length})</option>
+                    {persistentRagCategories.map(c => (
+                      <option key={c.name} value={c.name} disabled={c.docCount === 0}>
+                        📚 {c.name} ({c.docCount})
+                      </option>
+                    ))}
+                    {/* 未分類はカテゴリの有無に関係なく、対象の資料があれば常に出す
+                        (既存の登録資料はすべて未分類なので、カテゴリを作る前でも選べるように) */}
+                    {persistentRagUncategorized > 0 && (
+                      <option value="">📚 未分類 ({persistentRagUncategorized})</option>
+                    )}
+                    {/* 保存済みチャットが選んでいたカテゴリが削除された場合の受け皿
+                        (選択肢に無い value を握ると表示が空になるため) */}
+                    {persistentRagCategory !== 'off' && persistentRagCategory !== 'all' && persistentRagCategory !== ''
+                      && !persistentRagCategories.some(c => c.name === persistentRagCategory) && (
+                      <option value={persistentRagCategory}>📚 {persistentRagCategory} (削除済み)</option>
+                    )}
+                  </select>
                 )}
                 {/* Google Drive: 設定で有効な時だけ出す。未接続ならクリックで接続パネルへ誘導 */}
                 {appConfig.googleDrive?.enabled && (

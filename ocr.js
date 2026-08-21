@@ -413,6 +413,7 @@ function createOcrManager({
       jobId: job.jobId,
       filename: job.filename,
       mdFilename: job.mdFilename || null,
+      category: job.category || null,
       title: job.title,
       sizeBytes: job.sizeBytes,
       status: job.status,
@@ -831,10 +832,13 @@ function createOcrManager({
       // ここで手放せば長いRAG登録の間ずっと9GB占有し続けずに済む
       if (vlm) { vlm.release(); vlm = null; }
 
-      // ─── 結合して uploads に書き出す ───
+      // ─── 結合して uploads (カテゴリ指定時はそのフォルダ) に書き出す ───
       setStatus(job, 'running', { phase: 'merge', currentPage: 0 });
       const merged = mergePages(job, cacheDir);
-      const mdName = job.mdFilename || `${job.title}.md`;
+      // mdFilename はアップロード時に確定している。無い場合 (旧バージョンのジョブ) は
+      // 従来どおり <title>.md へ上書きする (一意化すると再実行のたびに別名が増えるため)
+      const mdName = job.mdFilename || (job.category ? `${job.category}/${job.title}.md` : `${job.title}.md`);
+      fs.mkdirSync(path.dirname(path.join(uploadsDir, mdName)), { recursive: true });
       fs.writeFileSync(path.join(uploadsDir, mdName), merged, 'utf-8');
       job.mdFilename = mdName;
       job.charCount = merged.length;
@@ -921,9 +925,12 @@ function createOcrManager({
   /**
    * アップロード受信 → ジョブ登録。
    * multipart/form-data でも、Content-Type: application/pdf の生ボディでも受ける
-   * (後者は curl から叩きやすくするため。?name= か X-Filename でファイル名を渡す)
+   * (後者は curl から叩きやすくするため。?name= か X-Filename でファイル名を渡す)。
+   * category は検証済みのカテゴリ名 (server.js の resolveRagCategory を通したもの)。
+   * 指定時は uploads/ragfiles/<category>/ に保存し、job.filename は
+   * "<category>/<名前>.pdf" のような uploadsDir 相対パスになる。
    */
-  async function receiveUpload(req, { ip = '-' } = {}) {
+  async function receiveUpload(req, { ip = '-', category = null } = {}) {
     ensureDirs();
     const c = cfg();
     const maxBytes = (parseInt(c.maxUploadMB) || 300) * 1024 * 1024;
@@ -988,15 +995,20 @@ function createOcrManager({
         e.status = 400; throw e;
       }
 
-      const filename = uniqueName(uploadsDir, sanitizePdfName(originalName));
-      fs.renameSync(tmpPath, path.join(uploadsDir, filename));
+      // カテゴリ指定時はカテゴリのフォルダへ。名前の一意化も保存先フォルダ内で行う
+      const destDir = category ? path.join(uploadsDir, category) : uploadsDir;
+      fs.mkdirSync(destDir, { recursive: true });
+      const baseName = uniqueName(destDir, sanitizePdfName(originalName));
+      fs.renameSync(tmpPath, path.join(destDir, baseName));
 
-      const title = filename.replace(/\.pdf$/i, '');
+      const filename = category ? `${category}/${baseName}` : baseName;
+      const title = baseName.replace(/\.pdf$/i, '');
       const job = {
         jobId: `ocr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
         filename,
+        category: category || null,
         title,
-        mdFilename: uniqueMdName(title),
+        mdFilename: uniqueMdName(title, category),
         sizeBytes: bytes,
         status: 'pending',
         phase: null,
@@ -1050,9 +1062,11 @@ function createOcrManager({
     });
   }
 
-  /** 生成する Markdown 名が uploads で衝突しないようにする */
-  function uniqueMdName(title) {
-    return uniqueName(uploadsDir, `${title}.md`);
+  /** 生成する Markdown 名が保存先フォルダ内で衝突しないようにする (カテゴリ指定時はカテゴリフォルダ内) */
+  function uniqueMdName(title, category = null) {
+    const dir = category ? path.join(uploadsDir, category) : uploadsDir;
+    const base = uniqueName(dir, `${title}.md`);
+    return category ? `${category}/${base}` : base;
   }
 
   function listJobs() {
@@ -1146,6 +1160,49 @@ function createOcrManager({
       setStatus(job, 'cancelled', { phase: null, finishedAt: Date.now() });
     }
     return jobView(job);
+  }
+
+  /**
+   * RAG登録済みジョブのファイルを別カテゴリへ移す (未分類は category=null)。
+   * server.js のカテゴリ変更APIから呼ばれる。docId はパス由来なので、
+   * 新しい docId (newRagDocId) は server 側で計算して渡してもらう。
+   * 対象ジョブが無ければ null を返す (呼び出し側が別の手段にフォールバックする)。
+   */
+  function moveJobCategory(ragDocId, category, newRagDocId = null) {
+    if (!ragDocId) return null;
+    const job = loadJobs().find(j => j.ragDocId === ragDocId);
+    if (!job) return null;
+    if (ACTIVE_STATUSES.includes(job.status)) {
+      const e = new Error('実行中のジョブはカテゴリを変更できません'); e.status = 409; throw e;
+    }
+    const destDir = category ? path.join(uploadsDir, category) : uploadsDir;
+    // 先に全ファイルの移動先を検証してから動かす (片方だけ移って止まるのを避ける)
+    const moves = [];
+    for (const key of ['filename', 'mdFilename']) {
+      const rel = job[key];
+      if (!rel || typeof rel !== 'string') continue;
+      const base = path.basename(rel);
+      const newRel = category ? `${category}/${base}` : base;
+      if (newRel === rel) continue;
+      const from = path.join(uploadsDir, rel);
+      const to = path.join(uploadsDir, newRel);
+      if (fs.existsSync(to)) {
+        const e = new Error(`移動先に同名のファイルがあります: ${newRel}`); e.status = 409; throw e;
+      }
+      // 元ファイルが消えていても (keepPdf=false 等) ジョブの参照名だけは付け替える
+      moves.push({ key, newRel, from, to, exists: fs.existsSync(from) });
+    }
+    fs.mkdirSync(destDir, { recursive: true });
+    for (const m of moves) {
+      if (m.exists) fs.renameSync(m.from, m.to);
+      job[m.key] = m.newRel;
+    }
+    job.category = category || null;
+    if (newRagDocId) job.ragDocId = newRagDocId;
+    saveJobs();
+    emitEvent(job.jobId, { type: 'status', job: jobView(job) });
+    log('-', `[OCR] カテゴリ変更: ${path.basename(job.filename || '')} → ${category || '未分類'}`);
+    return { jobId: job.jobId, filename: job.filename, mdFilename: job.mdFilename };
   }
 
   /** ジョブ削除 (キャッシュ・PDF・生成Markdown・RAG登録をまとめて片付ける) */
@@ -1269,6 +1326,7 @@ function createOcrManager({
     startJob,
     cancelJob,
     deleteJob,
+    moveJobCategory,
     subscribe,
     restoreOnBoot,
   };

@@ -3049,6 +3049,41 @@
   .toolbar-btn.rag-toggle:hover { opacity: 0.8; }
   .toolbar-btn.rag-toggle.active:hover { opacity: 1; }
 
+  /* 📚 永続RAGのカテゴリ選択プルダウン (旧ON/OFFトグルの置き換え)。
+     rag-toggle の色・active表現を引き継ぎつつ、選択中の項目が読める幅を持たせる。
+     選択肢は「使用しない / すべての資料 / カテゴリ… / 未分類」 */
+  .toolbar-btn.rag-category-select {
+    width: auto;
+    max-width: 190px;
+    height: 36px;
+    padding: 0 20px 0 8px;
+    font-size: 13px;
+    font-family: inherit;
+    border: 1px solid var(--border);
+    background-color: var(--bg-tertiary);
+    color: var(--text-secondary);
+    appearance: none;
+    -webkit-appearance: none;
+    /* appearance:none で消える矢印を自前で描く (プルダウンだと分かるように) */
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5'%3E%3Cpath d='M0 0l4 5 4-5z' fill='%23888888'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 7px center;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    overflow: hidden;
+    cursor: pointer;
+  }
+  .toolbar-btn.rag-category-select.active {
+    background-color: var(--accent-dim);
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  .toolbar-btn.rag-category-select option {
+    /* ドロップダウン側はOSの描画。ダークテーマでも読めるよう配色だけ寄せる */
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+  }
+
   @keyframes mic-pulse {
     0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5); }
     50% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }

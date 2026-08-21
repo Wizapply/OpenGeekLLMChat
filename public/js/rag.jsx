@@ -41,6 +41,41 @@ function formatDuration(ms) {
 
 const isActive = (job) => job.status === 'running' || job.status === 'queued';
 
+// uploads/ragfiles 配下のファイルURL。カテゴリ付きジョブのファイルは
+// "カテゴリ/名前.pdf" のような相対パスなので、区切りを保ったまま
+// セグメント単位でエンコードする
+function ragFileUrl(relName) {
+  return '/uploads/ragfiles/' + String(relName || '').split('/').map(encodeURIComponent).join('/');
+}
+
+// ジョブの登録先カテゴリのバッジ (未分類は出さない)
+function CategoryBadge({ category }) {
+  if (!category) return null;
+  return <span className="rag-cat-badge" title={`登録先カテゴリ: ${category}`}>📂 {category}</span>;
+}
+
+// ジョブのカテゴリ変更セレクト。RAG登録済みのジョブだけに出す
+// (元PDF/HTML・生成Markdown・RAG登録・ジョブ記録をまとめて移動する)
+function CategoryMoveSelect({ job, categories, onChangeCategory }) {
+  if (!job.ragDocId) return null;
+  return (
+    <select
+      className="rag-cat-move"
+      value={job.category || ''}
+      title="カテゴリを変更 (ファイルとRAG登録をまとめて移動します)"
+      disabled={isActive(job)}
+      onChange={e => { if ((job.category || '') !== e.target.value) onChangeCategory(e.target.value); }}
+    >
+      <option value="">📂 未分類</option>
+      {(categories || []).map(c => <option key={c.name} value={c.name}>📂 {c.name}</option>)}
+      {/* 登録簿から消えたカテゴリに居るジョブの受け皿 (選択肢に無い value だと表示が空になる) */}
+      {job.category && !(categories || []).some(c => c.name === job.category) && (
+        <option value={job.category}>📂 {job.category}</option>
+      )}
+    </select>
+  );
+}
+
 // 同時に張るSSEの上限。ブラウザのHTTP/1.1同時接続上限(1オリジン6本)を
 // SSEで使い切ると、アップロードやポーリングが接続待ちでハングするため絞る。
 // この画面はOCRとHTMLの2系統を束ねるので、それぞれの上限をさらに小さくしてある
@@ -141,6 +176,12 @@ function App() {
   const [hragJobs, setHragJobs] = useState([]);
   const [hragUploading, setHragUploading] = useState([]);
 
+  // カテゴリ (uploads/ragfiles/<フォルダ> 単位の分類)
+  const [categories, setCategories] = useState([]);      // [{name, docCount, createdAt}]
+  const [uncatCount, setUncatCount] = useState(0);       // カテゴリ無しの登録ドキュメント数
+  const [uploadCategory, setUploadCategory] = useState(''); // 新規登録の保存先 ('' = 未分類)
+  const [newCatName, setNewCatName] = useState('');
+
   useEffect(() => {
     (async () => {
       try {
@@ -195,16 +236,34 @@ function App() {
       if (r.ok) setHragStatus(await r.json());
     } catch {}
   }, []);
+  const loadCategories = useCallback(async () => {
+    try {
+      const r = await fetch('/rag/categories');
+      if (r.ok) {
+        const data = await r.json();
+        setCategories(data.categories || []);
+        setUncatCount(data.uncategorizedCount || 0);
+      }
+    } catch {}
+  }, []);
 
   useEffect(() => {
     if (!authenticated) return;
     loadOcrJobs(); loadOcrStatus();
     loadHragJobs(); loadHragStatus();
+    loadCategories();
     // SSE が主だが、取りこぼしと他タブからの操作に備えて定期的に取り直す
     const t = setInterval(() => { loadOcrJobs(); loadHragJobs(); }, 5000);
-    const t2 = setInterval(() => { loadOcrStatus(); loadHragStatus(); }, 30000);
+    const t2 = setInterval(() => { loadOcrStatus(); loadHragStatus(); loadCategories(); }, 30000);
     return () => { clearInterval(t); clearInterval(t2); };
-  }, [authenticated, loadOcrJobs, loadOcrStatus, loadHragJobs, loadHragStatus]);
+  }, [authenticated, loadOcrJobs, loadOcrStatus, loadHragJobs, loadHragStatus, loadCategories]);
+
+  // 選択中の登録先カテゴリが (他タブ等で) 削除されたら未分類へ戻す
+  useEffect(() => {
+    if (uploadCategory && !categories.some(c => c.name === uploadCategory)) {
+      setUploadCategory('');
+    }
+  }, [categories, uploadCategory]);
 
   // ─── 実行中ジョブの進捗を SSE で受ける ───
   // 張るのは running のジョブだけ (queued は進捗が動かないのでポーリングで十分)。
@@ -223,13 +282,13 @@ function App() {
         let data;
         try { data = JSON.parse(ev.data); } catch { return; }
         if (data.job) setOcrJobs(prev => prev.map(j => (j.jobId === data.job.jobId ? data.job : j)));
-        if (data.type === 'done' || data.type === 'error') loadOcrJobs();
+        if (data.type === 'done' || data.type === 'error') { loadOcrJobs(); loadCategories(); }
       };
       es.onerror = () => { /* ブラウザが自動再接続する。切断してもポーリングで追従できる */ };
       return es;
     });
     return () => sources.forEach(es => es.close());
-  }, [authenticated, ocrStreamIds, loadOcrJobs]);
+  }, [authenticated, ocrStreamIds, loadOcrJobs, loadCategories]);
 
   useEffect(() => {
     if (!authenticated || !hragStreamIds) return;
@@ -239,17 +298,78 @@ function App() {
         let data;
         try { data = JSON.parse(ev.data); } catch { return; }
         if (data.job) setHragJobs(prev => prev.map(j => (j.jobId === data.job.jobId ? data.job : j)));
-        if (data.type === 'done' || data.type === 'error') loadHragJobs();
+        if (data.type === 'done' || data.type === 'error') { loadHragJobs(); loadCategories(); }
       };
       es.onerror = () => {};
       return es;
     });
     return () => sources.forEach(es => es.close());
-  }, [authenticated, hragStreamIds, loadHragJobs]);
+  }, [authenticated, hragStreamIds, loadHragJobs, loadCategories]);
 
   function showToast(msg, type = 'info') {
     setToast({ msg, type });
     setTimeout(() => setToast(null), 4000);
+  }
+
+  // ─── カテゴリの作成/削除 ───
+  async function createCategory() {
+    const name = newCatName.trim();
+    if (!name) return;
+    try {
+      const r = await fetch('/rag/categories', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      showToast(`カテゴリ「${data.name}」を作成しました`, 'success');
+      setNewCatName('');
+      // 一覧の再取得を待たずに選択したいので、手元の一覧へ先に足しておく
+      // (「一覧に無い選択はリセット」のガードに巻き込まれないように)
+      setCategories(prev => (prev.some(c => c.name === data.name) ? prev : [...prev, { name: data.name, docCount: 0, createdAt: Date.now() }]));
+      setUploadCategory(data.name);   // 作ったカテゴリをそのまま登録先にする
+      loadCategories();
+    } catch (e) {
+      showToast(e.message, 'error');
+    }
+  }
+
+  async function deleteCategory(name) {
+    if (!confirm(`カテゴリ「${name}」を削除しますか?\n(登録ドキュメントやファイルが残っている場合は削除できません)`)) return;
+    try {
+      const r = await fetch(`/rag/categories/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      showToast(`カテゴリ「${name}」を削除しました`, 'success');
+      if (uploadCategory === name) setUploadCategory('');
+      loadCategories();
+    } catch (e) {
+      showToast(e.message, 'error');
+    }
+  }
+
+  // アップロード/URL登録に付けるカテゴリのクエリ文字列
+  const categoryQS = uploadCategory ? `?category=${encodeURIComponent(uploadCategory)}` : '';
+
+  // 登録済みジョブのカテゴリ変更 (ファイル・RAG登録・ジョブ記録をまとめて移動)
+  async function changeJobCategory(job, category) {
+    if (!job.ragDocId) return;
+    try {
+      const r = await fetch(`/rag/documents/${encodeURIComponent(job.ragDocId)}/category`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ category }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      showToast(`「${job.title || job.filename}」を${category ? `カテゴリ「${category}」` : '未分類'}へ移動しました`, 'success');
+      loadOcrJobs();
+      loadHragJobs();
+      loadCategories();
+    } catch (e) {
+      showToast(e.message, 'error');
+    }
   }
 
   // ─── OCR: PDFアップロード ───
@@ -270,7 +390,7 @@ function App() {
       const uid = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       setOcrUploading(prev => [...prev, { uid, name: file.name, pct: 0 }]);
       try {
-        const res = await uploadFileXhr('/ocr/upload', file, (pct) => {
+        const res = await uploadFileXhr(`/ocr/upload${categoryQS}`, file, (pct) => {
           setOcrUploading(prev => prev.map(u => (u.uid === uid ? { ...u, pct } : u)));
         });
         if (res.warning) showToast(`${file.name}: 登録しましたが開始できません — ${res.warning}`, 'error');
@@ -303,7 +423,7 @@ function App() {
       const uid = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       setHragUploading(prev => [...prev, { uid, name: file.name, pct: 0 }]);
       try {
-        const res = await uploadFileXhr('/htmlrag/upload', file, (pct) => {
+        const res = await uploadFileXhr(`/htmlrag/upload${categoryQS}`, file, (pct) => {
           setHragUploading(prev => prev.map(u => (u.uid === uid ? { ...u, pct } : u)));
         });
         if (res.warning) showToast(`${file.name}: 登録しましたが開始できません — ${res.warning}`, 'error');
@@ -324,7 +444,12 @@ function App() {
       const r = await fetch('/htmlrag/url', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, title: title || undefined, crawl: crawl === true || undefined }),
+        body: JSON.stringify({
+          url,
+          title: title || undefined,
+          crawl: crawl === true || undefined,
+          category: uploadCategory || undefined,
+        }),
       });
       const data = await r.json().catch(() => ({}));
       if (!r.ok && r.status !== 202) throw new Error(data.error || `HTTP ${r.status}`);
@@ -391,6 +516,7 @@ function App() {
       if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
       showToast('削除しました', 'success');
       if (base === '/ocr') loadOcrJobs(); else loadHragJobs();
+      loadCategories();   // ジョブ削除でカテゴリのドキュメント数が減る
     } catch (e) {
       showToast(e.message, 'error');
     }
@@ -474,6 +600,52 @@ function App() {
           <div className="main-title">📚 永続RAG登録</div>
         </header>
         <div className="main-body">
+          {/* カテゴリバー: 新規登録の保存先の選択と、カテゴリの作成/削除。
+              カテゴリ = uploads/ragfiles/<フォルダ> で、チャットの📚プルダウンの選択肢になる */}
+          <div className="rag-catbar">
+            <div className="rag-catbar-row">
+              <span className="rag-catbar-label">📂 登録先カテゴリ</span>
+              <select
+                className="rag-cat-select"
+                value={uploadCategory}
+                onChange={e => setUploadCategory(e.target.value)}
+                title="これからアップロード/URL登録するファイルの保存先カテゴリ"
+              >
+                <option value="">未分類</option>
+                {categories.map(c => <option key={c.name} value={c.name}>{c.name}</option>)}
+              </select>
+              <input
+                className="rag-cat-input"
+                placeholder="新しいカテゴリ名"
+                value={newCatName}
+                maxLength={40}
+                onChange={e => setNewCatName(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') createCategory(); }}
+              />
+              <button className="btn small" onClick={createCategory} disabled={!newCatName.trim()}>＋ 作成</button>
+            </div>
+            {(categories.length > 0 || uncatCount > 0) && (
+              <div className="rag-catbar-chips">
+                {uncatCount > 0 && (
+                  <span className="rag-cat-chip" title="カテゴリ未指定の登録ドキュメント">未分類 ({uncatCount})</span>
+                )}
+                {categories.map(c => (
+                  <span key={c.name} className="rag-cat-chip">
+                    📂 {c.name} ({c.docCount})
+                    <button
+                      className="rag-cat-del"
+                      title="カテゴリを削除 (ドキュメントとファイルが空のときだけ削除できます)"
+                      onClick={() => deleteCategory(c.name)}
+                    >×</button>
+                  </span>
+                ))}
+              </div>
+            )}
+            <div className="rag-catbar-hint">
+              アップロード/URL登録したファイルは選択中のカテゴリに保存され、チャット側の📚プルダウンでカテゴリ単位に検索できます。
+            </div>
+          </div>
+
           <div className="rag-tabs" role="tablist">
             {TABS.map(t => (
               <button
@@ -494,11 +666,13 @@ function App() {
               appConfig={appConfig}
               jobs={ocrJobs}
               uploading={ocrUploading}
+              categories={categories}
               onFiles={handlePdfFiles}
               onStart={(job) => jobAction('/ocr', job.jobId, 'start')}
               onCancel={(job) => jobAction('/ocr', job.jobId, 'cancel')}
               onRedo={redoOcrJob}
               onDelete={deleteOcrJob}
+              onChangeCategory={changeJobCategory}
             />
           ) : (
             <HragPanel
@@ -506,12 +680,14 @@ function App() {
               appConfig={appConfig}
               jobs={hragJobs}
               uploading={hragUploading}
+              categories={categories}
               onFiles={handleHtmlFiles}
               onUrl={handleUrl}
               onStart={(job) => jobAction('/htmlrag', job.jobId, 'start')}
               onCancel={(job) => jobAction('/htmlrag', job.jobId, 'cancel')}
               onRedo={redoHragJob}
               onDelete={deleteHragJob}
+              onChangeCategory={changeJobCategory}
             />
           )}
         </div>
@@ -526,7 +702,7 @@ function App() {
 // 📄 PDF OCR登録 タブ (旧 /ocr.html の本体)
 // ════════════════════════════════════════════════════════════
 
-function OcrPanel({ status, appConfig, jobs, uploading, onFiles, onStart, onCancel, onRedo, onDelete }) {
+function OcrPanel({ status, appConfig, jobs, uploading, categories, onFiles, onStart, onCancel, onRedo, onDelete, onChangeCategory }) {
   return (
     <>
       <div className="info-box">
@@ -575,10 +751,12 @@ function OcrPanel({ status, appConfig, jobs, uploading, onFiles, onStart, onCanc
             <OcrJobCard
               key={job.jobId}
               job={job}
+              categories={categories}
               onStart={() => onStart(job)}
               onCancel={() => onCancel(job)}
               onRedo={() => onRedo(job)}
               onDelete={() => onDelete(job)}
+              onChangeCategory={(cat) => onChangeCategory(job, cat)}
             />
           ))}
         </div>
@@ -625,7 +803,7 @@ function OcrStatusAlerts({ status }) {
   return <Alerts alerts={alerts} />;
 }
 
-function OcrJobCard({ job, onStart, onCancel, onRedo, onDelete }) {
+function OcrJobCard({ job, categories, onStart, onCancel, onRedo, onDelete, onChangeCategory }) {
   // 実行中は経過時間を毎秒動かす (サーバーからのpushはページ完了時だけなので)
   const [, tick] = useState(0);
   useEffect(() => {
@@ -650,7 +828,8 @@ function OcrJobCard({ job, onStart, onCancel, onRedo, onDelete }) {
   return (
     <div className={`ocr-job ${job.status}`}>
       <div className="ocr-job-head">
-        <div className="ocr-job-name">{job.filename}</div>
+        <div className="ocr-job-name">{String(job.filename || '').split('/').pop()}</div>
+        <CategoryBadge category={job.category} />
         <div className="ocr-job-size">{formatBytes(job.sizeBytes)}</div>
         <div className={`ocr-status ${job.status}`}>{ocrStatusText(job)}</div>
       </div>
@@ -710,14 +889,15 @@ function OcrJobCard({ job, onStart, onCancel, onRedo, onDelete }) {
         {job.status === 'completed' && job.mdFilename && (
           <>
             {/* ジョブファイルは uploads/ragfiles (永続RAGの管理フォルダ、認証付き配信) に置かれている */}
-            <a className="btn small" href={`/uploads/ragfiles/${encodeURIComponent(job.mdFilename)}`} download={job.mdFilename}>
+            <a className="btn small" href={ragFileUrl(job.mdFilename)} download={String(job.mdFilename).split('/').pop()}>
               ⬇ Markdown
             </a>
-            <a className="btn small" href={`/uploads/ragfiles/${encodeURIComponent(job.filename)}`} target="_blank" rel="noreferrer">
+            <a className="btn small" href={ragFileUrl(job.filename)} target="_blank" rel="noreferrer">
               📕 元PDF
             </a>
           </>
         )}
+        <CategoryMoveSelect job={job} categories={categories} onChangeCategory={onChangeCategory} />
         <button className="btn danger small spacer" onClick={onDelete} disabled={isActive(job)}>🗑 削除</button>
       </div>
     </div>
@@ -728,7 +908,7 @@ function OcrJobCard({ job, onStart, onCancel, onRedo, onDelete }) {
 // 🌐 HTML / Web登録 タブ (旧 /htmlrag.html の本体)
 // ════════════════════════════════════════════════════════════
 
-function HragPanel({ status, appConfig, jobs, uploading, onFiles, onUrl, onStart, onCancel, onRedo, onDelete }) {
+function HragPanel({ status, appConfig, jobs, uploading, categories, onFiles, onUrl, onStart, onCancel, onRedo, onDelete, onChangeCategory }) {
   const disabled = !!(status && !status.enabled);
   const urlEnabled = !status || status.allowUrlFetch !== false;
 
@@ -776,10 +956,12 @@ function HragPanel({ status, appConfig, jobs, uploading, onFiles, onUrl, onStart
             <HragJobCard
               key={job.jobId}
               job={job}
+              categories={categories}
               onStart={() => onStart(job)}
               onCancel={() => onCancel(job)}
               onRedo={() => onRedo(job)}
               onDelete={() => onDelete(job)}
+              onChangeCategory={(cat) => onChangeCategory(job, cat)}
             />
           ))}
         </div>
@@ -891,7 +1073,7 @@ function HragStatusAlerts({ status }) {
   return <Alerts alerts={alerts} />;
 }
 
-function HragJobCard({ job, onStart, onCancel, onRedo, onDelete }) {
+function HragJobCard({ job, categories, onStart, onCancel, onRedo, onDelete, onChangeCategory }) {
   const [, tick] = useState(0);
   useEffect(() => {
     if (!isActive(job)) return;
@@ -933,6 +1115,7 @@ function HragJobCard({ job, onStart, onCancel, onRedo, onDelete }) {
     <div className={`ocr-job ${job.status}`}>
       <div className="ocr-job-head">
         <div className="ocr-job-name">{job.title}</div>
+        <CategoryBadge category={job.category} />
         <div className={`hrag-source ${job.source}`}>{job.source === 'url' ? '🌐 URL' : '📁 ローカル'}</div>
         {job.crawl && <div className="hrag-source url" title="同一パス配下のリンクを1階層取り込むジョブ">🔗 1階層</div>}
         <div className="ocr-job-size">{formatBytes(job.sizeBytes)}</div>
@@ -1013,15 +1196,16 @@ function HragJobCard({ job, onStart, onCancel, onRedo, onDelete }) {
           </button>
         )}
         {job.status === 'completed' && job.mdFilename && (
-          <a className="btn small" href={`/uploads/ragfiles/${encodeURIComponent(job.mdFilename)}`} download={job.mdFilename}>
+          <a className="btn small" href={ragFileUrl(job.mdFilename)} download={String(job.mdFilename).split('/').pop()}>
             ⬇ {/\.html$/i.test(job.mdFilename) ? 'クリーンHTML' : 'Markdown'}
           </a>
         )}
         {job.filename && (
-          <a className="btn small" href={`/uploads/ragfiles/${encodeURIComponent(job.filename)}`} target="_blank" rel="noreferrer">
+          <a className="btn small" href={ragFileUrl(job.filename)} target="_blank" rel="noreferrer">
             📄 元HTML
           </a>
         )}
+        <CategoryMoveSelect job={job} categories={categories} onChangeCategory={onChangeCategory} />
         <button className="btn danger small spacer" onClick={onDelete} disabled={isActive(job)}>🗑 削除</button>
       </div>
     </div>

@@ -959,8 +959,9 @@ function createHtmlRagManager({
       jobId: job.jobId,
       source: job.source,                    // 'upload' | 'url'
       url: job.url || null,
-      filename: job.filename || null,        // uploads 内の元HTML
+      filename: job.filename || null,        // uploads 内の元HTML (カテゴリ指定時は "<カテゴリ>/<名前>")
       mdFilename: job.mdFilename || null,    // uploads 内の登録済み成果物 (.md / .rag.html)
+      category: job.category || null,        // 登録先カテゴリ (uploads/ragfiles/<カテゴリ>/)
       title: job.title,
       sizeBytes: job.sizeBytes || 0,
       status: job.status,
@@ -1222,9 +1223,10 @@ function createHtmlRagManager({
       // URLジョブの元HTML保存 (初回に保存名を確定し、再実行では同じ名前へ上書き)
       if (job.source === 'url' && c.keepHtml !== false && rawStartHtml !== null) {
         if (!job.filename) {
-          job.filename = uniqueName(uploadsDir, sanitizeHtmlName(job.title));
+          job.filename = jobRelName(job.category, uniqueName(jobFileDir(job.category), sanitizeHtmlName(job.title)));
           saveJobs();
         }
+        fs.mkdirSync(path.dirname(path.join(uploadsDir, job.filename)), { recursive: true });
         fs.writeFileSync(path.join(uploadsDir, job.filename), rawStartHtml, 'utf-8');
       }
 
@@ -1364,8 +1366,10 @@ function createHtmlRagManager({
 
       const format = c.registerFormat === 'html' ? 'html' : 'markdown';
       if (!job.mdFilename) {
-        const stem = (job.filename ? job.filename.replace(/\.(html?|xhtml)$/i, '') : sanitizeHtmlName(job.title).replace(/\.html$/i, ''));
-        job.mdFilename = uniqueName(uploadsDir, format === 'html' ? `${stem}.rag.html` : `${stem}.md`);
+        // stem はファイル名部分だけから作る (job.filename はカテゴリのフォルダを含み得るため)
+        const baseName = job.filename ? path.basename(job.filename) : sanitizeHtmlName(job.title);
+        const stem = baseName.replace(/\.(html?|xhtml)$/i, '');
+        job.mdFilename = jobRelName(job.category, uniqueName(jobFileDir(job.category), format === 'html' ? `${stem}.rag.html` : `${stem}.md`));
         saveJobs();
       }
       let output;
@@ -1386,6 +1390,7 @@ function createHtmlRagManager({
         }
         output = parts.join('\n\n') + '\n';
       }
+      fs.mkdirSync(path.dirname(path.join(uploadsDir, job.mdFilename)), { recursive: true });
       fs.writeFileSync(path.join(uploadsDir, job.mdFilename), output, 'utf-8');
       job.originalChars = originalChars;
       job.cleanedChars = cleanedChars;
@@ -1454,12 +1459,19 @@ function createHtmlRagManager({
     return `hrag_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   }
 
+  // カテゴリ (uploads/ragfiles/<category>/) 対応の補助。
+  // job.filename / job.mdFilename は uploadsDir 相対パスで持ち、
+  // カテゴリ付きなら "<category>/<名前>" になる (path.join がそのまま通る)
+  const jobFileDir = (category) => (category ? path.join(uploadsDir, category) : uploadsDir);
+  const jobRelName = (category, base) => (category ? `${category}/${base}` : base);
+
   /**
    * HTMLファイルのアップロード受信 → ジョブ登録。
    * multipart/form-data でも、Content-Type: text/html の生ボディでも受ける
-   * (後者は ?name= か X-Filename でファイル名を渡す)
+   * (後者は ?name= か X-Filename でファイル名を渡す)。
+   * category は検証済みのカテゴリ名 (server.js の resolveRagCategory を通したもの)
    */
-  async function receiveUpload(req, { ip = '-' } = {}) {
+  async function receiveUpload(req, { ip = '-', category = null } = {}) {
     ensureDirs();
     const c = cfg();
     const maxBytes = (parseInt(c.maxUploadMB) || 20) * 1024 * 1024;
@@ -1521,17 +1533,21 @@ function createHtmlRagManager({
         e.status = 400; throw e;
       }
 
-      const filename = uniqueName(uploadsDir, sanitizeHtmlName(originalName));
-      fs.renameSync(tmpPath, path.join(uploadsDir, filename));
+      const destDir = jobFileDir(category);
+      fs.mkdirSync(destDir, { recursive: true });
+      const baseName = uniqueName(destDir, sanitizeHtmlName(originalName));
+      fs.renameSync(tmpPath, path.join(destDir, baseName));
 
+      const filename = jobRelName(category, baseName);
       const job = {
         jobId: newJobId(),
         source: 'upload',
         url: null,
         crawl: false,
         filename,
+        category: category || null,
         mdFilename: null,
-        title: filename.replace(/\.(html?|xhtml)$/i, ''),
+        title: baseName.replace(/\.(html?|xhtml)$/i, ''),
         titleLocked: false,
         sizeBytes: bytes,
         status: 'pending',
@@ -1560,7 +1576,7 @@ function createHtmlRagManager({
   }
 
   /** URL からの取り込みジョブを登録する (取得は startJob → processJob で行う) */
-  function addUrlJob(rawUrl, { title = '', crawl = false, ip = '-' } = {}) {
+  function addUrlJob(rawUrl, { title = '', crawl = false, category = null, ip = '-' } = {}) {
     const c = cfg();
     if (c.allowUrlFetch === false) {
       const e = new Error('URLからの取り込みは無効です (config.json の htmlRag.allowUrlFetch)');
@@ -1581,6 +1597,7 @@ function createHtmlRagManager({
       // リンク先の同時取り込み (同一パス配下・1階層)。再取り込みでも引き継がれる
       crawl: crawl === true && c.crawlEnabled !== false,
       filename: null,        // ページの <title> が分かった時点で命名する
+      category: category || null,
       mdFilename: null,
       title: userTitle || titleFromUrl(u.href),
       titleLocked: !!userTitle,
@@ -1651,6 +1668,49 @@ function createHtmlRagManager({
       setStatus(job, 'cancelled', { phase: null, finishedAt: Date.now() });
     }
     return jobView(job);
+  }
+
+  /**
+   * RAG登録済みジョブのファイルを別カテゴリへ移す (未分類は category=null)。
+   * server.js のカテゴリ変更APIから呼ばれる。docId はパス由来なので、
+   * 新しい docId (newRagDocId) は server 側で計算して渡してもらう。
+   * 対象ジョブが無ければ null を返す (呼び出し側が別の手段にフォールバックする)。
+   */
+  function moveJobCategory(ragDocId, category, newRagDocId = null) {
+    if (!ragDocId) return null;
+    const job = loadJobs().find(j => j.ragDocId === ragDocId);
+    if (!job) return null;
+    if (ACTIVE_STATUSES.includes(job.status)) {
+      const e = new Error('実行中のジョブはカテゴリを変更できません'); e.status = 409; throw e;
+    }
+    const destDir = jobFileDir(category);
+    // 先に全ファイルの移動先を検証してから動かす (片方だけ移って止まるのを避ける)
+    const moves = [];
+    for (const key of ['filename', 'mdFilename']) {
+      const rel = job[key];
+      if (!rel || typeof rel !== 'string') continue;
+      const base = path.basename(rel);
+      const newRel = jobRelName(category, base);
+      if (newRel === rel) continue;
+      const from = path.join(uploadsDir, rel);
+      const to = path.join(uploadsDir, newRel);
+      if (fs.existsSync(to)) {
+        const e = new Error(`移動先に同名のファイルがあります: ${newRel}`); e.status = 409; throw e;
+      }
+      // 元ファイルが消えていても (keepHtml=false 等) ジョブの参照名だけは付け替える
+      moves.push({ key, newRel, from, to, exists: fs.existsSync(from) });
+    }
+    fs.mkdirSync(destDir, { recursive: true });
+    for (const m of moves) {
+      if (m.exists) fs.renameSync(m.from, m.to);
+      job[m.key] = m.newRel;
+    }
+    job.category = category || null;
+    if (newRagDocId) job.ragDocId = newRagDocId;
+    saveJobs();
+    emitEvent(job.jobId, { type: 'status', job: jobView(job) });
+    log('-', `[HTML-RAG] カテゴリ変更: ${job.title} → ${category || '未分類'}`);
+    return { jobId: job.jobId, filename: job.filename, mdFilename: job.mdFilename };
   }
 
   /** ジョブ削除 (元HTML・成果物・RAG登録をまとめて片付ける) */
@@ -1773,6 +1833,7 @@ function createHtmlRagManager({
     startJob,
     cancelJob,
     deleteJob,
+    moveJobCategory,
     subscribe,
     restoreOnBoot,
   };

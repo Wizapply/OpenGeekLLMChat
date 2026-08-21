@@ -2868,6 +2868,7 @@ const ML_JOBS_FILE = path.join(ML_DIR, 'jobs.json');   // 学習ジョブ履歴
 // 外部API(ツール対応モード)用の永続RAGストア
 const RAG_DIR = path.join(__dirname, 'ml', 'rag');     // RAGドキュメント保存先
 const RAG_INDEX_FILE = path.join(RAG_DIR, 'index.json'); // 登録ドキュメント一覧
+const RAG_CATEGORIES_FILE = path.join(RAG_DIR, 'categories.json'); // カテゴリ一覧 (名前=ragfiles内のフォルダ名)
 
 // 画像検出 (torchvision) のモデルweightキャッシュ先
 // 本番環境では ~/.cache が読み取り専用のことがあるため、アプリ内に明示
@@ -9242,16 +9243,70 @@ function ragDocId(filename) {
   return crypto.createHash('sha1').update(filename).digest('hex').slice(0, 16);
 }
 
+// ─── RAGカテゴリ ───
+// カテゴリ = uploads/ragfiles/<フォルダ名> の1階層。カテゴリ名がそのままフォルダ名になる。
+// 一覧はフォルダ走査ではなく ml/rag/categories.json の登録簿で持つ
+// (ドキュメント0件の空カテゴリもUIの選択肢に出し続けるため)。
+// 未分類のドキュメントは従来どおり ragfiles 直下に置かれ、category は null。
+function loadRagCategories() {
+  if (!fs.existsSync(RAG_CATEGORIES_FILE)) return [];
+  try {
+    const data = JSON.parse(fs.readFileSync(RAG_CATEGORIES_FILE, 'utf-8'));
+    return Array.isArray(data.categories) ? data.categories : [];
+  } catch { return []; }
+}
+function saveRagCategories(categories) {
+  fs.writeFileSync(RAG_CATEGORIES_FILE, JSON.stringify({ categories }, null, 2), 'utf-8');
+}
+
+// カテゴリ名の整形 (フォルダ名としてそのまま使うので、fs的に危険な文字を潰す)
+function sanitizeRagCategoryName(raw) {
+  let name = String(raw || '').replace(/[\r\n\t\0]/g, ' ').trim();
+  name = name.replace(/[\/\\:*?"<>|]/g, '_');
+  name = name.replace(/^\.+/, '');   // 先頭ドット (隠しフォルダ化と safeRagFilePath の拒否を避ける)
+  name = name.trim();
+  if (name.length > 40) name = name.slice(0, 40);
+  return name;
+}
+
+// 登録済みカテゴリを探す (大文字小文字は区別しない。Windowsではフォルダが同一視されるため)
+function findRagCategory(name) {
+  if (!name) return null;
+  const lower = String(name).toLowerCase();
+  return loadRagCategories().find(c => c.name.toLowerCase() === lower) || null;
+}
+
+// アップロード/登録時の category パラメータ解決。空・未指定は null (未分類)。
+// 未登録の名前はエラー (タイポのたびに勝手にフォルダが増えるのを防ぐ)
+function resolveRagCategory(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  const cat = findRagCategory(s);
+  if (!cat) {
+    const e = new Error(`カテゴリ「${s}」は登録されていません。先に永続RAG画面でカテゴリを作成してください`);
+    e.status = 400;
+    throw e;
+  }
+  return cat.name;
+}
+
 // uploads のファイルを RAG 化して保存。
 // ragDir: true (または "ragfiles/" プレフィックス付きの filename) は、OCR/HTML取り込みが
 // 生成物を置く管理フォルダ (uploads/ragfiles) 内のファイルを指す。
 // docId・表示名は管理フォルダのプレフィックスを除いた名前で計算するので、
 // 旧バージョン (uploads直下に保存) で登録済みのドキュメントとIDが揺れない。
-async function ragIngestFile(filename, { ragDir = false } = {}) {
+// カテゴリ: ragfiles 内のサブフォルダ名 (filename の1階層目) がそのままカテゴリになる。
+// 手動登録 (uploads のユーザーファイル) は opts.category をメタデータとして持てる。
+async function ragIngestFile(filename, { ragDir = false, category = null } = {}) {
   let name = String(filename || '');
   const m = name.match(/^ragfiles[\/\\](.+)$/i);
   if (m) { ragDir = true; name = m[1]; }
   filename = name;
+  let cat = category || null;
+  if (ragDir) {
+    const segs = filename.split(/[\/\\]/).filter(Boolean);
+    cat = segs.length > 1 ? segs[0] : null;
+  }
   const abs = ragDir ? safeRagFilePath(filename) : safeUploadPath(filename);
   if (!abs) throw new Error('無効なファイルパス');
   if (!fs.existsSync(abs)) throw new Error(`ファイルが見つかりません: ${filename}`);
@@ -9291,6 +9346,7 @@ async function ragIngestFile(filename, { ragDir = false } = {}) {
   const docId = ragDocId(filename);
   const docData = {
     docId, filename, chunkCount: chunks.length,
+    category: cat,            // ragfiles内のサブフォルダ名 (未分類は null)
     chunks, embeddings,
     pages,                    // 各チャンクの由来ページ (OCR以外の資料では null 埋め)
     chunkSize, overlap,       // 再現・デバッグ用に分割条件も残す
@@ -9302,11 +9358,11 @@ async function ragIngestFile(filename, { ragDir = false } = {}) {
   const idx = loadRagIndex();
   idx.documents = idx.documents.filter(d => d.docId !== docId);  // 既存削除
   idx.documents.push({
-    docId, filename, chunkCount: chunks.length, ingestedAt: docData.ingestedAt,
+    docId, filename, category: cat, chunkCount: chunks.length, ingestedAt: docData.ingestedAt,
   });
   saveRagIndex(idx);
 
-  return { docId, filename, chunkCount: chunks.length };
+  return { docId, filename, category: cat, chunkCount: chunks.length };
 }
 
 // RAG検索 (全ドキュメントのチャンクから cosine 類似度 top-k)
@@ -9315,9 +9371,17 @@ async function ragIngestFile(filename, { ragDir = false } = {}) {
 // 連結したもの。embedding の ctx (BERT系は512トークン固定) を侵さずに、
 // 数式とその記号定義のように離れた記述を一緒に届けるための仕組み。
 // neighbors に null を渡すと config.ragNeighborChunks を使う。
-async function ragSearch(query, topK = 5, neighbors = null) {
+// category: undefined/null = 全ドキュメント、'' = 未分類のみ、名前 = そのカテゴリのみ
+async function ragSearch(query, topK = 5, neighbors = null, category = undefined) {
   const idx = loadRagIndex();
   if (idx.documents.length === 0) return { results: [], note: 'RAGドキュメントが登録されていません' };
+  let targetDocs = idx.documents;
+  if (category !== undefined && category !== null) {
+    targetDocs = targetDocs.filter(d => (d.category || '') === category);
+    if (targetDocs.length === 0) {
+      return { results: [], note: `カテゴリ「${category || '未分類'}」に登録ドキュメントがありません` };
+    }
+  }
 
   const n = neighbors === null
     ? Math.max(0, parseInt(appConfig.ragNeighborChunks) || 0)
@@ -9326,7 +9390,7 @@ async function ragSearch(query, topK = 5, neighbors = null) {
   const qVec = await ragGetEmbedding(query);
   const docs = new Map();   // docId -> ドキュメント本体 (連結時に再読み込みしないため)
   const scored = [];
-  for (const doc of idx.documents) {
+  for (const doc of targetDocs) {
     const docPath = path.join(RAG_DIR, `${doc.docId}.json`);
     if (!fs.existsSync(docPath)) continue;
     try {
@@ -9431,6 +9495,8 @@ function requireEmbedding(req, res, next) {
 
 // uploads のファイルを RAG 登録
 // body: { filename: "manual.txt" }  または { filenames: ["a.txt", "b.md"] }
+//   category (任意): 登録先カテゴリ名。管理フォルダ内 ("ragfiles/カテゴリ/名前.md") の
+//   ファイルはパスからカテゴリが自動で決まるので指定不要
 app.post('/rag/documents', requireAuth, requirePermission('ml:write'), requireEmbedding, jsonParser, async (req, res) => {
   const ip = getIP(req);
   const { filename, filenames } = req.body || {};
@@ -9438,19 +9504,167 @@ app.post('/rag/documents', requireAuth, requirePermission('ml:write'), requireEm
   if (targets.length === 0) {
     return res.status(400).json({ error: 'filename または filenames が必要です' });
   }
+  let category = null;
+  try { category = resolveRagCategory(req.body?.category); }
+  catch (e) { return res.status(e.status || 400).json({ error: e.message }); }
   const results = [];
   const errors = [];
   for (const f of targets) {
     try {
-      const r = await ragIngestFile(f);
+      const r = await ragIngestFile(f, { category });
       results.push(r);
-      log(ip, `[RAG] 登録: ${f} (${r.chunkCount} チャンク)`);
+      log(ip, `[RAG] 登録: ${f} (${r.chunkCount} チャンク${r.category ? `、カテゴリ: ${r.category}` : ''})`);
     } catch (e) {
       errors.push({ filename: f, error: e.message });
       log(ip, `[RAG] 登録失敗: ${f} - ${e.message}`);
     }
   }
   res.json({ ingested: results, errors, count: results.length });
+});
+
+// ─── RAGカテゴリ API ───
+
+// カテゴリ一覧 (登録ドキュメント数付き)。uncategorizedCount はカテゴリ無しのドキュメント数
+app.get('/rag/categories', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const idx = loadRagIndex();
+  const countBy = new Map();
+  for (const d of idx.documents) {
+    const c = d.category || '';
+    countBy.set(c, (countBy.get(c) || 0) + 1);
+  }
+  const categories = loadRagCategories().map(c => ({
+    name: c.name,
+    createdAt: c.createdAt || null,
+    docCount: countBy.get(c.name) || 0,
+  }));
+  res.json({ categories, uncategorizedCount: countBy.get('') || 0 });
+});
+
+// カテゴリ作成 body: { name }。uploads/ragfiles/<name>/ のフォルダも作る
+app.post('/rag/categories', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  const ip = getIP(req);
+  const name = sanitizeRagCategoryName(req.body?.name);
+  if (!name) return res.status(400).json({ error: 'カテゴリ名が必要です' });
+  if (findRagCategory(name)) return res.status(409).json({ error: `カテゴリ「${name}」は既にあります` });
+  try {
+    fs.mkdirSync(path.join(RAGFILES_DIR, name), { recursive: true });
+  } catch (e) {
+    return res.status(500).json({ error: `フォルダを作成できません: ${e.message}` });
+  }
+  const categories = loadRagCategories();
+  categories.push({ name, createdAt: Date.now() });
+  saveRagCategories(categories);
+  log(ip, `[RAG] カテゴリ作成: ${name} (uploads/ragfiles/${name}/)`);
+  res.json({ ok: true, name });
+});
+
+// カテゴリ削除。登録ドキュメントやフォルダ内のファイルが残っている間は消させない
+// (ジョブ側の参照を壊さないため。先にジョブ/ドキュメントを削除してもらう)
+app.delete('/rag/categories/:name', requireAuth, requirePermission('ml:write'), (req, res) => {
+  const ip = getIP(req);
+  const cat = findRagCategory(sanitizeRagCategoryName(req.params.name));
+  if (!cat) return res.status(404).json({ error: 'カテゴリが見つかりません' });
+  const idx = loadRagIndex();
+  const docCount = idx.documents.filter(d => (d.category || '') === cat.name).length;
+  if (docCount > 0) {
+    return res.status(409).json({ error: `カテゴリ「${cat.name}」には ${docCount} 件のドキュメントが登録されています。先に登録画面でジョブを削除してください` });
+  }
+  const dir = path.join(RAGFILES_DIR, cat.name);
+  try {
+    const left = fs.existsSync(dir) ? fs.readdirSync(dir).filter(n => !n.startsWith('.')) : [];
+    if (left.length > 0) {
+      return res.status(409).json({ error: `カテゴリのフォルダにファイルが ${left.length} 件残っています。先に登録画面でジョブを削除してください` });
+    }
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+  saveRagCategories(loadRagCategories().filter(c => c.name !== cat.name));
+  log(ip, `[RAG] カテゴリ削除: ${cat.name}`);
+  res.json({ ok: true });
+});
+
+// RAG ドキュメントのカテゴリ変更 (embedding不要: ファイル移動とインデックス更新のみ)
+// body: { category: "名前" } / { category: "" } (未分類へ)
+// - OCR/HTML取り込みのジョブがあれば、元PDF/HTMLと生成Markdownをカテゴリの
+//   フォルダへ移し、ジョブ記録 (filename/mdFilename/category/ragDocId) も更新する
+// - docId は「ragfiles からの相対パス」由来なので、移動に合わせて振り直す
+//   (再OCR・再取り込みが同じドキュメントとして上書きし続けられるように)
+// - uploads のユーザーファイルを手動登録したドキュメントは、ファイルは動かさず
+//   メタデータの category だけ変更する
+app.post('/rag/documents/:docId/category', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  const ip = getIP(req);
+  const docId = req.params.docId;
+  if (!/^[a-f0-9]{16}$/.test(docId)) return res.status(400).json({ error: '無効なdocId' });
+  let category = null;
+  try { category = resolveRagCategory(req.body?.category); }
+  catch (e) { return res.status(e.status || 400).json({ error: e.message }); }
+  try {
+    const idx = loadRagIndex();
+    const entry = idx.documents.find(d => d.docId === docId);
+    if (!entry) return res.status(404).json({ error: 'ドキュメントが見つかりません' });
+    if ((entry.category || null) === (category || null)) {
+      return res.json({ ok: true, docId: entry.docId, filename: entry.filename, category: entry.category || null, unchanged: true });
+    }
+
+    const base = path.basename(String(entry.filename || ''));
+    const newRel = category ? `${category}/${base}` : base;
+    const newDocId = ragDocId(newRel);
+    // 再キー先の衝突はファイルを動かす前に確認して止める
+    if (newDocId !== entry.docId
+        && (idx.documents.some(d => d.docId === newDocId) || fs.existsSync(path.join(RAG_DIR, `${newDocId}.json`)))) {
+      return res.status(409).json({ error: `移動先に同名のドキュメントが既にあります: ${newRel}` });
+    }
+
+    // ジョブ (OCR / HTML取り込み) があれば、ジョブのファイルごと移す
+    let moved = ocr.moveJobCategory(docId, category, newDocId);
+    if (!moved) moved = htmlRag.moveJobCategory(docId, category, newDocId);
+
+    if (!moved) {
+      const manualAbs = safeUploadPath(entry.filename);
+      if (manualAbs && fs.existsSync(manualAbs)) {
+        // uploads のユーザーファイルの手動登録: メタデータだけ変更 (docId も不変)
+        entry.category = category;
+        saveRagIndex(idx);
+        const p = path.join(RAG_DIR, `${entry.docId}.json`);
+        try {
+          const d = JSON.parse(fs.readFileSync(p, 'utf-8'));
+          d.category = category;
+          fs.writeFileSync(p, JSON.stringify(d), 'utf-8');
+        } catch {}
+        log(ip, `[RAG] カテゴリ変更 (メタデータのみ): ${entry.filename} → ${category || '未分類'}`);
+        return res.json({ ok: true, docId: entry.docId, filename: entry.filename, category });
+      }
+      // ジョブの無い ragfiles ドキュメント (ジョブ削除後に残した生成物等): 本体だけ移す
+      const from = safeRagFilePath(entry.filename);
+      const to = safeRagFilePath(newRel);
+      if (from && to && from !== to && fs.existsSync(from)) {
+        if (fs.existsSync(to)) return res.status(409).json({ error: `移動先に同名のファイルがあります: ${newRel}` });
+        fs.mkdirSync(path.dirname(to), { recursive: true });
+        fs.renameSync(from, to);
+      }
+    }
+
+    // RAGドキュメントの再キー (本体JSONの改名と、インデックスの更新)
+    const oldDocPath = path.join(RAG_DIR, `${entry.docId}.json`);
+    const newDocPath = path.join(RAG_DIR, `${newDocId}.json`);
+    if (fs.existsSync(oldDocPath)) {
+      const data = JSON.parse(fs.readFileSync(oldDocPath, 'utf-8'));
+      data.docId = newDocId;
+      data.filename = newRel;
+      data.category = category;
+      fs.writeFileSync(newDocPath, JSON.stringify(data), 'utf-8');
+      if (newDocPath !== oldDocPath) fs.unlinkSync(oldDocPath);
+    }
+    entry.docId = newDocId;
+    entry.filename = newRel;
+    entry.category = category;
+    saveRagIndex(idx);
+    log(ip, `[RAG] カテゴリ変更: ${base} → ${category || '未分類'} (docId: ${docId} → ${newDocId})`);
+    res.json({ ok: true, docId: newDocId, filename: newRel, category, jobId: moved ? moved.jobId : null });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
 });
 
 // RAG ドキュメント削除 (embedding不要: ファイル削除のみ)
@@ -9466,16 +9680,18 @@ app.delete('/rag/documents/:docId', requireAuth, requirePermission('ml:write'), 
 });
 
 // RAG 検索 (テスト用、agent_proxy も内部でこれと同じ ragSearch を使う)
-// body: { query, topK?, neighbors? }
+// body: { query, topK?, neighbors?, category? }
 //   topK      … 拾うチャンク数 (省略時 config.ragTopK)
 //   neighbors … ヒットの前後何チャンクを連結して返すか (省略時 config.ragNeighborChunks)
+//   category  … 検索対象カテゴリ。省略/null = 全ドキュメント、"" = 未分類のみ、名前 = そのカテゴリのみ
 app.post('/rag/search', requireAuth, requirePermission('ml:read'), requireEmbedding, jsonParser, async (req, res) => {
-  const { query, topK, neighbors } = req.body || {};
+  const { query, topK, neighbors, category } = req.body || {};
   if (!query) return res.status(400).json({ error: 'query が必要です' });
   try {
     const k = Math.min(parseInt(topK) || appConfig.ragTopK || 10, 50);
     const n = (neighbors === undefined || neighbors === null) ? null : Math.min(parseInt(neighbors) || 0, 10);
-    const result = await ragSearch(query, k, n);
+    const cat = (category === undefined || category === null) ? undefined : String(category);
+    const result = await ragSearch(query, k, n, cat);
     res.json(result);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -9565,12 +9781,14 @@ app.get('/ocr/status', requireAuth, requirePermission('ml:read'), async (req, re
 // PDF アップロード → ジョブ登録
 // multipart/form-data (name は任意) か、Content-Type: application/pdf の生ボディ。
 // 生ボディの場合はファイル名を ?name= か X-Filename ヘッダーで渡す。
+// ?category=<カテゴリ名> で登録先カテゴリ (uploads/ragfiles/<カテゴリ>/) を指定できる。
 // autostart=0 を付けない限り、登録後そのまま実行キューに載せる。
 app.post('/ocr/upload', requireAuth, requirePermission('ml:write'), requireOcr, async (req, res) => {
   const ip = getIP(req);
   let job;
   try {
-    job = await ocr.receiveUpload(req, { ip });
+    const category = resolveRagCategory(req.query.category);
+    job = await ocr.receiveUpload(req, { ip, category });
   } catch (e) {
     return ocrError(res, e);
   }
@@ -9715,12 +9933,14 @@ app.get('/htmlrag/status', requireAuth, requirePermission('ml:read'), async (req
 // HTML アップロード → ジョブ登録
 // multipart/form-data (name は任意) か、Content-Type: text/html の生ボディ。
 // 生ボディの場合はファイル名を ?name= か X-Filename ヘッダーで渡す。
+// ?category=<カテゴリ名> で登録先カテゴリ (uploads/ragfiles/<カテゴリ>/) を指定できる。
 // autostart=0 を付けない限り、登録後そのまま実行キューに載せる。
 app.post('/htmlrag/upload', requireAuth, requirePermission('ml:write'), requireHtmlRag, async (req, res) => {
   const ip = getIP(req);
   let job;
   try {
-    job = await htmlRag.receiveUpload(req, { ip });
+    const category = resolveRagCategory(req.query.category);
+    job = await htmlRag.receiveUpload(req, { ip, category });
   } catch (e) {
     return ocrError(res, e);
   }
@@ -9736,15 +9956,17 @@ app.post('/htmlrag/upload', requireAuth, requirePermission('ml:write'), requireH
 });
 
 // URL 指定でのジョブ登録 (取得はジョブ実行時に行う)
-// body: { url: "https://...", title?: "任意の表示名", crawl?: true }
+// body: { url: "https://...", title?: "任意の表示名", crawl?: true, category?: "カテゴリ名" }
 //   crawl: 同一パス配下のリンクを1階層だけ辿ってまとめて取り込む (htmlRag.crawl* 設定に従う)
+//   category: 登録先カテゴリ (uploads/ragfiles/<カテゴリ>/)
 app.post('/htmlrag/url', requireAuth, requirePermission('ml:write'), requireHtmlRag, jsonParser, (req, res) => {
   const ip = getIP(req);
   const { url, title, crawl } = req.body || {};
   if (!url) return res.status(400).json({ error: 'url が必要です' });
   let job;
   try {
-    job = htmlRag.addUrlJob(url, { title, crawl: crawl === true, ip });
+    const category = resolveRagCategory(req.body?.category);
+    job = htmlRag.addUrlJob(url, { title, crawl: crawl === true, category, ip });
   } catch (e) {
     return ocrError(res, e);
   }

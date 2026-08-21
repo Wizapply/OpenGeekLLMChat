@@ -78,7 +78,7 @@ PDF アップロード → public/uploads/ragfiles/<名前>.pdf に保存
   → ragIngestFile() で RAG 登録 → search_persistent_documents から参照可能
 ```
 
-元PDFと生成Markdownは `uploads` 直下ではなく**管理フォルダ `public/uploads/ragfiles/`** に保存されます。サーバーファイル一覧（右サイドバー / `GET /files`）や LLM のファイルツール（`list_files` / `read_file` / `write_file`）、Drive連携には出てこないので、RAG登録を重ねてもユーザーのファイル置き場が散らかりません（ダウンロードはRAG登録画面のボタンから、認証付きの `/uploads/ragfiles/*` ルートで配信）。ジョブを削除すればファイルも一緒に片付きます。旧バージョンが `uploads` 直下に保存したジョブファイルは、サーバー起動時に自動で `ragfiles/` へ移動されます。
+元PDFと生成Markdownは `uploads` 直下ではなく**管理フォルダ `public/uploads/ragfiles/`** に保存されます（カテゴリを指定した場合は `uploads/ragfiles/<カテゴリ名>/`）。サーバーファイル一覧（右サイドバー / `GET /files`）や LLM のファイルツール（`list_files` / `read_file` / `write_file`）、Drive連携には出てこないので、RAG登録を重ねてもユーザーのファイル置き場が散らかりません（ダウンロードはRAG登録画面のボタンから、認証付きの `/uploads/ragfiles/*` ルートで配信）。ジョブを削除すればファイルも一緒に片付きます。旧バージョンが `uploads` 直下に保存したジョブファイルは、サーバー起動時に自動で `ragfiles/` へ移動されます。
 
 **特徴**
 
@@ -144,7 +144,7 @@ llama-server -m /models/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf \
 
 | Method | Path | 説明 |
 |---|---|---|
-| `POST` | `/ocr/upload` | PDF を受信 → ジョブ登録（既定でそのまま開始。`?autostart=0` で保留） |
+| `POST` | `/ocr/upload` | PDF を受信 → ジョブ登録（既定でそのまま開始。`?autostart=0` で保留、`?category=名前` で登録先カテゴリ指定） |
 | `GET` | `/ocr/jobs` | 全ジョブの状態一覧 |
 | `GET` | `/ocr/jobs/:jobId` | 個別ジョブの詳細 |
 | `GET` | `/ocr/jobs/:jobId/stream` | SSE でリアルタイム進捗配信 |
@@ -211,8 +211,8 @@ URL指定 or HTMLアップロード
 
 | Method | Path | 説明 |
 |---|---|---|
-| `POST` | `/htmlrag/upload` | HTML を受信 → ジョブ登録（既定でそのまま開始。`?autostart=0` で保留） |
-| `POST` | `/htmlrag/url` | URL指定でジョブ登録。ボディ `{"url":"https://...", "title":"任意", "crawl":true}`（`crawl` で同一パス配下の1階層クロール） |
+| `POST` | `/htmlrag/upload` | HTML を受信 → ジョブ登録（既定でそのまま開始。`?autostart=0` で保留、`?category=名前` で登録先カテゴリ指定） |
+| `POST` | `/htmlrag/url` | URL指定でジョブ登録。ボディ `{"url":"https://...", "title":"任意", "crawl":true, "category":"任意"}`（`crawl` で同一パス配下の1階層クロール、`category` で登録先カテゴリ指定） |
 | `GET` | `/htmlrag/jobs` | 全ジョブの状態一覧 |
 | `GET` | `/htmlrag/jobs/:jobId` | 個別ジョブの詳細 |
 | `GET` | `/htmlrag/jobs/:jobId/stream` | SSE でリアルタイム進捗配信 |
@@ -247,8 +247,12 @@ curl -X POST 'http://localhost:3000/htmlrag/upload' \
 ### 🌐 Web検索ON/OFFトグル
 チャット入力欄の🌐ボタンで検索の有効/無効を即座に切り替え可能。社内ドキュメントだけで答えてほしい時はOFF、最新情報が必要な時はONに。デフォルトは `config.webSearch` で設定。
 
-### 📚 登録資料（永続RAG）ON/OFFトグル
-チャット入力欄の📚ボタンで、サーバー登録資料の検索を切り替えられます（サーバーに資料が登録されている時だけ表示）。**デフォルトはOFF** で、OFFの間は `search_persistent_documents` ツールもRAG用の引用ルールもLLMに渡らないため、雑談やコード生成のたびにベクトル検索が走ることがありません。資料について尋ねたいチャットでONにしてください。新規チャットを開くと既定値に戻ります。初期値は `config.ragEnabledByDefault` で変更できます。
+### 📚 登録資料（永続RAG）のカテゴリ選択プルダウン
+チャット入力欄の📚プルダウンで、サーバー登録資料の検索対象を選べます（サーバーに資料が登録されている時だけ表示）。選択肢は **「使用しない」「すべての資料」「（カテゴリ名）…」「未分類」** で、カテゴリを選ぶと `search_persistent_documents` の検索もツール定義に載る資料一覧も、そのカテゴリの資料だけに絞られます。**デフォルトは「使用しない」** で、その間は検索ツールもRAG用の引用ルールもLLMに渡らないため、雑談やコード生成のたびにベクトル検索が走ることがありません。資料について尋ねたいチャットで対象を選んでください。選択はチャットごとに保存され、新規チャットを開くと既定値に戻ります。初期値は `config.ragEnabledByDefault`（`true` で「すべての資料」）で変更できます。
+
+カテゴリは **`/rag.html`（永続RAG登録画面）上部の「📂 登録先カテゴリ」バー**で作成・削除します。カテゴリ名がそのまま `uploads/ragfiles/<カテゴリ名>/` のフォルダになり、以降そのカテゴリを選んでアップロード/URL登録したファイル（元PDF/HTMLと生成Markdown）はフォルダ内に保存されます。カテゴリの削除は、登録ドキュメントとフォルダ内のファイルが空のときだけできます（先にジョブを削除してください）。
+
+**登録済みドキュメントの振り分け** — 既存の資料（未分類を含む）は、`/rag.html` のジョブカードにある **「📂 カテゴリ変更」セレクト**で後からカテゴリへ移動できます。元PDF/HTML・生成Markdown・RAG登録・ジョブ記録がまとめて移動し、再OCR・再取り込みも移動先のカテゴリで同じドキュメントとして上書きされ続けます（`POST /rag/documents/:docId/category` を直接叩いても同じことができます）。
 
 ### 📐 コンテキスト管理（コンパクション / 重み付け）
 会話履歴の送り方は `config.historyMode` で選択:
@@ -1387,7 +1391,7 @@ opengeek-llm-chat/
 | `ragNeighborChunks` | ヒットの前後何チャンクを一緒に渡すか。数式と記号定義が分断されるのを防ぐ（0で無効） |
 | `ragRelaxSamplers` | 検索結果を渡して回答させる時、繰り返しペナルティ（DRY・repeat_penalty）を外す。既定 `true`。**RAG で原文どおりの引用が必要なら切らないこと**（詳細は下記） |
 | `ragAlwaysSearch` | 毎ターン必ず永続RAGを検索する。判断モデルが `web_search` を選んだり検索を省いたりする場合に `true`。既定 `false`（チャット欄の📚トグルがONのチャットでのみ効く） |
-| `ragEnabledByDefault` | チャット欄の📚トグル（登録資料の検索）の初期値。既定 `false` = OFF。常時RAGを引く運用なら `true` |
+| `ragEnabledByDefault` | チャット欄の📚プルダウン（登録資料の検索）の初期値。既定 `false` = 「使用しない」。`true` にすると「すべての資料」で始まる |
 | `ragLedgerTurns` | 直近いくつの回答ぶんの出典（資料名・ページ・抜粋）を次のターンへ持ち越すか、デフォルト1（0で無効） |
 | `ragLedgerChars` | 持ち越す1出典あたりの抜粋文字数、デフォルト400（0ならページ対応表のみ） |
 | `agentContext.smallPredict` | ツール判断時のmax_tokens（短文モード）デフォルト512 |
@@ -2308,10 +2312,14 @@ PDF/Word は事前にテキスト化が必要 (バイナリは拒否)。
 
 | メソッド | パス | 権限 | 説明 |
 |:--|:--|:--|:--|
-| GET | `/rag/documents` | `ml:read` | 登録一覧 |
-| POST | `/rag/documents` | `ml:write` | uploads のファイルを RAG 登録 |
+| GET | `/rag/documents` | `ml:read` | 登録一覧（各ドキュメントに `category` 付き） |
+| POST | `/rag/documents` | `ml:write` | uploads のファイルを RAG 登録（`category` 指定可） |
 | DELETE | `/rag/documents/:docId` | `ml:write` | ドキュメント削除 |
-| POST | `/rag/search` | `ml:read` | RAG 検索 (テスト用) |
+| POST | `/rag/documents/:docId/category` | `ml:write` | ドキュメントのカテゴリ変更（`{"category":"名前"}`、`""`=未分類へ。ジョブのファイルごと移動） |
+| POST | `/rag/search` | `ml:read` | RAG 検索 (テスト用)。`category` で絞り込み可（省略=全体、`""`=未分類） |
+| GET | `/rag/categories` | `ml:read` | カテゴリ一覧（登録ドキュメント数付き） |
+| POST | `/rag/categories` | `ml:write` | カテゴリ作成（`{"name": "..."}`。`uploads/ragfiles/<名前>/` を作る） |
+| DELETE | `/rag/categories/:name` | `ml:write` | カテゴリ削除（ドキュメント・ファイルが空のときだけ） |
 
 ### ストレージ
 

@@ -5998,7 +5998,8 @@ Markdown 変換）も同型の構成で、同じ画面の「🌐 HTML / Web登�
 | ジョブは **既定1本ずつ**順次実行 | 単一GPUに Vision LLM (Qwen2.5-VL 7B ≒ 9GB) と embedding (≒1.5GB) を同居させる前提。並列にすると OOM する。`maxConcurrentJobs` で将来のマルチGPUに開けてある |
 | 1ページ失敗しても **ジョブは止めない** | 300ページ中1ページが崩れただけで全部無駄になるのは損。リトライ後スキップし、失敗ページを記録する |
 | RAG登録は **内部関数呼び出し** | `ragIngestFile()` を直接呼ぶ。自分自身に HTTP を投げると認証・タイムアウト・多重プロキシの面倒が増えるだけで得がない |
-| ジョブファイルは **`uploads/ragfiles/` に隔離** | 元PDF/元HTMLと生成Markdownを `uploads` 直下に置くと、登録を重ねるほどユーザーのサーバーファイル一覧 (`/files`) と LLM の `list_files` がRAG素材で埋まる。管理フォルダに隔離し、一覧・ファイルツール・Drive連携からは隠す（`safeUploadPath` が隠しファイルと同じ扱いで遮断）。ダウンロード/プレビューは認証付き専用ルート `/uploads/ragfiles/*` だけが窓口。docId はフォルダ名を含まない素のファイル名から計算するので、旧配置で登録済みのドキュメントとIDが揺れない。旧配置のジョブファイルは起動時 (`restoreOnBoot` → `migrateLegacyFiles`) に自動移行する |
+| ジョブファイルは **`uploads/ragfiles/` に隔離** | 元PDF/元HTMLと生成Markdownを `uploads` 直下に置くと、登録を重ねるほどユーザーのサーバーファイル一覧 (`/files`) と LLM の `list_files` がRAG素材で埋まる。管理フォルダに隔離し、一覧・ファイルツール・Drive連携からは隠す（`safeUploadPath` が隠しファイルと同じ扱いで遮断）。ダウンロード/プレビューは認証付き専用ルート `/uploads/ragfiles/*` だけが窓口。docId は「ragfiles からの相対パス」(未分類は素のファイル名) から計算するので、旧配置で登録済みのドキュメントとIDが揺れない。旧配置のジョブファイルは起動時 (`restoreOnBoot` → `migrateLegacyFiles`) に自動移行する |
+| カテゴリ = **`ragfiles/<フォルダ>` の1階層** | 資料が増えると「この会話では設計資料だけ引きたい」が出てくる。カテゴリ名がそのままフォルダ名になり (`sanitizeRagCategoryName` で fs 安全な名前に整形)、ジョブの `filename`/`mdFilename` は「`<カテゴリ>/<名前>`」の uploadsDir 相対パスで持つ (`path.join` がそのまま通るので、マネージャ側の読み書き/削除のコードは変わらない)。カテゴリ一覧はフォルダ走査ではなく `ml/rag/categories.json` の登録簿 (空カテゴリも選択肢に出し続けるため)。ドキュメントの `category` はパスの1階層目から自動導出し、検索は `ragSearch(query, topK, neighbors, category)` がインデックスの `category` で絞る (省略=全体、`''`=未分類)。チャット側は📚トグルをプルダウン (使用しない/すべて/カテゴリ…/未分類) に置き換え、ツール定義に載せる資料名一覧も選択範囲で絞る。カテゴリの削除は「ドキュメント0件かつフォルダが空」のときだけ (ジョブの参照を壊さないため) |
 | Vision LLM は **LLMプールに載せられる** | 外部起動 (`vlmEndpoint`) だけだと、OCRが終わっても9GBが載りっぱなしになる。`ocr.vlmPoolModel` を設定すると `llm_pool.js` の管理下に入り、既存のアイドルアンロード・VRAM判定・退避をそのまま使える。プールを作り直すのではなく**既にある仕組みに相乗りする** |
 
 ### Vision LLM のライフサイクル
