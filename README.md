@@ -1,8 +1,9 @@
 # OpenGeekLLMChat
 
 <div align="center">
+<img src="docs/ogllm_icon.png" alt="OpenGeekLLMアイコン" width="256" /><br />
 ギークのためのブラウザベース・ローカルLLMチャットアプリ。GPU監視・RAG・Web検索・Python実行を統合。
-llama.cpp と React 1ファイル、Node.js サーバー1ファイル。ビルド不要、依存は最小（express + ws のみ）。
+サンドボックスとしても最適で、llama.cpp と React 1ファイル、Node.js サーバー1ファイル。ビルド不要、依存は最小（express + ws のみ）。
 <br /><br />
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
