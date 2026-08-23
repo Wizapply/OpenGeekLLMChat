@@ -4116,13 +4116,24 @@ function requireAuth(req, res, next) {
   res.status(401).json({ error: '認証が必要です' });
 }
 
+// config の permissions は配列が正 (["ml:read", "ml:write"]) だが、手書きの config.json で
+// "*" や "ml:read, ml:write" のような文字列になっていることがある。
+// どの形でも配列に揃える (権限チェックの .includes と UI の .map が配列前提のため。
+// 文字列のまま .includes すると部分一致になり、"ml:read" だけのつもりが
+// "ml:read,ml:write" 全体を含む等の誤判定も起きる)
+function normalizeApiPermissions(perms) {
+  if (Array.isArray(perms)) return perms.map(p => String(p).trim()).filter(Boolean);
+  if (typeof perms === 'string') return perms.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+  return [];
+}
+
 // API トークンの権限チェック (Cookie セッションは全権限あり)
 // 使い方: app.post('/path', requireAuth, requirePermission('ml:write'), handler)
 function requirePermission(perm) {
   return (req, res, next) => {
     // Cookie セッション (req.apiToken なし) は全権限とみなす
     if (!req.apiToken) return next();
-    const perms = req.apiToken.permissions || [];
+    const perms = normalizeApiPermissions(req.apiToken.permissions);
     if (perms.includes(perm) || perms.includes('*')) return next();
     return res.status(403).json({
       error: `権限 "${perm}" が必要です (現在のトークンの権限: ${perms.join(', ') || 'none'})`,
@@ -6003,7 +6014,8 @@ app.get('/api-tokens/generate', requireAuth, (req, res) => {
 app.get('/api-tokens', requireAuth, (req, res) => {
   const tokens = (appConfig.ml?.apiTokens || []).map(t => ({
     name: t.name || '',
-    permissions: t.permissions || [],
+    // config に文字列 ("*" 等) で書かれていても必ず配列で返す (UIが .map するため)
+    permissions: normalizeApiPermissions(t.permissions),
     tokenPreview: t.token ? `${t.token.slice(0, 12)}...${t.token.slice(-4)}` : '',
     // フルトークンはセキュリティ上返さない (config.json または editconfig.html で確認)
   }));

@@ -364,7 +364,9 @@ const renderer = new marked.Renderer();
 renderer.code = function(arg1, arg2) {
   // marked v12+: arg1 = { text, lang } / older: arg1 = code, arg2 = lang
   const text = (typeof arg1 === 'object' && arg1 !== null) ? (arg1.text || arg1.code || '') : (arg1 || '');
-  const language = (typeof arg1 === 'object' && arg1 !== null) ? (arg1.lang || arg1.language || '') : (arg2 || '');
+  const rawLanguage = (typeof arg1 === 'object' && arg1 !== null) ? (arg1.lang || arg1.language || '') : (arg2 || '');
+  // フェンスの言語名はモデル出力なので、class属性やonclickに混ぜる前に安全な文字だけへ絞る
+  const language = String(rawLanguage || '').replace(/[^\w+#.\-]/g, '').slice(0, 30);
   let highlighted;
   if (language && hljs.getLanguage(language)) {
     try { highlighted = hljs.highlight(text, { language }).value; } catch { highlighted = text; }
@@ -389,7 +391,7 @@ renderer.code = function(arg1, arg2) {
   if (isPreviewable) {
     actionBtns += '<button class="run-btn preview-btn" onclick="runPreview(\'' + id + '\', this)">▶ プレビュー</button>';
   }
-  return '<div class="code-block-wrapper"><div class="code-header"><span>' + (language || 'code') + '</span><div class="code-header-actions">' + actionBtns + '<button class="copy-btn" onclick="copyCode(this, \'' + id + '\')">コピー</button></div></div><pre><code id="' + id + '" class="hljs language-' + language + '">' + highlighted + '</code></pre><div id="output-' + id + '"></div></div>';
+  return '<div class="code-block-wrapper"><div class="code-header"><span>' + (language || 'code') + '</span><div class="code-header-actions">' + actionBtns + '<button class="copy-btn" onclick="copyCode(this, \'' + id + '\')">コピー</button><button class="copy-btn dl-btn" onclick="downloadCode(this, \'' + id + '\', \'' + language + '\')">ダウンロード</button></div></div><pre><code id="' + id + '" class="hljs language-' + language + '">' + highlighted + '</code></pre><div id="output-' + id + '"></div></div>';
 };
 // ─── カスタムRenderer: 飛べないリンクは素のテキストに落とす ───
 // RAG の出典をモデルが Markdown のリンク記法で書き出すことがある。
@@ -446,6 +448,46 @@ function fallbackCopy(text, cb) {
   try { document.execCommand('copy'); cb(); } catch {}
   document.body.removeChild(ta);
 }
+
+// ─── コードのダウンロード（グローバル）───
+// 生成コードを UTF-8 (BOMなし) のファイルとして保存する。JSの文字列を Blob に
+// 渡すと UTF-8 でエンコードされる。BOM を付けないのは、シバン行のあるスクリプトや
+// JSON・設定ファイルが BOM で壊れることがあるため (コードファイルの標準は BOM なし)。
+// 拡張子はフェンスの言語名から引く。知らない言語は .txt。
+const CODE_DOWNLOAD_EXT = {
+  python: 'py', python2: 'py', python3: 'py', py: 'py',
+  javascript: 'js', js: 'js', jsx: 'jsx', typescript: 'ts', ts: 'ts', tsx: 'tsx',
+  html: 'html', htm: 'html', css: 'css', json: 'json', xml: 'xml', svg: 'svg',
+  bash: 'sh', sh: 'sh', shell: 'sh', zsh: 'sh', bat: 'bat', powershell: 'ps1',
+  sql: 'sql', yaml: 'yml', yml: 'yml', toml: 'toml', ini: 'ini', dockerfile: 'dockerfile',
+  markdown: 'md', md: 'md', csv: 'csv', tsv: 'tsv', text: 'txt', txt: 'txt', plaintext: 'txt',
+  c: 'c', h: 'h', cpp: 'cpp', 'c++': 'cpp', hpp: 'hpp', java: 'java',
+  csharp: 'cs', cs: 'cs', 'c#': 'cs', go: 'go', rust: 'rs', ruby: 'rb', php: 'php',
+  kotlin: 'kt', swift: 'swift', scala: 'scala', r: 'r', dart: 'dart', lua: 'lua', perl: 'pl',
+};
+window.downloadCode = function(btn, id, lang) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const text = el.textContent;
+  const ext = CODE_DOWNLOAD_EXT[String(lang || '').toLowerCase()] || 'txt';
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const name = `code_${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.${ext}`;
+  try {
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    btn.textContent = '保存しました';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'ダウンロード'; btn.classList.remove('copied'); }, 2000);
+  } catch {}
+};
 
 // ─── Python 実行関数（グローバル）───
 window.runPython = function(codeId, btn) {

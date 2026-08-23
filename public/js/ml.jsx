@@ -4497,7 +4497,12 @@ requests.post(f"{BASE}/ml/rl/models/promo/checkpoint", headers=H)`;
                 <tr key={i}>
                   <td>{t.name || <span style={{color: 'var(--text-muted)'}}>(無名)</span>}</td>
                   <td style={{fontFamily: 'var(--font-mono)', fontSize: 11}}>
-                    {(t.permissions || []).map(p => (
+                    {/* permissions は配列が正だが、古いサーバーや手書きconfigだと
+                        "*" 等の文字列で届くことがあるので、どの形でも配列に揃えて描く */}
+                    {(Array.isArray(t.permissions)
+                      ? t.permissions
+                      : String(t.permissions || '').split(/[,\s]+/).filter(Boolean)
+                    ).map(p => (
                       <span key={p} style={{
                         background: p.includes('write') ? 'var(--orange-dim)' : 'var(--accent-dim)',
                         color: p.includes('write') ? 'var(--orange)' : 'var(--accent)',
