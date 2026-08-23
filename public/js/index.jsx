@@ -2289,6 +2289,17 @@ function App() {
     const hasTextFiles = chatTextFiles.length > 0;
     if ((!text && !hasImages && !hasTextFiles) || isLoading) return;
 
+    // ─── エージェントハーネス: UserPromptSubmit フック ───
+    // config.json の harness.hooks に宣言された入力検査 (deny) を送信前に評価する。
+    // (/js/harness_client.js が window.HarnessClient を生やす。未読み込みなら素通し)
+    if (window.HarnessClient) {
+      const pv = window.HarnessClient.checkUserPrompt(appConfig.harness, text);
+      if (!pv.allow) {
+        setError(`ハーネスのフックによりこのリクエストは送信されません: ${pv.reason}`);
+        return;
+      }
+    }
+
     // モデル選択でマルチLLMワークフローが選ばれている場合は、
     // 通常のツール判断・RAG経路ではなくサーバー側のオーケストレータに委譲する。
     // ワークフローは自前でワーカーを起動するため chatModel のロード状態は問わない
@@ -3146,6 +3157,17 @@ function App() {
           }
         }
 
+        // ─── エージェントハーネス: 権限設定で実行できないツールは LLM に見せない ───
+        // permissionMode / allowedTools / disallowedTools (config.json の harness) による
+        // 事前フィルタ。default モードの「確認して実行」対象はブラウザで confirm できる
+        // ため残す。実行段階の再チェックは各 tool_call 直前のゲートで行う
+        if (window.HarnessClient) {
+          const removedByHarness = window.HarnessClient.filterToolDefsInPlace(appConfig.harness, tools);
+          if (removedByHarness.length > 0) {
+            console.log(`[ハーネス] 権限設定 (${(appConfig.harness || {}).permissionMode || 'bypassPermissions'}) によりツール除外: ${removedByHarness.join(', ')}`);
+          }
+        }
+
         let agentSystem = systemPrompt;
         if (documents.length > 0 && sp.documents) {
           const docListText = documents.map(d => d.name).join(', ');
@@ -3859,6 +3881,20 @@ function App() {
             let fnArgs = tc.function?.arguments || {};
             if (typeof fnArgs === 'string') {
               try { fnArgs = JSON.parse(fnArgs); } catch { fnArgs = {}; }
+            }
+
+            // ─── エージェントハーネス: 実行直前ゲート (権限モード + PreToolUse フック) ───
+            // 事前フィルタをすり抜けた呼び出し (ハルシネーション等) の再チェックと、
+            // default モードの許可リスト外ツールの confirm 確認をここで行う。
+            // 拒否時も tool_call_id との対応を壊さないよう、拒否理由を tool 結果として返す
+            if (window.HarnessClient) {
+              const gate = window.HarnessClient.gateToolCall(appConfig.harness, fnName, fnArgs);
+              if (!gate.allow) {
+                console.log(`[ハーネス] ツール拒否: ${fnName} — ${gate.reason}`);
+                apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: gate.message });
+                continue;
+              }
+              if (gate.args) fnArgs = gate.args;
             }
 
             // ─── 同一ツール呼び出しの重複実行を防ぐ ───
@@ -4628,6 +4664,17 @@ function App() {
                   copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: null, searchQueries: [...searchQueries] };
                   return copy;
                 });
+              }
+            }
+
+            // ─── エージェントハーネス: ツール結果の後処理 ───
+            // 外部データ由来の結果への注意リマインダー (プロンプトインジェクション緩和) と
+            // PostToolUse フックの addContext を、この呼び出しに対応する tool 結果
+            // (直前に push されたもの) に付与する
+            if (window.HarnessClient) {
+              const lastMsg = apiMessages[apiMessages.length - 1];
+              if (lastMsg && lastMsg.role === 'tool' && lastMsg.tool_call_id === tc.id && typeof lastMsg.content === 'string') {
+                lastMsg.content = window.HarnessClient.decorateToolResult(appConfig.harness, fnName, lastMsg.content);
               }
             }
           }

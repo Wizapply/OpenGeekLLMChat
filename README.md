@@ -36,6 +36,9 @@ OpenGeekLLMChatは、**クラウドに依存しないローカルLLM環境を自
 ### 🤖 Agentic RAG（マルチターン対応）
 LLMが自ら検索要否を判断し、必要なときだけドキュメントRAG・Web検索・ファイル操作を呼び出します。最大3ターンのツール実行ループで、「一覧取得 → 内容読み込み → 応答」の段階的処理が可能。
 
+### 🧰 エージェントハーネス（Claude 型の LLM 制御層）
+Claude Code 等の「ハーネス」に倣い、モデルの外側でエージェントを制御する層を実装（サーバー側 `harness.js` ＋ 通常チャット用 `public/js/harness_client.js`）。**通常チャットと外部APIのツール対応モードの両方**で、権限モード（`bypassPermissions` / `default` / `acceptEdits` / `plan`）とツール許可リストが実行を統制し、`PreToolUse` 等のフック、キーワード規則による判断LLM省略（System-1 即決）、`<system-reminder>` 注入（外部データ注意・残りターン警告）、同一ツール連打を止めるリピートガード、トークン予算超過時の履歴自動圧縮を備えます。通常チャットの `default` モードでは、許可リスト外の書き込みツールを実行前にブラウザの確認ダイアログで人に聞きます（Claude Code の許可プロンプト相当）。既定は従来互換（全ツール許可）で、`config.json` の `harness` セクションで段階的に厳しくできます。
+
 ### 🌐 DuckDuckGo Web検索（本文取得対応）
 APIキー不要。検索結果のスニペットだけでなく、上位3件のページ本文も自動取得。天気・ニュース・株価なども回答可能。
 
@@ -1064,6 +1067,9 @@ opengeek-llm-chat/
 ├── rl_online_server.py         # 強化学習(RL)オンライン常駐ワーカー (act/learn HTTP API)
 ├── rl_common.py                # 強化学習の共通ロジック (Qネット構築・状態エンコード・損失計算)
 ├── agent_proxy.js              # 外部API用ツール対応モード (OpenAI互換 + エージェントループ)
+├── harness.js                  # エージェントハーネス (Claude型の制御層: 権限モード/フック/System-1規則/リマインダー/コンパクション、依存なし)
+├── harness_test.js             # ハーネスのスモークテスト (node harness_test.js、LLM不要)
+│                               #   ※ ブラウザ側ゲートは public/js/harness_client.js (通常チャット用)
 ├── google_drive.js             # Google Drive 連携 (OAuth2/サービスアカウント + Drive API v3、依存なし)
 ├── gdrive_token.json           # Driveのリフレッシュトークン (自動生成・gitignore済み・chmod600)
 ├── llm_pool.js                 # マルチLLMワーカープール (複数llama-server同時起動・VRAM自動判定)
@@ -1140,6 +1146,37 @@ opengeek-llm-chat/
 ## ⚙️ config.json
 
 全ての挙動は `config.json` で制御できます。
+
+### カテゴリ構成とコメントキー（`"// ..."`）
+
+同梱の `config.json` は、キーを以下の15カテゴリ順に並べています（見出し等の余計なキーは含みません。並び順は動作に影響しないため、自由に入れ替えてかまいません）：
+
+| # | カテゴリ | 主なキー |
+|:--|:--|:--|
+| 1 | アプリ基本・UI | `appName` `logo*` `welcome*` `accentColor` `defaultModel` |
+| 2 | サーバー基本 | `password` `pythonPath` `logLevel` |
+| 3 | LLM実行基盤 | `llamaServer` `chatModels` `embeddingModel` |
+| 4 | チャット動作 | `historyMode` `contextCompaction` `chatMaxTokens` `inlineFile*` |
+| 5 | エージェント | `agentContext` `harness` |
+| 6 | RAG | `ragMode` `ragTopK` `ragChunk*` `ragLedger*` `ragAlwaysSearch` ＋ 永続RAG取り込み `ocrRag` `htmlRag` |
+| 7 | サンプラー | `temperature` `topK/topP` `repeat*` `dry*` |
+| 8 | ツール機能の有効化 | `webSearch` `fileAccess` `imageGen` `ttsGen` |
+| 9 | システムプロンプト | `systemPrompts` |
+| 10 | 音声 | `transcribe` `irodoriTts` `ttsVoices` |
+| 11 | 画像生成 | `stableDiffusion` `imageModels` |
+| 12 | 機械学習 (ML/RL) | `ml` |
+| 13 | ファインチューニング | `tuning` |
+| 14 | オーケストレーション | `orchestration` |
+| 15 | Google Drive 連携 | `googleDrive` |
+
+- RAG カテゴリの PDF OCR 取り込みは、config.json 上のキー名を **`ocrRag`** としています（`htmlRag` と対になる名前）。旧名 `ocr` も互換で受け付け、内部的には同じ設定です。本README リファレンスの `ocr.*` 表記は `ocrRag.*` に読み替えられます。
+
+また、JSON はコメントを書けないため、**`//` で始まるキーをコメント・見出しとして自由に書けます**。サーバーが読み込み時に再帰的に読み飛ばすので、設定値には一切影響しません（`/config` にも出ません）。`/editconfig.html` から保存してもコメントキーと並び順は保持されます：
+
+```jsonc
+"// ══════════ RAG ══════════": "ここに好きなメモ・区切りを書ける",
+"ragMode": "agentic",
+```
 
 ```json
 {
@@ -1239,6 +1276,16 @@ opengeek-llm-chat/
     "largePredict": 8192,
     "judgeHistoryCount": 3,
     "largeGenKeywords": null
+  },
+  "harness": {
+    "enabled": true,
+    "permissionMode": "bypassPermissions",
+    "allowedTools": [],
+    "disallowedTools": [],
+    "maxTurns": 5,
+    "repeatGuard": 3,
+    "reminders": true,
+    "hooks": []
   },
   "tokenAvgWindow": 2000,
   "recentMessageCount": 6,
@@ -1402,6 +1449,15 @@ opengeek-llm-chat/
 | `agentContext.judgeHistoryChars` | ツール判断に送る過去メッセージ1件あたりの最大文字数、デフォルト800（最新の質問は切り詰めない）。判断のたびに長文回答を再処理するのを防ぐ |
 | `chatMaxTokens` | 1応答あたりの最大生成トークン（暴走ループの安全網）。デフォルト8192。`agentContext.largePredict` が優先される。**長い解説やコード生成が途中で切れる場合はここを上げる**（ctx に余裕があること） |
 | `agentContext.largeGenKeywords` | 長文モード判定キーワード（null=デフォルト使用） |
+| `harness.enabled` | エージェントハーネス（通常チャットと外部APIツール対応モードの制御層）。`false` で従来と同一挙動。デフォルトtrue |
+| `harness.permissionMode` | ツール実行の権限モード: `bypassPermissions`（全許可・従来互換）/ `default`（読み取り専用+`allowedTools`のみ）/ `acceptEdits`（書き込みも許可、破壊的ツールは要登録）/ `plan`（読み取り専用のみ、変更は計画として回答）。デフォルト`bypassPermissions` |
+| `harness.allowedTools` / `harness.disallowedTools` | ツールの許可/禁止リスト（`gdrive_*` のような glob 可）。禁止が常に最優先 |
+| `harness.maxTurns` / `harness.maxToolCallsPerTurn` | エージェントループの最大ターン（デフォルト5）と1ターンのツール呼び出し上限（デフォルト8） |
+| `harness.repeatGuard` | 同一ツール+同一引数の実行上限（無限ループ防止）。デフォルト3、0で無効 |
+| `harness.reminders` | ツール結果への外部データ注意・残りターン警告など `<system-reminder>` の注入。デフォルトtrue |
+| `harness.fastRouting` / `harness.customRules` | キーワード・正規表現による System-1 即決（判断LLMの省略）。デフォルトfalse / [] |
+| `harness.contextTokenBudget` / `harness.compaction` | 見積もりトークンが予算を超えたら履歴を LLM 要約で自動圧縮。デフォルト24000 |
+| `harness.hooks` / `harness.allowCommandHooks` | 宣言フック（`PreToolUse` 等5イベントに deny/allow/confirm/addContext/command）。外部コマンド実行は `allowCommandHooks: true` の時のみ。詳細は「外部API: ツール対応モード」の章を参照 |
 | `historyMode` | 会話履歴の送信方式。`compaction`（Claude風、上限接近時のみLLM要約で圧縮、デフォルト）/ `weighted`（従来の直近優先圧縮） |
 | `contextCompaction.threshold` | コンパクション発動の使用率閾値（n_ctx比）、デフォルト0.75 |
 | `contextCompaction.keepRecent` | 圧縮後も原文のまま残す直近メッセージ件数、デフォルト4 |
@@ -2208,16 +2264,69 @@ embedding を有効化するには `config.json` の `embeddingModel.path` に G
 - **ツール対応モードは chat タイプのみ** (embedding タイプは非対応)
 - **モデルは関数呼び出し対応が必要**: Qwen, Gemma 等の `tool_calls` をサポートするモデルのみ
 - **ストリーミングは最終応答のみ一括返却** (途中のツール実行はストリームに乗らない)
-- **MAX_TURNS=5**: ツール実行ループの上限 (無限ループ防止)
+- **ツール実行ループの上限は `harness.maxTurns` (既定5)**: 無限ループ防止。同一ツール+同一引数の連打は `harness.repeatGuard` が途中で止める
 - **HTML応答を排除**: JSON パースエラー・404・予期しないエラーも全て JSON で返す (OpenAI 互換)
 - **`/health` は認証スキップ**: ロードバランサーや監視ツール対応のためパブリック
+
+### 🧰 エージェントハーネス（権限モード・フック・ガード）
+
+ツール対応モードのエージェントループは **エージェントハーネス (`harness.js`)** が制御しています。Claude Code 等の「ハーネス」（モデルの外側でループ・権限・規則・コンテキストを管理する層）をこのシステム向けに実装したもので、`config.json` の `harness` セクションで設定します:
+
+> **通常チャット（ブラウザのメインチャット）でも同じ設定で働きます。** ツール定義の事前フィルタと実行直前ゲートは `public/js/harness_client.js`（`harness.js` と同じ判定規則のブラウザ実装）が担当し、`default` モードで許可リスト外の書き込みツールが呼ばれた時は**ブラウザの確認ダイアログで人に聞いてから**実行します（Claude Code の許可プロンプト相当）。`UserPromptSubmit` の deny フックは送信前に評価され、外部データを含むツール結果には注意リマインダーが付きます。ブラウザでは `command` フックは実行されません（宣言フックのみ。`command` の中身は `/config` にも出ません）。なお通常チャットの System-1 即決とコンパクションは、従来からある `agentContext.fastToolRouting` と `historyMode: "compaction"` がそのまま担当します。
+
+```jsonc
+"harness": {
+  "enabled": true,                        // false で従来ループと同一挙動 (素通し)
+  "permissionMode": "bypassPermissions",  // 既定: 全ツール許可 (従来互換)
+  "allowedTools": [],                     // 例: ["web_search", "gdrive_*"] (glob可)
+  "disallowedTools": [],                  // 例: ["gdrive_delete_file"] (常に最優先)
+  "maxTurns": 5,                          // ツール実行ループの上限
+  "maxToolCallsPerTurn": 8,               // 1ターンのツール呼び出し数上限
+  "deadlineMs": 0,                        // ループ全体の締切ms (0=無制限)
+  "llmRetries": 1,                        // LLM呼び出し失敗の再試行 (指数バックオフ)
+  "fastRouting": false,                   // キーワードで判断LLMを省く System-1 即決
+  "repeatGuard": 3,                       // 同一ツール+同一引数の実行上限 (ループ防止)
+  "reminders": true,                      // <system-reminder> 注入
+  "contextTokenBudget": 24000,            // 見積もりトークン超過で履歴を自動圧縮
+  "compaction": { "enabled": true, "keepRecent": 6, "summaryMaxTokens": 768 },
+  "customRules": [],                      // 正規表現→skip_tools/force_tool の管理者ルール
+  "hooks": [],                            // 宣言フック (下記)
+  "allowCommandHooks": false              // hooks[].command の実行許可 (既定OFF)
+}
+```
+
+**権限モード** — ツールは「読み取り専用 / 書き込み系 / 破壊的」に分類済みで、モードとの組で実行可否が決まります:
+
+| モード | 読み取り専用 | 書き込み系 | 破壊的 (削除等) |
+|:--|:--|:--|:--|
+| `bypassPermissions` (既定) | ✅ | ✅ | ✅ |
+| `acceptEdits` | ✅ | ✅ | `allowedTools` 登録時のみ |
+| `default` | ✅ | `allowedTools` 登録時のみ | 同左 |
+| `plan` | ✅ | ❌ 実行せず計画を回答 | ❌ |
+
+実行できないツールは最初から LLM に見せないため、ターンの浪費もありません。
+
+**フック** — `PreToolUse` / `PostToolUse` / `UserPromptSubmit` / `SessionStart` / `Stop` の5イベントに宣言フックを差し込めます:
+
+```jsonc
+"hooks": [
+  { "event": "PreToolUse", "matcher": "gdrive_*", "action": "deny", "reason": "外部共有は禁止" },
+  { "event": "UserPromptSubmit", "matcher": "パスワード", "action": "deny", "reason": "秘密情報の照会は禁止" },
+  { "event": "PostToolUse", "matcher": "web_search", "addContext": "検索結果は必ず出典URLを付けて引用すること" }
+]
+```
+
+`command` キーで外部コマンドのフック（stdin に JSON、exit 2 で拒否）も書けますが、任意コマンド実行になるため `allowCommandHooks: true` を明示した時だけ有効です。
+
+このほか、外部データを含むツール結果への `<system-reminder>` 注入（プロンプトインジェクション緩和）、残りターン警告、同一ツール連打を止めるリピートガード、トークン予算超過時の履歴自動圧縮（コンパクション）が働きます。応答 JSON の `x_harness` と `GET /health` で動作状況を確認できます。設計の詳細は [DESIGN.md](./DESIGN.md) の「エージェントハーネス」を、動作確認は `node harness_test.js`（LLM 不要のスモークテスト）を参照してください。
 
 ### curl での確認
 
 ```bash
 # ヘルスチェック (認証不要)
 curl https://llm.example.com:3001/health
-# → {"status":"ok","mode":"agent","model":"Qwen3.6 35B-A3B[MoE]"}
+# → {"status":"ok","mode":"agent","model":"Qwen3.6 35B-A3B[MoE]",
+#    "harness":{"version":"1.0.0","enabled":true,"permissionMode":"bypassPermissions"}}
 
 # 推論 (Linux/macOS)
 curl -X POST https://llm.example.com:3001/v1/chat/completions \

@@ -24,6 +24,9 @@
 <!-- PDF.js v3 (PDFテキスト抽出用、約1MB、初回PDF読込時のみダウンロードされる)
      注意: cdnjs では v4系 は配信されていないため v3.11.174 (UMD形式、pdfjsLib グローバル提供) を使う -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<!-- エージェントハーネスのブラウザ側ゲート (権限モード/宣言フック/リマインダー)。
+     読み込み失敗時も index.jsx 側の window.HarnessClient ガードで従来どおり動く -->
+<script src="/js/harness_client.js"></script>
 <script type="text/babel" src="/js/index.jsx"></script>
 </body>
 </html>

@@ -343,6 +343,32 @@ const DEFAULT_CONFIG = {
     fastToolRouting: true,
     largeGenKeywords: null,   // 長文モード判定キーワード (null=デフォルト使用)
   },
+  // ─── エージェントハーネス (harness.js) ───
+  // Claude Code 等の「ハーネス」に倣った LLM 制御層。現在は外部APIのツール対応モード
+  // (agent_proxy) のエージェントループが使用する。既定は従来互換 (全ツール許可・
+  // System-1 即決OFF)。詳細は DESIGN.md「エージェントハーネス」参照
+  harness: {
+    enabled: true,
+    // 権限モード: 'bypassPermissions' (全許可・従来互換) / 'default' (読み取り専用 +
+    // allowedTools のみ) / 'acceptEdits' (書き込みも許可、破壊的ツールは要 allowedTools) /
+    // 'plan' (読み取り専用のみ。変更作業は計画として回答させる)
+    permissionMode: 'bypassPermissions',
+    allowedTools: [],         // 例: ['web_search', 'gdrive_*'] (glob可)
+    disallowedTools: [],      // 例: ['gdrive_delete_file'] (常に優先)
+    maxTurns: 5,              // エージェントループの最大ターン (従来値)
+    maxToolCallsPerTurn: 8,   // 1ターンのツール呼び出し上限
+    deadlineMs: 0,            // ループ全体の締切ms (0=無制限)
+    llmRetries: 1,            // LLM呼び出し失敗時の再試行回数 (指数バックオフ)
+    fastRouting: false,       // System-1 即決 (キーワードで判断LLMを省略)。外部APIは既定OFF
+    repeatGuard: 3,           // 同一ツール+同一引数の実行上限 (0=無効)
+    reminders: true,          // <system-reminder> 注入 (外部データ注意・残りターン警告等)
+    toolResultMaxChars: 50000,
+    contextTokenBudget: 24000, // 見積もりトークン超過でコンパクション (0=無効)
+    compaction: { enabled: true, keepRecent: 6, summaryMaxTokens: 768 },
+    customRules: [],          // [{ pattern, action: 'skip_tools'|'force_tool', tool }]
+    hooks: [],                // 宣言フック [{ event, matcher, action|addContext|command }]
+    allowCommandHooks: false, // hooks[].command の実行許可 (セキュリティ上、既定OFF)
+  },
   tokenAvgWindow: 2000,
   // ─── 会話履歴のコンテキスト管理 ───
   // 'compaction' (デフォルト): Claude風。履歴は無圧縮で送り、コンテキスト上限に
@@ -401,12 +427,33 @@ const DEFAULT_CONFIG = {
   // 'quiet' にすると /v1/* プロキシの毎リクエストログとllama-serverのstdoutを抑制
   logLevel: 'normal',
 };
+// config.json 内の「"//" で始まるキー」はカテゴリ見出し・コメントとして扱い、
+// 設定値には取り込まない (JSONはコメントを書けないため、キーで代用する)。
+// 例: "// ═══ 1. アプリ基本・UI ═══": "ロゴ・ようこそ表示・配色"
+// ネストの中でも使えるよう再帰的に取り除く。
+function stripCommentKeys(obj) {
+  if (Array.isArray(obj)) { obj.forEach(stripCommentKeys); return obj; }
+  if (obj && typeof obj === 'object') {
+    for (const k of Object.keys(obj)) {
+      if (k.startsWith('//')) delete obj[k];
+      else stripCommentKeys(obj[k]);
+    }
+  }
+  return obj;
+}
 function loadConfig() {
   try {
     if (fs.existsSync(CONFIG_FILE)) {
-      const userConfig = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
+      const userConfig = stripCommentKeys(JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8')));
+      // キー名互換: config.json 上では "ocrRag" を正式名とする (RAG カテゴリで
+      // htmlRag と名前を揃えるため)。内部キーは従来どおり ocr のまま扱い、
+      // 旧名 "ocr" で書かれた設定もそのまま有効 (両方あれば ocrRag を優先)
+      if (userConfig.ocrRag !== undefined) {
+        userConfig.ocr = userConfig.ocrRag;
+        delete userConfig.ocrRag;
+      }
       const merged = { ...DEFAULT_CONFIG, ...userConfig };
-      ['systemPrompts', 'agentContext', 'contextCompaction', 'transcribe', 'llamaServer', 'embeddingModel', 'ml', 'irodoriTts', 'orchestration', 'googleDrive', 'ocr', 'htmlRag'].forEach(key => {
+      ['systemPrompts', 'agentContext', 'harness', 'contextCompaction', 'transcribe', 'llamaServer', 'embeddingModel', 'ml', 'irodoriTts', 'orchestration', 'googleDrive', 'ocr', 'htmlRag'].forEach(key => {
         if (DEFAULT_CONFIG[key] && typeof DEFAULT_CONFIG[key] === 'object') {
           merged[key] = { ...DEFAULT_CONFIG[key], ...(userConfig[key] || {}) };
         }
@@ -4164,6 +4211,13 @@ app.get('/config', (req, res) => {
       maxUploadMB: parseInt(htmlRagCfg?.maxUploadMB) || 20,
       autoRegisterToRag: htmlRagCfg ? htmlRagCfg.autoRegisterToRag !== false : true,
     },
+    // ハーネス設定: 通常チャットの権限ゲート (harness_client.js) が使う。
+    // フックの command (管理者のシェルコマンド) はブラウザに出さない
+    harness: rest.harness ? {
+      ...rest.harness,
+      hooks: (rest.harness.hooks || []).filter(h => h && !h.command),
+      allowCommandHooks: undefined,
+    } : undefined,
   };
   // Google Drive は「使えるか / 書けるか」だけ公開。認証情報は一切出さない
   if (googleDrive) {

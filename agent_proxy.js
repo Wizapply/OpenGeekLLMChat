@@ -11,12 +11,17 @@
  * 非対応: generate_image, python実行 (セキュリティ・複雑性のため外部公開しない)
  *
  * server.js から提供される deps オブジェクト経由で内部関数を呼ぶ (循環参照回避)。
+ *
+ * v2: エージェントループは harness.js (Claude のハーネスに倣った制御層) に委譲。
+ *     権限モード・フック・System-1 即決・リマインダー・リピートガード・
+ *     コンパクションは appConfig.harness で設定する (既定は従来互換の素通し)。
  */
 
 const express = require('express');
 const https = require('https');
 const http = require('http');
 const fs = require('fs');
+const { createHarness, neutralHarnessConfig, HARNESS_VERSION } = require('./harness');
 
 /**
  * ツール対応エージェントサーバーを起動
@@ -163,8 +168,9 @@ async function startAgentServer(opts, deps) {
             finish_reason: 'stop',
           }],
           usage: result.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-          // デバッグ用: 実行したツール
+          // デバッグ用: 実行したツールとハーネスの実行情報
           x_tools_used: result.toolsUsed,
+          x_harness: result.harness,
         });
       }
     } catch (e) {
@@ -175,8 +181,18 @@ async function startAgentServer(opts, deps) {
     }
   });
 
-  // ヘルスチェック
-  app.get('/health', (req, res) => res.json({ status: 'ok', mode: 'agent', model: modelName }));
+  // ヘルスチェック (ハーネスの状態も返す)
+  app.get('/health', (req, res) => {
+    const hc = appConfig.harness || {};
+    res.json({
+      status: 'ok', mode: 'agent', model: modelName,
+      harness: {
+        version: HARNESS_VERSION,
+        enabled: hc.enabled !== false,
+        permissionMode: hc.enabled !== false ? (hc.permissionMode || 'bypassPermissions') : 'bypassPermissions',
+      },
+    });
+  });
 
   // 404: 全ての未知のパスを JSON で返す (Express デフォルトの HTML を抑制)
   app.use((req, res) => {
@@ -579,88 +595,83 @@ function buildToolDefs(enabledTools, appConfig, deps = {}) {
 }
 
 /**
- * エージェントループ: ツール判断 → 実行 → 最終応答
+ * ツールのハーネス用メタデータ
+ *   readOnly        … 状態を変更しない (plan/default モードで無条件許可)
+ *   dangerous       … 破壊的 (acceptEdits でも allowedTools への登録が必要)
+ *   untrustedOutput … 結果が外部由来データ → 取り扱い注意リマインダーを付ける
+ *   hintKeywords    … System-1 即決 (harness.fastRouting=true 時) のヒント
+ *   fastDirect      … 質問文をそのまま query にして判断LLM抜きで即実行できる検索系
+ */
+const TOOL_META = {
+  web_search:                  { readOnly: true, untrustedOutput: true, fastDirect: true,
+                                 hintKeywords: ['天気', 'ニュース', '最新', '現在', '株価', '為替', '今日', '検索して', 'weather', 'news'] },
+  list_files:                  { readOnly: true, hintKeywords: ['ファイル一覧', 'アップロード'] },
+  read_file:                   { readOnly: true, untrustedOutput: true, hintKeywords: ['ファイルを読', 'サーバーのファイル'] },
+  search_persistent_documents: { readOnly: true, untrustedOutput: true, fastDirect: true,
+                                 hintKeywords: ['資料', 'ドキュメント', 'マニュアル', '社内', '規定', 'FAQ'] },
+  search_documents:            { readOnly: true, untrustedOutput: true },
+  ml_list_datasets:            { readOnly: true },
+  ml_describe_dataset:         { readOnly: true },
+  ml_query_dataset:            { readOnly: true },
+  ml_list_models:              { readOnly: true },
+  ml_predict:                  { readOnly: true },
+  rl_list_agents:              { readOnly: true },
+  rl_get_policy:               { readOnly: true },
+  rl_eval_agent:               { readOnly: true },
+  rl_act:                      { readOnly: true },
+  rl_train_agent:              { readOnly: false },  // 学習ジョブを開始する (書き込み系)
+  rl_learn:                    { readOnly: false },  // モデルを更新する (書き込み系)
+  gdrive_search_files:         { readOnly: true, untrustedOutput: true },
+  gdrive_list_files:           { readOnly: true },
+  gdrive_read_file:            { readOnly: true, untrustedOutput: true },
+  gdrive_import_to_server:     { readOnly: false },  // サーバーにファイルを書く
+  gdrive_write_file:           { readOnly: false },
+  gdrive_upload_from_server:   { readOnly: false },
+  gdrive_create_folder:        { readOnly: false },
+  gdrive_delete_file:          { readOnly: false, dangerous: true },
+};
+
+/**
+ * エージェントループ: harness.js に委譲 (ツール判断 → 実行 → 最終応答)
+ * appConfig.harness が無効 (enabled=false) の場合は素通し設定で動かし、
+ * ハーネス導入前のループと同じ挙動 (全ツール許可・付加機能なし) にする。
  */
 async function runAgentLoop({ messages, tools, temperature, maxTokens, chatHost, chatPort, modelName, deps, ip }) {
-  const { log } = deps;
-  const MAX_TURNS = 5;
-  const apiMessages = [...messages];
-  const toolsUsed = [];
-  let totalPromptTokens = 0;
-  let totalCompletionTokens = 0;
-
-  for (let turn = 0; turn < MAX_TURNS; turn++) {
-    // llama-server にツール付きで問い合わせ
-    const llamaResp = await callLlama({
+  const { log, appConfig } = deps;
+  const hc = appConfig?.harness || {};
+  const harness = createHarness({
+    config: hc.enabled === false ? neutralHarnessConfig() : hc,
+    // LLM 呼び出し: 内部 llama-server (ツール判断・最終応答・コンパクション要約が通る)
+    chat: (p) => callLlama({
       chatHost, chatPort, modelName,
-      messages: apiMessages,
-      tools: tools.length > 0 ? tools : undefined,
-      temperature, maxTokens,
+      messages: p.messages,
+      tools: p.tools && p.tools.length > 0 ? p.tools : undefined,
+      temperature: p.temperature !== undefined ? p.temperature : temperature,
+      maxTokens: p.maxTokens !== undefined ? p.maxTokens : maxTokens,
       stream: false,
-    });
-
-    const choice = llamaResp.choices?.[0];
-    const msg = choice?.message || {};
-    if (llamaResp.usage) {
-      totalPromptTokens += llamaResp.usage.prompt_tokens || 0;
-      totalCompletionTokens += llamaResp.usage.completion_tokens || 0;
-    }
-
-    const toolCalls = msg.tool_calls || [];
-    if (toolCalls.length === 0) {
-      // ツール呼び出しなし = 最終応答
-      return {
-        content: (msg.content || '').trim(),
-        toolsUsed,
-        usage: {
-          prompt_tokens: totalPromptTokens,
-          completion_tokens: totalCompletionTokens,
-          total_tokens: totalPromptTokens + totalCompletionTokens,
-        },
-      };
-    }
-
-    // assistant のツール呼び出しメッセージを履歴に追加
-    apiMessages.push({ role: 'assistant', content: msg.content || '', tool_calls: toolCalls });
-
-    // 各ツールを実行
-    for (const tc of toolCalls) {
-      const fnName = tc.function?.name;
-      let fnArgs = {};
-      try { fnArgs = JSON.parse(tc.function?.arguments || '{}'); } catch {}
-      log(ip, `[エージェントAPI] tool: ${fnName}(${JSON.stringify(fnArgs).slice(0, 100)})`);
-      toolsUsed.push(fnName);
-
-      let toolResult;
-      try {
-        toolResult = await executeTool(fnName, fnArgs, deps, ip);
-      } catch (e) {
-        toolResult = `エラー: ${e.message}`;
+    }),
+    log: (msg) => log(ip, `[エージェントAPI][harness] ${msg}`),
+    onEvent: (ev) => {
+      // 重要イベントだけログに残す (通常のツール実行ログは harness の log 経由で出る)
+      if (['tool_denied', 'repeat_guard', 'compaction', 'rule_decision', 'deadline', 'prompt_denied'].includes(ev.type)) {
+        log(ip, `[エージェントAPI][harness:${ev.type}] ${JSON.stringify({ ...ev, type: undefined, at: undefined }).slice(0, 200)}`);
       }
-      let content = typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult, null, 2);
-      if (content.length > 50000) content = content.slice(0, 50000) + '\n... (省略)';
+    },
+  });
 
-      apiMessages.push({ role: 'tool', tool_call_id: tc.id, content });
-    }
+  // buildToolDefs が組んだ OpenAI 形式の定義を、メタデータ付きでハーネスに登録
+  for (const def of tools) {
+    const fn = def.function;
+    harness.registerTool({
+      name: fn.name,
+      description: fn.description,
+      parameters: fn.parameters,
+      ...(TOOL_META[fn.name] || {}),
+      execute: (args) => executeTool(fn.name, args, deps, ip),
+    });
   }
 
-  // MAX_TURNS 到達: ツールなしで最終応答を強制
-  const finalResp = await callLlama({
-    chatHost, chatPort, modelName,
-    messages: apiMessages,
-    temperature, maxTokens,
-    stream: false,
-  });
-  const finalMsg = finalResp.choices?.[0]?.message || {};
-  return {
-    content: (finalMsg.content || '回答を生成できませんでした。').trim(),
-    toolsUsed,
-    usage: {
-      prompt_tokens: totalPromptTokens,
-      completion_tokens: totalCompletionTokens,
-      total_tokens: totalPromptTokens + totalCompletionTokens,
-    },
-  };
+  return await harness.run({ messages, temperature, maxTokens });
 }
 
 /**
