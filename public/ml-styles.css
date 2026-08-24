@@ -799,3 +799,15 @@ input[type="range"], .image-detect-slider { accent-color: var(--accent, #7c4dff)
 
 /* チェックボックスもテーマ色に (列選択チップ等) */
 input[type="checkbox"], input[type="radio"] { accent-color: var(--accent, #7c4dff); }
+
+/* チャット連携の対応状況ノート (画像学習 > データセット一覧の下部) */
+.chat-write-note {
+  margin-top: 12px;
+  padding: 9px 12px;
+  border: 1px dashed var(--border, #2a2a3e);
+  border-radius: 8px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-muted, #8888a0);
+  background: var(--bg-tertiary, rgba(255,255,255,0.03));
+}

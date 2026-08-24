@@ -33,6 +33,8 @@
     search_persistent_documents: { readOnly: true, untrusted: true },
     web_search:                  { readOnly: true, untrusted: true },
     detect_objects:              { readOnly: true },
+    detect_keypoints:            { readOnly: true },
+    image_list_models:           { readOnly: true },
     list_files:                  { readOnly: true },
     read_file:                   { readOnly: true, untrusted: true },
     write_file:                  { readOnly: false },
@@ -43,6 +45,8 @@
     ml_query_dataset:            { readOnly: true },
     ml_list_models:              { readOnly: true },
     ml_predict:                  { readOnly: true },
+    ml_import_csv:               { readOnly: false },  // データテーブルへCSVを取り込む (書き込み)
+    tuning_import_samples:       { readOnly: false },  // ファインチューニング教師データを追加 (書き込み)
     gdrive_search_files:         { readOnly: true, untrusted: true },
     gdrive_list_files:           { readOnly: true },
     gdrive_read_file:            { readOnly: true, untrusted: true },

@@ -8,7 +8,10 @@ function App() {
   const [duckdbHint, setDuckdbHint] = useState('');
   // サイドバー統計（モデル数・画像学習・強化学習などの件数）
   const [stats, setStats] = useState({ models: 0, imageDatasets: 0, imageModels: 0, keypointDatasets: 0, keypointModels: 0, rlModels: 0 });
-  const [activeTab, setActiveTab] = useState('tables');
+  const [activeTab, setActiveTab] = useState('models');
+  // モデル学習タブ内のサブタブ (tables=データテーブル | query=SQLクエリ | train=モデル学習)
+  // 「SQLで開く」等でサブタブをまたいで遷移するため App が保持する
+  const [modelsSubTab, setModelsSubTab] = useState('tables');
   const [selectedTable, setSelectedTable] = useState(null);
   const [tableSchema, setTableSchema] = useState(null);
   const [previewRows, setPreviewRows] = useState([]);
@@ -204,12 +207,10 @@ function App() {
           <div className="main-title">🤖 機械学習</div>
         </header>
         <div className="tab-bar">
-          <button className={`tab ${activeTab === 'tables' ? 'active' : ''}`} onClick={() => setActiveTab('tables')}>🗂️ データテーブル</button>
           <button className={`tab ${activeTab === 'models' ? 'active' : ''}`} onClick={() => setActiveTab('models')}>🧠 モデル学習</button>
           <button className={`tab ${activeTab === 'imagetrain' ? 'active' : ''}`} onClick={() => setActiveTab('imagetrain')}>🖼️ 画像学習</button>
           <button className={`tab ${activeTab === 'rl' ? 'active' : ''}`} onClick={() => setActiveTab('rl')}>🎮 強化学習</button>
           <button className={`tab ${activeTab === 'api' ? 'active' : ''}`} onClick={() => setActiveTab('api')}>📡 API(外部連携)</button>
-          <button className={`tab ${activeTab === 'query' ? 'active' : ''}`} onClick={() => setActiveTab('query')}>🔍 SQLクエリ</button>
         </div>
         <div className="main-body">
           {!duckdbAvailable && (
@@ -219,67 +220,41 @@ function App() {
             </div>
           )}
 
-          {activeTab === 'tables' && (
-            <>
-              <div className="toolbar">
-                <button className="btn primary" onClick={() => setShowImport(true)} disabled={!duckdbAvailable}>
-                  📥 CSVをインポート
-                </button>
-                <button className="btn" onClick={() => setShowApiImport(true)} disabled={!duckdbAvailable}>
-                  🌐 Web API をインポート
-                </button>
-                <button className="btn" onClick={loadTables}>🔄 更新</button>
-              </div>
-
-              <div className="ml-layout">
-                <div className="ml-table-list">
-                  {tables.length === 0 ? (
-                    <div className="empty-state">テーブルがありません。<br />「📥 CSVをインポート」から開始してください。</div>
-                  ) : tables.map(t => (
-                    <div
-                      key={t.name}
-                      className={`ml-table-item ${selectedTable === t.name ? 'selected' : ''}`}
-                      onClick={() => loadTableDetails(t.name)}
-                    >
-                      <div className="ml-table-name">🗂️ {t.name}</div>
-                      <div className="ml-table-meta">{t.rowCount.toLocaleString()} 行</div>
-                      {t.description && <div className="ml-table-desc">{t.description}</div>}
-                    </div>
-                  ))}
-                </div>
-
-                <div className="ml-table-detail">
-                  {selectedTable ? (
-                    <TableDetailView
-                      name={selectedTable}
-                      schema={tableSchema}
-                      preview={previewRows}
-                      onDelete={() => deleteTable(selectedTable)}
-                      onQueryHere={() => {
-                        setQueryText(`SELECT * FROM ${selectedTable} LIMIT 100`);
-                        setActiveTab('query');
-                      }}
-                    />
-                  ) : (
-                    <div className="empty-state">← 左のテーブルを選択してください</div>
-                  )}
-                </div>
-              </div>
-            </>
-          )}
-
-          {activeTab === 'query' && (
-            <QueryView
-              sql={queryText}
-              setSql={setQueryText}
-              result={queryResult}
-              error={queryError}
-              onRun={runQuery}
-              tables={tables}
-            />
-          )}
           {activeTab === 'models' && (
-            <ModelsView tables={tables} showToast={showToast} />
+            <ModelsView
+              tables={tables}
+              showToast={showToast}
+              subTab={modelsSubTab}
+              setSubTab={setModelsSubTab}
+              tablesPanel={
+                <DataTablesView
+                  tables={tables}
+                  duckdbAvailable={duckdbAvailable}
+                  selectedTable={selectedTable}
+                  schema={tableSchema}
+                  preview={previewRows}
+                  onImport={() => setShowImport(true)}
+                  onApiImport={() => setShowApiImport(true)}
+                  onReload={loadTables}
+                  onSelectTable={loadTableDetails}
+                  onDeleteTable={deleteTable}
+                  onQueryHere={(name) => {
+                    setQueryText(`SELECT * FROM ${name} LIMIT 100`);
+                    setModelsSubTab('query');
+                  }}
+                />
+              }
+              queryPanel={
+                <QueryView
+                  sql={queryText}
+                  setSql={setQueryText}
+                  result={queryResult}
+                  error={queryError}
+                  onRun={runQuery}
+                  tables={tables}
+                />
+              }
+            />
           )}
           {activeTab === 'imagetrain' && (
             <ImageTrainView showToast={showToast} />
@@ -297,6 +272,55 @@ function App() {
       {showApiImport && <ApiImportDialog onClose={() => setShowApiImport(false)} onDone={() => { setShowApiImport(false); loadTables(); }} showToast={showToast} />}
       {toast && <div className={`toast ${toast.type}`}>{toast.msg}</div>}
     </div>
+  );
+}
+
+// ─── 🗂️ データテーブル (モデル学習タブ内のサブタブとして表示) ───
+function DataTablesView({ tables, duckdbAvailable, selectedTable, schema, preview, onImport, onApiImport, onReload, onSelectTable, onDeleteTable, onQueryHere }) {
+  return (
+    <>
+      <div className="toolbar">
+        <button className="btn primary" onClick={onImport} disabled={!duckdbAvailable}>
+          📥 CSVをインポート
+        </button>
+        <button className="btn" onClick={onApiImport} disabled={!duckdbAvailable}>
+          🌐 Web API をインポート
+        </button>
+        <button className="btn" onClick={onReload}>🔄 更新</button>
+      </div>
+
+      <div className="ml-layout">
+        <div className="ml-table-list">
+          {tables.length === 0 ? (
+            <div className="empty-state">テーブルがありません。<br />「📥 CSVをインポート」から開始してください。</div>
+          ) : tables.map(t => (
+            <div
+              key={t.name}
+              className={`ml-table-item ${selectedTable === t.name ? 'selected' : ''}`}
+              onClick={() => onSelectTable(t.name)}
+            >
+              <div className="ml-table-name">🗂️ {t.name}</div>
+              <div className="ml-table-meta">{t.rowCount.toLocaleString()} 行</div>
+              {t.description && <div className="ml-table-desc">{t.description}</div>}
+            </div>
+          ))}
+        </div>
+
+        <div className="ml-table-detail">
+          {selectedTable ? (
+            <TableDetailView
+              name={selectedTable}
+              schema={schema}
+              preview={preview}
+              onDelete={() => onDeleteTable(selectedTable)}
+              onQueryHere={() => onQueryHere(selectedTable)}
+            />
+          ) : (
+            <div className="empty-state">← 左のテーブルを選択してください</div>
+          )}
+        </div>
+      </div>
+    </>
   );
 }
 
@@ -651,6 +675,10 @@ function DatasetManager({ datasets, onReload, onReloadDataset, onSelect, showToa
             </div>
           </div>
         ))}
+        <div className="chat-write-note">
+          💬 現時点では、チャットからのデータセットへの書き込み (作成・画像追加・アノテーション) には非対応です。
+          チャットからは検出の実行と学習済みモデル一覧の参照のみ利用できます。
+        </div>
       </div>
     </div>
   );
@@ -1828,6 +1856,10 @@ function KeypointDatasetManager({ datasets, onReload, onReloadDataset, onSelect,
             </div>
           </div>
         ))}
+        <div className="chat-write-note">
+          💬 現時点では、チャットからのデータセットへの書き込み (作成・画像追加・アノテーション) には非対応です。
+          チャットからは検出の実行と学習済みモデル一覧の参照のみ利用できます。
+        </div>
       </div>
     </div>
   );
@@ -2669,8 +2701,9 @@ function QueryView({ sql, setSql, result, error, onRun, tables }) {
   );
 }
 
-// ─── 🧠 モデル管理ビュー ───
-function ModelsView({ tables, showToast }) {
+// ─── 🧠 モデル学習ビュー (🗂️ データテーブル / 🔍 SQLクエリ / 🧠 モデル学習 のサブタブ構成) ───
+// subTab/setSubTab は App が保持 (「SQLで開く」でデータテーブル→SQLクエリへ遷移するため)
+function ModelsView({ tables, showToast, tablesPanel, queryPanel, subTab, setSubTab }) {
   const [models, setModels] = useState([]);
   const [jobs, setJobs] = useState([]);
   const [runningJobId, setRunningJobId] = useState(null);
@@ -2761,6 +2794,19 @@ function ModelsView({ tables, showToast }) {
 
   return (
     <div className="ml-models-view">
+      {/* 学習データの管理 (データテーブル)・SQLでのデータ確認・モデルの学習をサブタブで切替 */}
+      <div className="image-train-subtabs" style={{marginBottom: 16}}>
+        <button className={`subtab ${subTab === 'tables' ? 'active' : ''}`} onClick={() => setSubTab('tables')}>🗂️ データテーブル</button>
+        <button className={`subtab ${subTab === 'query' ? 'active' : ''}`} onClick={() => setSubTab('query')}>🔍 SQLクエリ</button>
+        <button className={`subtab ${subTab === 'train' ? 'active' : ''}`} onClick={() => setSubTab('train')}>🧠 モデル学習</button>
+      </div>
+
+      {subTab === 'tables' && tablesPanel}
+
+      {subTab === 'query' && queryPanel}
+
+      {subTab === 'train' && (
+      <>
       <div className="toolbar">
         <button className="btn primary" onClick={() => { setEditing(null); setShowCreate(true); }}>
           ➕ モデルを新規作成
@@ -2883,6 +2929,8 @@ function ModelsView({ tables, showToast }) {
           )}
         </div>
       </div>
+      </>
+      )}
 
       {showCreate && (
         <ModelEditDialog

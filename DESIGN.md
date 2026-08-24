@@ -2874,6 +2874,12 @@ body, .app-layout, .chat-area {
 32. **`<think>` タグが閉じないまま終わるケース**
     Qwen3系で `max_tokens` 切れにより `<think>...</think>` の閉じタグが出ない場合、フロント側で「全文がthinking、本文が空」と解釈されて表示が止まる。ストリーミング完了後の救済処理として、`!content && thinking` ならthinking内容を本文に昇格させる。
 
+    **追加対処: 思考のみで打ち切られた場合の自動引き直し (`retryFinalWithoutThinking`)**
+    昇格で救えるのは「thinking の中に実は回答が書かれていた」ケースだけで、出典キーの検討のような思考が延々と続いて `finish_reason=length` で切れた場合は昇格しても回答が存在しない (全部独白→固定メッセージ、または引用断片の誤昇格になる)。そこでストリーム完了後、最後のメッセージに `thinkingOnly` フラグ (昇格・固定メッセージ化・「日本語で聞かれたのに本文が全て非日本語のまま length 打ち切り」のいずれかで立つ) があり、かつ `rescueFailed` か `lengthCapped` の場合は、ツール判断と同じ `chat_template_kwargs: { enable_thinking: false }` を付けて「思考を書かず最終回答だけを日本語で」と1回だけ引き直す。`ctxExhausted` (引き直しても同じ) と `loopDetected` (controller が abort 済み) は対象外。agentic 経路・always 経路の両方に適用し、空応答救済の引き直しにも enable_thinking=false を追加した。
+
+    **同根の対処: コンパクション要約の「要約結果が空でした」(`requestConversationSummary`)**
+    要約呼び出しも同じ理由で空になる (思考が summaryMaxTokens=1024 を食い潰し、`<think>` 除去後に何も残らない)。加えて、圧縮を使うのはコンテキストが埋まった時なので、対象会話の全文を1リクエストに詰めると n_ctx を圧迫して生成余地が無くなる。対策: ①要約呼び出しに enable_thinking=false を付与、②空なら max_tokens を3倍にして1回だけ引き直し、③対象を `chunkTextsForSummary()` で「n_ctx - 要約予算×2 - 600tok」のチャンクへ分割し、既存の「前回要約 + 続き → 統合要約」形式で順次要約 (1メッセージ単体で予算を超える巨大テキストは先頭優先で切り詰め)。失敗時の挙動は従来どおり (自動: 未圧縮で送信 / 手動: エラー表示)。
+
 33. **Embedding処理中の並行リクエストでサーバー詰まり**
     ドキュメントD&D中はチャンクごとに大量の `/embed/v1/embeddings` が発生する。同時にチャット送信されるとllama-server側で詰まることがある。フロント側で `embeddingJobs.length > 0` の間は送信ボタンを無効化し、並行リクエストを防ぐ。
 
@@ -4294,7 +4300,7 @@ PostProcessDialog で量子化レベル選択時、モデル名からサイズ�
 ```
 ┌─────────────────────────────────────────────────────────┐
 │ Browser (React SPA)                                       │
-│   /ml.html (4タブ): データテーブル / SQL / モデル / API     │
+│   /ml.html: モデル学習(データテーブル/SQL/学習) / API       │
 └──────────────────────┬──────────────────────────────────┘
                        │ HTTP (Cookie or Bearer Token)
                        ▼
@@ -4576,7 +4582,7 @@ LLM が派生列で呼んでも自動修正されるので、サーバーには�
 
 ### LLM ツール連携の設計
 
-#### 5つのMLツール
+#### 7つのMLツール
 
 | ツール | 役割 | 引数 |
 |:--|:--|:--|
@@ -4585,6 +4591,22 @@ LLM が派生列で呼んでも自動修正されるので、サーバーには�
 | `ml_query_dataset` | 読み取り専用 SQL | `sql, limit?` |
 | `ml_list_models` | 学習済みモデル一覧 + predictHint | (なし) |
 | `ml_predict` | 推論実行 | `modelName, features` |
+| `ml_import_csv` | 生成CSVをデータテーブルへ登録 (書き込み。既定 append、replace はユーザー明示時のみ) | `tableName, mode?, description?, csvContent?` |
+| `tuning_import_samples` | 生成CSVをファインチューニング教師データへ追加登録 (書き込み) | `csvContent?` |
+
+書き込み系の2つは通常チャット (index.jsx) のみで提供し、`harness_client.js` の `CHAT_TOOL_META` に `readOnly: false` で登録済み (plan モードで拒否、default モードで確認対象)。外部API (agent_proxy.js) には提供しない。UI 側の同等機能として、チャットの ```csv / ```tsv コードブロックの「📊 学習に登録」ボタン → `CsvRegisterDialog` からも同じサーバーAPI (`/ml/datasets/import/csv`, `/tuning/samples/import`) で登録できる。
+
+#### 画像学習系チャットツール (読み取り専用)
+
+| ツール | 役割 | 提供条件 |
+|:--|:--|:--|
+| `detect_objects` | 添付画像の物体検出。`model` 引数で学習済みカスタムモデル指定 (サーバーの `customModel` に渡す。省略時はCOCO) | 画像添付 + ml.enabled |
+| `detect_keypoints` | 添付画像のキーポイント検出 (`/ml/image/keypoint/detect`。COCO人体17点/カスタム) | 画像添付 + ml.enabled |
+| `image_list_models` | `/ml/image/custom-models` と `/ml/image/keypoint/custom-models` を束ねた学習済みモデル一覧 | 画像添付、または画像学習系キーワード発話 + ml.enabled |
+
+3つとも `CHAT_TOOL_META` に `readOnly: true` で登録。データセット作成・画像追加・学習開始の書き込み系ツールは意図的に提供しない (誤爆時にGPUを長時間占有する学習が走るリスクと、チャットからの画像一括アップロードが実用的でないため)。UI 側 (`DatasetManager` / `KeypointDatasetManager`) のデータセット一覧下部に「チャットからの書き込みは非対応」のノート (`.chat-write-note`) を表示して対応状況を明示する。
+
+**csvContent は省略が既定 (参照方式)**: ツール判断の LLM 呼び出しは分類用の小さい `max_tokens` で走るため、LLM にCSV全文をツール引数へ再掲させると生成が途中で打ち切られ、llama-server 側のツール呼び出しJSONパースが「missing closing quote」の 500 で落ちる。そこで csvContent 省略時は `findLastCsvFence()` (index.jsx) が会話 — 今ターンの `apiMessages` を優先し、次にチャット履歴 `messages` — を新しい順に走査して、最後に現れた ```csv / ```tsv コードブロックをクライアント側で解決する。TSV は tuning 登録時に `tsvToCsv()` でカンマ区切りへ変換する。引数は tableName 程度の小ささに保たれ、トークン切れが構造的に起きない。
 
 #### MLプリフィルタ (誤発動防止)
 

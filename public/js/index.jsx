@@ -100,6 +100,33 @@ function splitLeakedReasoning(content, expectJapanese) {
   return { reasoning, answer };
 }
 
+// ─── 要約用チャンク分割 (コンパクション) ───
+// 会話テキスト配列を、1回の要約リクエストに収まる塊へ順序を保って分割する。
+// トークンは「2字/トークン」の概算 (コンパクション判定の estTok と同じ規則)。
+// 1要素単体で予算を超える巨大テキスト (貼り付けた長文など) は、n_ctx 溢れを
+// 防ぐため先頭優先で切り詰める。
+function chunkTextsForSummary(texts, chunkBudgetTok) {
+  const estTok = (s) => Math.ceil(String(s || '').length / 2);
+  const chunks = [];
+  let cur = [];
+  let curTok = 0;
+  for (let t of texts) {
+    if (estTok(t) > chunkBudgetTok) {
+      t = t.slice(0, chunkBudgetTok * 2) + '\n…(長いため以降を省略)';
+    }
+    const tok = estTok(t);
+    if (cur.length > 0 && curTok + tok > chunkBudgetTok) {
+      chunks.push(cur);
+      cur = [];
+      curTok = 0;
+    }
+    cur.push(t);
+    curTok += tok;
+  }
+  if (cur.length > 0) chunks.push(cur);
+  return chunks;
+}
+
 // ─── 高速ツールルーティング (System-1) のキーワード ───
 // 毎ターン判断LLM (数秒〜数十秒) に聞くのではなく、明白なケースはキーワードで即決する。
 // ここの判定は「粗くて良い」: 外れても従来の判断LLM or 無駄な検索1回に落ちるだけで、
@@ -384,12 +411,17 @@ renderer.code = function(arg1, arg2) {
   const id = 'code-' + Math.abs(hash).toString(36) + '-' + text.length;
   const isPython = /^py(thon[23]?)?$/.test(language);
   const isPreviewable = /^(html|threejs|three\.js|3d|webgl|canvas)$/.test(language);
+  const isDataTable = /^(csv|tsv)$/.test(language.toLowerCase());
   let actionBtns = '';
   if (isPython) {
     actionBtns += '<button class="run-btn" onclick="runPython(\'' + id + '\', this)">▶ 実行</button>';
   }
   if (isPreviewable) {
     actionBtns += '<button class="run-btn preview-btn" onclick="runPreview(\'' + id + '\', this)">▶ プレビュー</button>';
+  }
+  if (isDataTable) {
+    // 生成した CSV/TSV を ML データテーブル / ファインチューニング教師データへ登録
+    actionBtns += '<button class="run-btn csvreg-btn" onclick="registerCsvData(\'' + id + '\', \'' + language.toLowerCase() + '\')">📊 学習に登録</button>';
   }
   return '<div class="code-block-wrapper"><div class="code-header"><span>' + (language || 'code') + '</span><div class="code-header-actions">' + actionBtns + '<button class="copy-btn" onclick="copyCode(this, \'' + id + '\')">コピー</button><button class="copy-btn dl-btn" onclick="downloadCode(this, \'' + id + '\', \'' + language + '\')">ダウンロード</button></div></div><pre><code id="' + id + '" class="hljs language-' + language + '">' + highlighted + '</code></pre><div id="output-' + id + '"></div></div>';
 };
@@ -487,6 +519,19 @@ window.downloadCode = function(btn, id, lang) {
     btn.classList.add('copied');
     setTimeout(() => { btn.textContent = 'ダウンロード'; btn.classList.remove('copied'); }, 2000);
   } catch {}
+};
+
+// ─── CSV/TSV の「学習に登録」（グローバル）───
+// チャットが生成した CSV/TSV コードブロックを、ML データテーブル (DuckDB) や
+// ファインチューニングの教師データとして登録するダイアログを開く。
+// コードブロックは Markdown レンダラーが HTML 文字列として生成するため、
+// React (App) 側へは CustomEvent で橋渡しする (App が拾ってダイアログ表示)。
+window.registerCsvData = function(id, lang) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  window.dispatchEvent(new CustomEvent('ogc:register-csv', {
+    detail: { content: el.textContent, lang: String(lang || '').toLowerCase() === 'tsv' ? 'tsv' : 'csv' },
+  }));
 };
 
 // ─── Python 実行関数（グローバル）───
@@ -1435,6 +1480,246 @@ function OrchestraPanel({ orch }) {
   );
 }
 
+// ─── チャット生成CSVの学習登録ダイアログ ───
+// コードブロックの「📊 学習に登録」から開き、CSV/TSV を
+//   ① ML データテーブル (POST /ml/datasets/import/csv … ml.html のインポートと同じAPI)
+//   ② ファインチューニング教師データ (POST /tuning/samples/import … tuning.html と同じAPI)
+// のどちらかへ登録する。
+
+// クォート対応の簡易1行パーサー (プレビューとヘッダー判定用。サーバー側 parseCsvLine と同じ規則)
+function splitDelimLine(line, delim) {
+  const result = [];
+  let cur = '';
+  let inQuote = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuote) {
+      if (c === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+      else if (c === '"') { inQuote = false; }
+      else { cur += c; }
+    } else {
+      if (c === '"') inQuote = true;
+      else if (c === delim) { result.push(cur); cur = ''; }
+      else cur += c;
+    }
+  }
+  result.push(cur);
+  return result;
+}
+
+// TSV → CSV 変換 (ファインチューニングの import API はカンマ区切りのみ対応のため)
+function tsvToCsv(content) {
+  const esc = (v) => /[",\r\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+  return content.split(/\r?\n/).map(l => l.split('\t').map(esc).join(',')).join('\n');
+}
+
+// 会話メッセージから「最後に現れた ```csv / ```tsv コードブロック」を探す。
+// ml_import_csv / tuning_import_samples ツールの csvContent 省略時の参照解決に使う。
+// ── なぜ参照方式か ──
+// ツール判断のLLM呼び出しは分類用の小さい max_tokens で走るため、LLM にCSV全文を
+// ツール引数へ再掲させると途中で打ち切られ、llama-server 側のツール呼び出しJSON
+// パースが「missing closing quote」の 500 で落ちる。会話に既にあるCSVはクライアント
+// 側で拾い、引数は tableName 程度の小ささに保つ。
+// messageLists: メッセージ配列の配列 (先のリスト優先)。各リストは末尾 (新しい方) から探す。
+function findLastCsvFence(messageLists) {
+  const fenceRe = /```[ \t]*(csv|tsv)[^\S\r\n]*\r?\n([\s\S]*?)```/gi;
+  for (const list of messageLists) {
+    if (!Array.isArray(list)) continue;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const content = list[i]?.content;
+      if (typeof content !== 'string' || content.indexOf('```') === -1) continue;
+      let m, last = null;
+      fenceRe.lastIndex = 0;
+      while ((m = fenceRe.exec(content)) !== null) {
+        last = { lang: m[1].toLowerCase(), content: m[2].trim() };
+      }
+      if (last && last.content) return last;
+    }
+  }
+  return null;
+}
+
+function CsvRegisterDialog({ data, onClose }) {
+  // data: { content, lang: 'csv'|'tsv' }
+  const delim = data.lang === 'tsv' ? '\t' : ',';
+  const [dest, setDest] = useState('ml');  // 'ml' | 'tuning'
+  const [tableName, setTableName] = useState(() => {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    return `chat_csv_${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}`;
+  });
+  const [description, setDescription] = useState('チャットで生成したCSVから登録');
+  const [mode, setMode] = useState('replace');  // ml.html のインポートと同じ既定
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(null);   // 成功メッセージ { text, link, linkLabel }
+  const [error, setError] = useState('');
+
+  // プレビュー用パース (先頭数行のみ。引用符内改行のセルは行単位プレビューでは崩れるが登録には影響しない)
+  const lines = data.content.split(/\r?\n/).filter(l => l.trim() !== '');
+  const headers = lines.length > 0 ? splitDelimLine(lines[0], delim).map(h => h.trim()) : [];
+  const previewRows = lines.slice(1, 6).map(l => splitDelimLine(l, delim));
+  const dataRowCount = Math.max(0, lines.length - 1);
+
+  // ファインチューニング登録には instruction / response 列が必須 (system は任意)
+  const lowerHeaders = headers.map(h => h.toLowerCase());
+  const tuningReady = lowerHeaders.includes('instruction') && lowerHeaders.includes('response');
+
+  const tableNameValid = /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(tableName);
+
+  async function submit() {
+    setError('');
+    setBusy(true);
+    try {
+      if (dest === 'ml') {
+        if (!tableNameValid) throw new Error('テーブル名は英数字とアンダースコアで先頭は英字、64文字以内です');
+        const r = await fetch('/ml/datasets/import/csv', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tableName, csvContent: data.content, mode, description }),
+        });
+        const res = await r.json();
+        if (!r.ok) throw new Error(res.error || `HTTP ${r.status}`);
+        setDone({
+          text: `テーブル「${res.tableName}」に登録しました (現在 ${Number(res.rowCount).toLocaleString()} 行)`,
+          link: '/ml.html', linkLabel: '🤖 機械学習ページで確認',
+        });
+      } else {
+        const content = data.lang === 'tsv' ? tsvToCsv(data.content) : data.content;
+        const r = await fetch('/tuning/samples/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ format: 'csv', content }),
+        });
+        const res = await r.json();
+        if (!r.ok) throw new Error(res.error || `HTTP ${r.status}`);
+        setDone({
+          text: `教師データを ${res.added} 件追加しました (合計 ${res.total} 件)`,
+          link: '/tuning.html', linkLabel: '🧠 ファインチューニングページで確認',
+        });
+      }
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="role-modal-overlay" onClick={onClose}>
+      <div className="role-modal csvreg-modal" onClick={e => e.stopPropagation()}>
+        <div className="role-modal-header">
+          <span>📊 生成{data.lang === 'tsv' ? 'TSV' : 'CSV'}を学習に登録</span>
+          <button className="role-modal-close" onClick={onClose}>×</button>
+        </div>
+
+        {/* データのプレビュー */}
+        <div className="csvreg-preview">
+          <div className="csvreg-preview-meta">
+            {headers.length} 列 × {dataRowCount.toLocaleString()} 行 (ヘッダー除く) / プレビューは先頭5行
+          </div>
+          <div className="csvreg-preview-scroll">
+            <table className="csvreg-preview-table">
+              <thead>
+                <tr>{headers.map((h, i) => <th key={i}>{h}</th>)}</tr>
+              </thead>
+              <tbody>
+                {previewRows.map((row, i) => (
+                  <tr key={i}>{headers.map((_, j) => <td key={j}>{row[j] ?? ''}</td>)}</tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* 登録先の選択 */}
+        <div className="csvreg-dest-row">
+          <label className={`csvreg-dest ${dest === 'ml' ? 'selected' : ''}`}>
+            <input type="radio" name="csvreg-dest" checked={dest === 'ml'} onChange={() => setDest('ml')} />
+            <div>
+              <div className="csvreg-dest-title">🗂️ MLデータテーブル (機械学習)</div>
+              <div className="csvreg-dest-desc">DuckDB のデータテーブルに取り込み、モデル学習・SQL分析に使う</div>
+            </div>
+          </label>
+          <label className={`csvreg-dest ${dest === 'tuning' ? 'selected' : ''} ${!tuningReady ? 'disabled' : ''}`}>
+            <input type="radio" name="csvreg-dest" checked={dest === 'tuning'} disabled={!tuningReady} onChange={() => setDest('tuning')} />
+            <div>
+              <div className="csvreg-dest-title">🧠 ファインチューニング教師データ</div>
+              <div className="csvreg-dest-desc">
+                {tuningReady
+                  ? 'instruction / response 列を教師データとして追加 (既存データは消えません)'
+                  : '⚠️ ヘッダーに instruction と response 列が必要です (このデータには不足)'}
+              </div>
+            </div>
+          </label>
+        </div>
+
+        {/* ML 登録フォーム */}
+        {dest === 'ml' && (
+          <div className="csvreg-form">
+            <div className="csvreg-field">
+              <label>テーブル名</label>
+              <input
+                type="text" value={tableName}
+                onChange={e => setTableName(e.target.value)}
+                className={tableNameValid ? '' : 'invalid'}
+                placeholder="例: sales_data"
+              />
+              {!tableNameValid && <div className="csvreg-field-error">英数字とアンダースコアで先頭は英字、64文字以内</div>}
+            </div>
+            <div className="csvreg-field">
+              <label>説明 (任意)</label>
+              <input type="text" value={description} onChange={e => setDescription(e.target.value)} />
+            </div>
+            <div className="csvreg-field">
+              <label>モード</label>
+              <select value={mode} onChange={e => setMode(e.target.value)}>
+                <option value="replace">置換 (新規作成 / 同名テーブルを置き換え)</option>
+                <option value="append">追記 (既存テーブルの末尾に追加)</option>
+              </select>
+            </div>
+          </div>
+        )}
+
+        {/* ファインチューニング登録の説明 */}
+        {dest === 'tuning' && tuningReady && (
+          <div className="csvreg-form">
+            <div className="csvreg-tuning-cols">
+              検出した列: <span className="ok">instruction ✓</span> <span className="ok">response ✓</span>{' '}
+              {lowerHeaders.includes('system')
+                ? <span className="ok">system ✓</span>
+                : <span className="opt">system (任意・なし)</span>}
+            </div>
+          </div>
+        )}
+
+        {error && <div className="csvreg-error">❌ {error}</div>}
+        {done && (
+          <div className="csvreg-done">
+            ✅ {done.text}{' '}
+            <a href={done.link} target="_blank" rel="noreferrer noopener">{done.linkLabel} →</a>
+          </div>
+        )}
+
+        <div className="role-editor-actions">
+          <button className="role-btn-cancel" onClick={onClose}>{done ? '閉じる' : 'キャンセル'}</button>
+          {!done && (
+            <button
+              className="role-btn-save"
+              onClick={submit}
+              disabled={busy || dataRowCount === 0 || (dest === 'ml' && !tableNameValid)}
+            >
+              {busy ? '登録中...' : '登録'}
+            </button>
+          )}
+        </div>
+        <div className="role-editor-hint">
+          💡 チャットの ```csv / ```tsv コードブロックから登録できます。ML登録後は 🤖 機械学習ページの「モデル学習 &gt; データテーブル」に表示されます。
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   // ─── 認証 ───
   const [authenticated, setAuthenticated] = useState(false);
@@ -1539,6 +1824,14 @@ function App() {
   // search_persistent_documents ツールが追加される
   // 出典ビューア (【S1】をクリックすると、渡された本文と元PDFの該当ページを表示)
   const [sourceViewer, setSourceViewer] = useState(null);
+  // 生成CSVの学習登録ダイアログ ({content, lang} / null)。コードブロックの
+  // 「📊 学習に登録」ボタン (グローバル関数) から CustomEvent 経由で開く
+  const [csvRegisterData, setCsvRegisterData] = useState(null);
+  useEffect(() => {
+    const handler = (e) => setCsvRegisterData(e.detail);
+    window.addEventListener('ogc:register-csv', handler);
+    return () => window.removeEventListener('ogc:register-csv', handler);
+  }, []);
   const [persistentRagAvailable, setPersistentRagAvailable] = useState(false);
   // 登録ドキュメント全件 [{docId, filename, category, ...}] とカテゴリ一覧 [{name, docCount}]
   const [persistentRagDocs, setPersistentRagDocs] = useState([]);
@@ -2846,20 +3139,55 @@ function App() {
           }
         }
 
-        // 物体検出ツール: 画像が添付されていて、かつ ML 機能が有効な時のみ提供
+        // 物体検出/キーポイント検出ツール: 画像が添付されていて、かつ ML 機能が有効な時のみ提供
         // 「何が写ってる」「物体検出」「画像を分析」等の質問で LLM が呼ぶ
         if (hasImages && appConfig.ml?.enabled) {
           tools.push({
             type: 'function',
             function: {
               name: 'detect_objects',
-              description: '添付された画像に対して物体検出を実行し、写っている物体 (人・車・動物・家具・食べ物など80種類) とその位置・個数を取得する。「何が写っているか」「物体を検出」「画像を分析」のような質問で使う。torchvision の COCO 事前学習モデルを使用。',
+              description: '添付された画像に対して物体検出を実行し、写っている物体とその位置・個数を取得する。「何が写っているか」「物体を検出」「画像を分析」のような質問で使う。' +
+                'model を省略すると COCO 事前学習モデル (人・車・動物・家具・食べ物など80種類)。' +
+                '画像学習タブで学習した独自クラスのカスタムモデルを使う場合は model にそのモデル名を渡す (ユーザーがモデル名を明示した時のみ。一覧は image_list_models で確認できる)。',
               parameters: {
                 type: 'object',
                 properties: {
-                  threshold: { type: 'number', description: '信頼度しきい値 (0〜1、デフォルト0.5)。低くすると多く検出、高くすると確実なものだけ' }
+                  threshold: { type: 'number', description: '信頼度しきい値 (0〜1、デフォルト0.5)。低くすると多く検出、高くすると確実なものだけ' },
+                  model: { type: 'string', description: '学習済みカスタム検出モデル名 (省略時はCOCO汎用モデル)。ユーザーが明示した時のみ指定し、推測で名前を作らない' }
                 }
               }
+            }
+          });
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'detect_keypoints',
+              description: '添付された画像に対してキーポイント検出を実行し、対象ごとの各点の座標を取得する。「姿勢を検出」「キーポイントを検出」「関節位置を調べて」のような質問で使う。' +
+                'model を省略すると COCO 人体17点モデル。画像学習タブで学習したカスタムキーポイントモデルを使う場合は model にそのモデル名を渡す (一覧は image_list_models で確認できる)。',
+              parameters: {
+                type: 'object',
+                properties: {
+                  threshold: { type: 'number', description: '信頼度しきい値 (0〜1、デフォルト0.5)' },
+                  model: { type: 'string', description: '学習済みカスタムキーポイントモデル名 (省略時はCOCO人体17点)。ユーザーが明示した時のみ指定し、推測で名前を作らない' }
+                }
+              }
+            }
+          });
+        }
+        // 画像学習モデル一覧ツール: 画像添付時、または画像学習系のキーワードを発話した時に提供
+        // (「どんな画像モデルがある?」に画像なしでも答えられるように)
+        const imageModelKeywords = ['画像学習', '画像モデル', '検出モデル', 'キーポイントモデル', 'カスタムモデル', '物体検出', 'キーポイント'];
+        const wantsImageModels = imageModelKeywords.some(k => text.includes(k));
+        if (appConfig.ml?.enabled && (hasImages || wantsImageModels)) {
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'image_list_models',
+              description: '【発動条件: ユーザーが「どんな画像モデルがある?」「検出モデル一覧」「カスタムモデルで検出したい」のように画像学習モデルについて聞いた時のみ】' +
+                '画像学習タブで学習した独自モデルの一覧を取得する (物体検出モデルのクラス名、キーポイントモデルの点名を含む)。' +
+                '検出の実行は detect_objects / detect_keypoints (要・画像添付)。\n' +
+                '❌ 呼ばないケース: 画像と無関係な質問、MLデータテーブルの話 (それは ml_list_datasets / ml_list_models)。',
+              parameters: { type: 'object', properties: {} }
             }
           });
         }
@@ -3074,6 +3402,54 @@ function App() {
               }
             }
           });
+          // ─── 書き込み系: 生成したCSVの登録 (ハーネスの権限モードで readOnly=false として扱われる) ───
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'ml_import_csv',
+              description:
+                '【発動条件: ユーザーが「このCSVをデータテーブルに登録して」「MLに取り込んで」のように、CSVデータの登録・取り込みを明示的に指示した時のみ】' +
+                '会話中のCSVを機械学習用データテーブル (DuckDB) に取り込む。\n\n' +
+                '⚠️ ルール:\n' +
+                '1. 【最重要】会話に既に ```csv / ```tsv コードブロックがあるなら csvContent は**省略する** (自動で会話の直近のCSVブロックが使われる)。' +
+                'CSV全文を引数に書き写すとトークン上限で呼び出しが壊れて失敗するため、絶対に再掲しない。\n' +
+                '2. tableName は英数字とアンダースコア (先頭は英字)。ユーザーが指定しなければ内容がわかる新しい名前を付ける。\n' +
+                '3. mode は基本 "append" (追記)。既存テーブルの全置き換えは、ユーザーが明示的に「上書き」「置き換え」と言った時だけ "replace"。\n' +
+                '4. まだ会話にCSVが無い場合: 数行程度の小さなデータなら csvContent に直接書いてよい。大きなデータは、先に ```csv コードブロックとして提示してから (次のターンで) このツールを呼ぶ。\n' +
+                '❌ 呼ばないケース: ユーザーが登録を指示していない。',
+              parameters: {
+                type: 'object',
+                properties: {
+                  tableName: { type: 'string', description: '登録先テーブル名 (英数字と_、先頭は英字、64文字以内)' },
+                  csvContent: { type: 'string', description: '省略推奨。省略すると会話の直近の ```csv / ```tsv コードブロックを自動で取り込む。指定は会話にCSVが無く数行の小さなデータを直接渡す時だけ (1行目はヘッダー)' },
+                  mode: { type: 'string', enum: ['append', 'replace'], description: 'append=追記 (既定・安全) / replace=同名テーブルを置き換え (ユーザーが明示した時のみ)' },
+                  description: { type: 'string', description: 'テーブルの説明 (任意)' },
+                },
+                required: ['tableName']
+              }
+            }
+          });
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'tuning_import_samples',
+              description:
+                '【発動条件: ユーザーが「このCSVをファインチューニング(教師データ)に登録して」のように明示的に指示した時のみ】' +
+                'instruction,response (任意で system) 列を持つCSVを、ファインチューニングの教師データとして追加登録する。追加のみで既存データは消えない。\n\n' +
+                '⚠️ ルール:\n' +
+                '1. 【最重要】会話に既に ```csv / ```tsv コードブロックがあるなら csvContent は**省略する** (自動で会話の直近のCSVブロックが使われる)。' +
+                'CSV全文を引数に書き写すとトークン上限で呼び出しが壊れて失敗するため、絶対に再掲しない。通常は引数なし {} で呼ぶだけでよい。\n' +
+                '2. CSVの1行目はヘッダーで、instruction と response 列が必須。列名が違うデータは、まず ```csv コードブロックでその2列の形に整形して提示してから、このツールを引数なしで呼ぶ。\n' +
+                '❌ 呼ばないケース: ユーザーが登録を指示していない。',
+              parameters: {
+                type: 'object',
+                properties: {
+                  csvContent: { type: 'string', description: '省略推奨。省略すると会話の直近の ```csv / ```tsv コードブロックを自動で登録する。指定は会話にCSVが無く数行の小さなデータを直接渡す時だけ (ヘッダーに instruction,response 必須)' },
+                },
+                required: []
+              }
+            }
+          });
         }
 
         // ─── ML系ツールのプリフィルタ ───
@@ -3098,6 +3474,9 @@ function App() {
             // 予測関連のキーワード
             '予測して', '推論して', '予測する', '推論する', '予測でき',
             'predict', 'forecast',
+            // CSV登録関連のキーワード (ml_import_csv / tuning_import_samples 用)
+            'csv', 'tsv', '登録して', '取り込んで', 'インポート',
+            'ファインチューニング', '教師データ', '学習データ',
           ];
           const hasMetaKeyword = mlMetaKeywords.some(k => recentUserText.includes(k));
 
@@ -3141,6 +3520,7 @@ function App() {
             const mlToolNames = new Set([
               'ml_list_datasets', 'ml_describe_dataset', 'ml_query_dataset',
               'ml_list_models', 'ml_predict',
+              'ml_import_csv', 'tuning_import_samples',
             ]);
             const before = tools.length;
             for (let i = tools.length - 1; i >= 0; i--) {
@@ -3391,7 +3771,11 @@ function App() {
           );
         }
         if (hasImages && appConfig.ml?.enabled) {
-          toolListLines.push('- detect_objects: 添付画像の物体検出（「何が写ってる」「物体を検出」「画像を分析」等で使う）');
+          toolListLines.push('- detect_objects: 添付画像の物体検出（「何が写ってる」「物体を検出」「画像を分析」等で使う。カスタムモデル名の明示があれば model 引数で指定）');
+          toolListLines.push('- detect_keypoints: 添付画像のキーポイント検出（「姿勢を検出」「キーポイント」「関節位置」等で使う。カスタムモデル名の明示があれば model 引数で指定）');
+        }
+        if (appConfig.ml?.enabled && (hasImages || wantsImageModels)) {
+          toolListLines.push('- image_list_models: 画像学習の学習済みカスタムモデル一覧（「どんな画像モデルがある」「検出モデル一覧」等で使う）');
         }
         if (appConfig.ttsGen) {
           toolListLines.push('- generate_speech: テキストを音声(WAV)に合成（「音声にして」「しゃべって」「読み上げて」「〇〇の声で作って」等で使う。声の特徴はテキストで指定可）');
@@ -3644,7 +4028,14 @@ function App() {
               } catch {
                 try { errBody = (await toolRes.text()).slice(0, 200); } catch {}
               }
-              throw new Error(`API Error ${toolRes.status}${errBody ? ': ' + errBody : ''}`);
+              errBody = String(errBody).slice(0, 300);
+              // LLM がツール引数に長文 (CSV等) を書き出して max_tokens で途中で切れると、
+              // llama-server 側のツール呼び出しJSONパースがここで 500 になる。
+              // 登録系ツールはCSVを自動参照するので、再掲なしの短い指示で復旧できる旨を補足
+              const argParseBroken = /parse tool call arguments/i.test(errBody);
+              throw new Error(`API Error ${toolRes.status}${errBody ? ': ' + errBody : ''}${argParseBroken
+                ? '\n\n💡 ツール引数に長いデータ (CSV等) を書き出して途中で切れた可能性があります。会話に出ているCSVは自動参照されるので、内容を再掲させず「さっきのCSVを登録して」のように短く指示し直してください。'
+                : ''}`);
             }
             toolData = await toolRes.json();
             // OpenAI互換: { choices: [{ message: { role, content, tool_calls } }] }
@@ -3951,12 +4342,14 @@ function App() {
               apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: ragResultText });
 
             } else if (fnName === 'detect_objects') {
-              // 添付画像の物体検出 (Phase 1 の /ml/image/detect を再利用)
+              // 添付画像の物体検出 (Phase 1 の /ml/image/detect を再利用)。
+              // model 指定があれば画像学習タブで学習したカスタムモデルで検出する
               const th = typeof fnArgs.threshold === 'number' ? fnArgs.threshold : 0.5;
-              searchQueries.push({ query: '画像の物体検出', resultCount: null, type: 'image' });
+              const customModel = typeof fnArgs.model === 'string' && fnArgs.model.trim() ? fnArgs.model.trim() : null;
+              searchQueries.push({ query: customModel ? `画像の物体検出 (${customModel})` : '画像の物体検出', resultCount: null, type: 'image' });
               setMessages(prev => {
                 const copy = [...prev];
-                copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: '🖼️ 画像の物体検出中...', searchQueries: [...searchQueries] };
+                copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: customModel ? `🖼️ 「${customModel}」で物体検出中...` : '🖼️ 画像の物体検出中...', searchQueries: [...searchQueries] };
                 return copy;
               });
 
@@ -3973,13 +4366,13 @@ function App() {
                   const res = await fetch('/ml/image/detect', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ image: dataUrl, threshold: th }),
+                    body: JSON.stringify({ image: dataUrl, threshold: th, ...(customModel ? { customModel } : {}) }),
                   });
                   const data = await res.json();
                   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
 
                   if (data.count === 0) {
-                    detectText = `物体は検出されませんでした (しきい値 ${th})。画像サイズ: ${data.imageWidth}×${data.imageHeight}`;
+                    detectText = `物体は検出されませんでした (モデル: ${data.model}, しきい値 ${th})。画像サイズ: ${data.imageWidth}×${data.imageHeight}`;
                   } else {
                     // クラス別に集計
                     const summary = {};
@@ -3990,12 +4383,13 @@ function App() {
                     const detailText = data.detections.slice(0, 10).map((d, i) =>
                       `${i + 1}. ${d.label} (信頼度 ${(d.score * 100).toFixed(0)}%, 位置 [${Math.round(d.box.x1)},${Math.round(d.box.y1)}]-[${Math.round(d.box.x2)},${Math.round(d.box.y2)}])`
                     ).join('\n');
-                    detectText = `検出結果 (${data.count}個): ${summaryText}\n\n詳細:\n${detailText}\n\n画像サイズ: ${data.imageWidth}×${data.imageHeight}、使用デバイス: ${data.device}`;
+                    detectText = `検出結果 (${data.count}個, モデル: ${data.model}): ${summaryText}\n\n詳細:\n${detailText}\n\n画像サイズ: ${data.imageWidth}×${data.imageHeight}、使用デバイス: ${data.device}`;
                   }
                   searchQueries[searchQueries.length - 1].resultCount = data.count;
                 }
               } catch (e) {
-                detectText = `物体検出エラー: ${e.message}`;
+                detectText = `物体検出エラー: ${e.message}`
+                  + (customModel ? `\n(カスタムモデル「${customModel}」が存在するかは image_list_models で確認できます)` : '');
               }
 
               setMessages(prev => {
@@ -4004,6 +4398,110 @@ function App() {
                 return copy;
               });
               apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: detectText });
+
+            } else if (fnName === 'detect_keypoints') {
+              // 添付画像のキーポイント検出 (/ml/image/keypoint/detect)。
+              // model 指定があれば学習済みカスタムキーポイントモデルを使う
+              const th = typeof fnArgs.threshold === 'number' ? fnArgs.threshold : 0.5;
+              const customModel = typeof fnArgs.model === 'string' && fnArgs.model.trim() ? fnArgs.model.trim() : null;
+              searchQueries.push({ query: customModel ? `キーポイント検出 (${customModel})` : 'キーポイント検出', resultCount: null, type: 'image' });
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: customModel ? `🖐️ 「${customModel}」でキーポイント検出中...` : '🖐️ キーポイント検出中...', searchQueries: [...searchQueries] };
+                return copy;
+              });
+
+              let kpText;
+              try {
+                if (!pendingImages || pendingImages.length === 0) {
+                  kpText = '画像が添付されていません。キーポイント検出には画像の添付が必要です。';
+                } else {
+                  const img0 = pendingImages[0];
+                  const dataUrl = img0.base64.startsWith('data:')
+                    ? img0.base64
+                    : `data:image/png;base64,${img0.base64}`;
+                  const res = await fetch('/ml/image/keypoint/detect', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ image: dataUrl, threshold: th, ...(customModel ? { customModel } : {}) }),
+                  });
+                  const data = await res.json();
+                  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+
+                  const names = data.keypointNames || [];
+                  if (!data.count) {
+                    kpText = `キーポイントは検出されませんでした (モデル: ${data.model}, しきい値 ${th})。画像サイズ: ${data.imageWidth}×${data.imageHeight}`;
+                  } else {
+                    // 対象ごとに各点の座標を列挙 (LLM が位置関係を説明できる形)。上位5対象まで
+                    const detailText = (data.detections || []).slice(0, 5).map((det, i) => {
+                      const b = det.box || {};
+                      const kps = (det.keypoints || []).map((kp, ki) => {
+                        const nm = names[ki] || `kp${ki}`;
+                        const z = typeof kp.z === 'number' ? `, z=${kp.z.toFixed(2)}` : '';
+                        return `  - ${nm}: (${Math.round(kp.x)}, ${Math.round(kp.y)}${z})`;
+                      }).join('\n');
+                      return `対象${i + 1} (位置 [${Math.round(b.x1)},${Math.round(b.y1)}]-[${Math.round(b.x2)},${Math.round(b.y2)}]):\n${kps}`;
+                    }).join('\n\n');
+                    kpText = `キーポイント検出結果 (${data.count}対象, モデル: ${data.model}, 点: ${names.join(', ') || '不明'}):\n\n${detailText}\n\n画像サイズ: ${data.imageWidth}×${data.imageHeight}、使用デバイス: ${data.device}`;
+                  }
+                  searchQueries[searchQueries.length - 1].resultCount = data.count || 0;
+                }
+              } catch (e) {
+                kpText = `キーポイント検出エラー: ${e.message}`
+                  + (customModel ? `\n(カスタムモデル「${customModel}」が存在するかは image_list_models で確認できます)` : '');
+              }
+
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: null, searchQueries: [...searchQueries] };
+                return copy;
+              });
+              apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: kpText });
+
+            } else if (fnName === 'image_list_models') {
+              // 画像学習タブで学習した独自モデルの一覧 (物体検出 + キーポイント)
+              searchQueries.push({ query: '画像モデル一覧', resultCount: null, type: 'image' });
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: '🖼️ 画像学習モデル一覧を取得中...', searchQueries: [...searchQueries] };
+                return copy;
+              });
+
+              let listText;
+              try {
+                const [detRes, kpRes] = await Promise.all([
+                  fetch('/ml/image/custom-models', { signal: controller.signal }),
+                  fetch('/ml/image/keypoint/custom-models', { signal: controller.signal }),
+                ]);
+                const detData = detRes.ok ? await detRes.json() : { models: [] };
+                const kpData = kpRes.ok ? await kpRes.json() : { models: [] };
+                const detModels = detData.models || [];
+                const kpModels = kpData.models || [];
+                const fmtDate = (t) => t ? new Date(t).toLocaleDateString('ja-JP') : '不明';
+                const detLines = detModels.map(m =>
+                  `- ${m.name} (物体検出): クラス [${(m.classes || []).join(', ')}]、学習日 ${fmtDate(m.trainedAt)}`);
+                const kpLines = kpModels.map(m =>
+                  `- ${m.name} (キーポイント${m.dim === '3d' ? '・3D' : ''}): 点 [${(m.keypoints || []).join(', ')}]、学習日 ${fmtDate(m.trainedAt)}`);
+                if (detLines.length === 0 && kpLines.length === 0) {
+                  listText = '学習済みの画像カスタムモデルはまだありません。汎用モデル (COCO: 物体80種類 / 人体キーポイント17点) は detect_objects / detect_keypoints で model 指定なしで使えます。'
+                    + '\nカスタムモデルの学習は 🤖 機械学習ページの「🖼️ 画像学習」タブから行えます (データセット作成・アノテーション・学習はチャットからは非対応)。';
+                } else {
+                  listText = `学習済みの画像カスタムモデル (${detLines.length + kpLines.length}件):\n`
+                    + [...detLines, ...kpLines].join('\n')
+                    + '\n\n検出の実行: 画像を添付して detect_objects / detect_keypoints の model 引数にモデル名を指定。'
+                    + 'model 指定なしなら汎用モデル (COCO) を使う。';
+                }
+                searchQueries[searchQueries.length - 1].resultCount = detModels.length + kpModels.length;
+              } catch (e) {
+                listText = `画像モデル一覧の取得エラー: ${e.message}`;
+              }
+
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: null, searchQueries: [...searchQueries] };
+                return copy;
+              });
+              apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: listText });
 
             } else if (fnName === 'web_search') {
               const query = fnArgs.query || text;
@@ -4527,13 +5025,16 @@ function App() {
                 });
               }
             } else if (fnName === 'ml_list_datasets' || fnName === 'ml_describe_dataset' || fnName === 'ml_query_dataset'
-                       || fnName === 'ml_list_models' || fnName === 'ml_predict') {
-              // 機械学習用データテーブルへの読み取り専用アクセス + モデル推論
+                       || fnName === 'ml_list_models' || fnName === 'ml_predict'
+                       || fnName === 'ml_import_csv' || fnName === 'tuning_import_samples') {
+              // 機械学習用データテーブルへのアクセス + モデル推論 + 生成CSVの登録
               const label =
                   fnName === 'ml_list_datasets' ? 'データテーブル一覧'
                 : fnName === 'ml_describe_dataset' ? `スキーマ: ${fnArgs.table || ''}`
                 : fnName === 'ml_query_dataset' ? `SQL: ${(fnArgs.sql || '').slice(0, 80)}`
                 : fnName === 'ml_list_models' ? 'モデル一覧'
+                : fnName === 'ml_import_csv' ? `CSV登録: ${fnArgs.tableName || ''}`
+                : fnName === 'tuning_import_samples' ? '教師データ登録'
                 : `予測: ${fnArgs.modelName || ''}`;
               searchQueries.push({ type: 'data', query: label, resultCount: 0 });
               setMessages(prev => {
@@ -4594,6 +5095,69 @@ function App() {
                   }));
                   result = { models: trainedModels, count: trainedModels.length };
                   searchQueries[searchQueries.length - 1].resultCount = trainedModels.length;
+                } else if (fnName === 'ml_import_csv' || fnName === 'tuning_import_samples') {
+                  // 生成CSVの登録 (書き込み)。csvContent 省略時は会話の直近の
+                  // ```csv / ```tsv コードブロックを自動参照する (findLastCsvFence の
+                  // コメント参照: LLM にCSVを引数へ再掲させるとトークン切れで壊れるため)
+                  let csvContent = typeof fnArgs.csvContent === 'string' ? fnArgs.csvContent.trim() : '';
+                  let csvLang = 'csv';
+                  let csvOrigin = '引数 (csvContent)';
+                  if (!csvContent) {
+                    // 今ターンの会話 (apiMessages: ユーザー発話 + このループでの応答) を優先し、
+                    // 見つからなければチャット履歴全体 (messages) を新しい順に探す
+                    const found = findLastCsvFence([apiMessages, messages]);
+                    if (!found) {
+                      throw new Error('会話に ```csv / ```tsv コードブロックが見つかりません。先にCSVをコードブロックで提示するか、小さなデータなら csvContent 引数で渡してください');
+                    }
+                    csvContent = found.content;
+                    csvLang = found.lang;
+                    csvOrigin = `会話の直近の ${found.lang.toUpperCase()} コードブロック`;
+                  }
+                  if (fnName === 'ml_import_csv') {
+                    // 既定は安全な追記。replace は LLM が明示的に渡した時のみ
+                    // (サーバー既定の replace をここで上書きする)
+                    const tableName = fnArgs.tableName;
+                    if (!tableName) throw new Error('tableName が必要です');
+                    const importMode = fnArgs.mode === 'replace' ? 'replace' : 'append';
+                    const r = await fetch('/ml/datasets/import/csv', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        tableName,
+                        csvContent,
+                        mode: importMode,
+                        description: fnArgs.description || 'チャットから登録',
+                      }),
+                      signal: controller.signal,
+                    });
+                    const data = await r.json();
+                    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+                    result = {
+                      ...data,
+                      mode: importMode,
+                      source: csvOrigin,
+                      hint: `${csvOrigin}をテーブル「${data.tableName}」に登録しました (現在 ${data.rowCount} 行)。ユーザーには 🤖 機械学習ページ (/ml.html) の「モデル学習 > データテーブル」で確認できることを伝えてください。`,
+                    };
+                    searchQueries[searchQueries.length - 1].resultCount = data.rowCount || 0;
+                  } else {
+                    // tuning_import_samples: 教師データに追加登録 (追加のみ)。
+                    // import API はカンマ区切り想定なので TSV はここで変換する
+                    if (csvLang === 'tsv') csvContent = tsvToCsv(csvContent);
+                    const r = await fetch('/tuning/samples/import', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ format: 'csv', content: csvContent }),
+                      signal: controller.signal,
+                    });
+                    const data = await r.json();
+                    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+                    result = {
+                      ...data,
+                      source: csvOrigin,
+                      hint: `${csvOrigin}から教師データを ${data.added} 件追加しました (合計 ${data.total} 件)。ユーザーには 🧠 ファインチューニングページ (/tuning.html) で確認できることを伝えてください。added が 0 の場合は instruction/response 列の不足や空行が原因です。`,
+                    };
+                    searchQueries[searchQueries.length - 1].resultCount = data.added || 0;
+                  }
                 } else {
                   // ml_predict
                   const modelName = fnArgs.modelName;
@@ -4783,6 +5347,35 @@ function App() {
         if (!finalRes.ok) throw new Error(`API Error: ${finalRes.status}`);
         await streamResponse(finalRes, contextInfo, searchQueries, { audios: generatedAudios, images: generatedImages }, finalMessages);
 
+        // ─── 思考のみ応答の救済 ───
+        // 思考型モデルが思考だけで max_tokens を使い切り回答に到達しなかった場合、
+        // 思考を無効化して回答だけを1回引き直す (詳細は retryFinalWithoutThinking)
+        {
+          const lastMsg = await new Promise(resolve => {
+            setMessages(prev => { resolve(prev[prev.length - 1]); return prev; });
+          });
+          if (lastMsg?.thinkingOnly && (lastMsg.rescueFailed || lastMsg.lengthCapped)
+              && !lastMsg.ctxExhausted && !lastMsg.loopDetected) {
+            await retryFinalWithoutThinking({
+              baseMessages: finalMessages,
+              contextInfo,
+              searchQueries,
+              genMedia: { audios: generatedAudios, images: generatedImages },
+              requestBody: {
+                model: chatModel,
+                ...llamaCommonOptions,
+                ...(relaxSamplers ? {
+                  repeat_penalty: 1.0,
+                  dry_multiplier: 0,
+                  presence_penalty: 0,
+                  frequency_penalty: 0,
+                } : {}),
+              },
+              controller,
+            });
+          }
+        }
+
         // ─── 空応答の救済処理 ───
         // ツール呼び出し後の最終応答が空になることがある (Qwen3 系で稀に発生)
         // → 「分からない場合は理由を説明してほしい」と明示プロンプト追加して再生成
@@ -4844,6 +5437,9 @@ function App() {
                   presence_penalty: 0,
                   frequency_penalty: 0,
                 } : {}),
+                // 空応答の一因は思考型モデルが思考だけで予算を使い切ること
+                // (Qwen3系)。引き直しでは思考を止めて回答だけ書かせる
+                chat_template_kwargs: { enable_thinking: false },
               }),
               signal: controller.signal,
             });
@@ -5043,6 +5639,33 @@ function App() {
         const contextInfo = contexts.length > 0 ? contexts : null;
         setMessages(prev => [...prev, { role: 'assistant', content: '', thinking: '', contexts: contextInfo }]);
         await streamResponse(res, contextInfo, null, undefined, sentMessages);
+
+        // 思考のみで終わった場合の引き直し (ツール経路と同じ救済)
+        {
+          const lastMsg = await new Promise(resolve => {
+            setMessages(prev => { resolve(prev[prev.length - 1]); return prev; });
+          });
+          if (lastMsg?.thinkingOnly && (lastMsg.rescueFailed || lastMsg.lengthCapped)
+              && !lastMsg.ctxExhausted && !lastMsg.loopDetected) {
+            await retryFinalWithoutThinking({
+              baseMessages: sentMessages,
+              contextInfo,
+              searchQueries: null,
+              genMedia: undefined,
+              requestBody: {
+                model: chatModel,
+                ...llamaCommonOptions,
+                ...(appConfig.relaxSamplersAlways !== false ? {
+                  repeat_penalty: 1.0,
+                  dry_multiplier: 0,
+                  presence_penalty: 0,
+                  frequency_penalty: 0,
+                } : {}),
+              },
+              controller,
+            });
+          }
+        }
       }
     } catch (e) {
       if (e.name === 'AbortError') {
@@ -5089,40 +5712,85 @@ function App() {
   // 自動コンパクション（閾値超過時）と、手動の「コンテキストを圧縮」ボタンの両方から使う。
   // target = 要約対象のメッセージ配列、prevSummary = 既存の要約（あれば統合する）
   // 戻り値は要約本文（空文字なら失敗扱い）
+  //
+  // 「要約結果が空でした」になる2大原因への対策を入れてある:
+  //   1. 思考型モデル (Qwen3系) が <think> 内の思考だけで summaryMaxTokens を
+  //      使い切り、<think> 除去後に何も残らない
+  //      → enable_thinking=false で思考を止める (ツール判断フェーズと同じ対処)。
+  //        それでも空なら予算を増やして1回だけ引き直す
+  //   2. 圧縮を使うのはコンテキストが埋まった時なので、対象の会話全文を1回の
+  //      要約リクエストに詰めると n_ctx を圧迫し、生成余地が無くなって空になる
+  //      → 対象をチャンクへ分割し、「前回要約 + 続きの会話 → 統合要約」の
+  //        既存の統合形式で順次要約する
   async function requestConversationSummary(target, prevSummary, signal) {
     const cc = appConfig.contextCompaction || {};
-    const convoText = target.map(m =>
-      `[${m.role === 'user' ? 'ユーザー' : 'アシスタント'}] ${resolveStaleSourceKeys(m)}`
-    ).join('\n\n');
+    const summaryMax = cc.summaryMaxTokens ?? 1024;
     const compactSystem = 'あなたは会話履歴の要約担当です。以下の会話を、続きの会話でモデルが文脈として使うための要約にまとめてください。\n'
       + '- 事実・決定事項・数値・固有名詞・ファイル名・コードの要点は正確に残す\n'
       + '- ユーザーの目的と、未解決の課題・宿題を明記する\n'
       + '- 挨拶や相づちなど冗長な部分は省く\n'
       + '- 800字程度の日本語で、箇条書き中心でまとめる\n'
       + '- 要約本文のみを出力する（前置きや説明は不要）';
-    const compactUser = (prevSummary
-      ? `これまでの要約:\n${prevSummary}\n\n上記の要約の続きの会話:\n${convoText}\n\n要約と続きの会話を統合した新しい要約を作成してください。`
-      : convoText);
-    const sumRes = await fetchWithRetry('/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: chatModel,
-        messages: [
-          { role: 'system', content: compactSystem },
-          { role: 'user', content: compactUser },
-        ],
-        stream: false,
-        temperature: 0.2,
-        max_tokens: cc.summaryMaxTokens ?? 1024,
-        cache_prompt: true,
-      }),
-      signal,
-    });
-    if (!sumRes.ok) throw new Error(`API Error: ${sumRes.status}`);
-    const sumData = await sumRes.json();
-    return String(sumData.choices?.[0]?.message?.content || '')
-      .replace(/<think>[\s\S]*?(<\/think>|$)/gi, '').trim();
+
+    // 1回の要約LLM呼び出し
+    const callSummarizer = async (compactUser, maxTokens) => {
+      const sumRes = await fetchWithRetry('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: chatModel,
+          messages: [
+            { role: 'system', content: compactSystem },
+            { role: 'user', content: compactUser },
+          ],
+          stream: false,
+          temperature: 0.2,
+          max_tokens: maxTokens,
+          cache_prompt: true,
+          // 要約は機械的な作業で思考は不要。思考型モデルが思考だけで予算を
+          // 使い切って空要約になるのを防ぐ (効かないモデルでも害はない)
+          chat_template_kwargs: { enable_thinking: false },
+        }),
+        signal,
+      });
+      if (!sumRes.ok) throw new Error(`API Error: ${sumRes.status}`);
+      const sumData = await sumRes.json();
+      return String(sumData.choices?.[0]?.message?.content || '')
+        .replace(/<think>[\s\S]*?(<\/think>|$)/gi, '').trim();
+    };
+
+    // 対象をチャンクへ分割。1リクエストに入れる会話は
+    // 「n_ctx - 要約出力予算 - 前回要約と指示のぶん (概算 summaryMax + 600tok)」まで
+    const ctxTok = numCtx > 0 ? numCtx : 8192;
+    const chunkBudgetTok = Math.max(1500, ctxTok - summaryMax * 2 - 600);
+    const texts = target.map(m =>
+      `[${m.role === 'user' ? 'ユーザー' : 'アシスタント'}] ${resolveStaleSourceKeys(m)}`
+    );
+    const chunks = chunkTextsForSummary(texts, chunkBudgetTok);
+    if (chunks.length > 1) {
+      console.log(`[コンパクション] 対象が大きいため ${chunks.length} チャンクに分割して順次要約します (1チャンク≈${chunkBudgetTok}tok)`);
+    }
+
+    let summary = (prevSummary || '').trim();
+    for (let i = 0; i < chunks.length; i++) {
+      if (chunks.length > 1) {
+        setLoadingMessage(`会話を要約してコンテキストを圧縮中... (${i + 1}/${chunks.length})`);
+      }
+      const convoText = chunks[i].join('\n\n');
+      const compactUser = (summary
+        ? `これまでの要約:\n${summary}\n\n上記の要約の続きの会話:\n${convoText}\n\n要約と続きの会話を統合した新しい要約を作成してください。`
+        : convoText);
+      let out = await callSummarizer(compactUser, summaryMax);
+      if (!out) {
+        // enable_thinking が効かないモデルで思考が予算を食い潰した場合など。
+        // 予算を増やして1回だけ引き直す
+        console.warn(`[コンパクション] 要約が空 → max_tokens を ${summaryMax} → ${summaryMax * 3} に増やして引き直します`);
+        out = await callSummarizer(compactUser, summaryMax * 3);
+      }
+      if (!out) return '';   // 失敗扱い (自動: 今回は未圧縮で送信 / 手動: エラー表示)
+      summary = out;
+    }
+    return summary;
   }
 
   // ─── 手動コンテキスト圧縮（「コンテキストを圧縮」ボタン） ───
@@ -5555,19 +6223,42 @@ function App() {
             ...last,
             content: realAnswerLines.join('\n').trim(),
             thinking: reasoningLines.join('\n').trim(),
+            // 昇格で凌いだ印。打ち切りも重なっている場合は呼び出し元が
+            // 「思考なしで引き直し」(retryFinalWithoutThinking) を行う
+            thinkingOnly: true,
           };
         } else {
-          // 全部独白 → 固定メッセージ
+          // 全部独白 → 固定メッセージ (呼び出し元の引き直しが成功すれば上書きされる)
           console.warn(`[救済] thinkingが完全に独白 (${reasoningLines.length}行)、固定メッセージで応答`);
           copy[copy.length - 1] = {
             ...last,
             content: '申し訳ありません、適切な応答を生成できませんでした。もう一度質問していただけますか?',
             // thinking は残しておく (デバッグ用、ユーザーが展開すれば見える)
+            thinkingOnly: true,
+            rescueFailed: true,
           };
         }
       }
       return copy;
     });
+
+    // 日本語で聞かれたのに本文に日本語が1文字も無いまま max_tokens で切れた場合も
+    // 「思考のみで終わった」扱いにする。テンプレートによっては思考が content 側に
+    // 流れ込み、splitLeakedReasoning の目印 (計画メモの見出し等) に一致しない
+    // 自由文の思考 (出典キーの検討など) が途中で切れてそのまま本文になるため
+    if (lengthCapped && expectJapanese) {
+      setMessages(prev => {
+        const copy = [...prev];
+        const last = copy[copy.length - 1];
+        if (last && last.role === 'assistant') {
+          const c = (last.content || '').trim();
+          if (c && !HAS_JA_RE.test(c)) {
+            copy[copy.length - 1] = { ...last, thinkingOnly: true };
+          }
+        }
+        return copy;
+      });
+    }
 
     // ─── 生成メディアのマーカーを実URLで確定 ───
     // LLMが [[gen_audio:...]]/[[gen_image:...]] のファイル名を改変・捏造して
@@ -5581,6 +6272,69 @@ function App() {
         }
         return copy;
       });
+    }
+  }
+
+  // ─── 思考のみで終わった最終応答の引き直し ───
+  // Qwen3 等の思考型モデルが、出典キーの検討などの思考だけで max_tokens を使い切り、
+  // 回答本文に到達しないまま終わることがある (ユーザーには「思考中で停止した」ように
+  // 見える)。ツール判断フェーズと同じ対処 (chat_template_kwargs.enable_thinking=false)
+  // で思考を止め、回答だけを書かせて1回だけ引き直す。
+  // 呼び出し条件は呼び出し元で判定: 最後のメッセージに thinkingOnly が立っていて、
+  // かつ rescueFailed (完全に独白) or lengthCapped (思考の途中で打ち切り) の時。
+  // ctxExhausted (入力自体が上限超過 → 引き直しても同じ) と loopDetected
+  // (controller が abort 済み) の時は呼ばないこと。
+  async function retryFinalWithoutThinking({ baseMessages, contextInfo, searchQueries, genMedia, requestBody, controller }) {
+    const retryMessages = [
+      ...baseMessages,
+      {
+        role: 'user',
+        content:
+          '先ほどの応答は思考 (検討過程) だけで終わってしまい、回答が届いていません。\n'
+          + '思考・計画・出典キーの検討過程は書かず、最終回答だけを日本語で書いてください。',
+      },
+    ];
+    console.warn('[思考のみ救済] 思考だけで終了 → enable_thinking=false で回答のみを引き直します');
+    setMessages(prev => {
+      const copy = [...prev];
+      const last = copy[copy.length - 1];
+      if (last && last.role === 'assistant') {
+        copy[copy.length - 1] = {
+          ...last,
+          content: '',
+          agentStatus: '🧠 思考のみで終了したため、思考を止めて回答を生成し直しています...',
+          // 前回の終了状態を引き継ぐと引き直し後の表示・判定が汚れるためクリア
+          thinkingOnly: false,
+          rescueFailed: false,
+          lengthCapped: false,
+        };
+      }
+      return copy;
+    });
+    try {
+      const res = await fetchWithRetry('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...requestBody,
+          messages: retryMessages,
+          stream: true,
+          stream_options: { include_usage: true },
+          // ツール判断フェーズと同じ: 思考型モデルの思考を明示的に無効化
+          // (効かないモデルでも害はない。judgeBudget まわりのコメント参照)
+          chat_template_kwargs: { enable_thinking: false },
+        }),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        console.warn(`[思考のみ救済] 引き直し失敗: HTTP ${res.status}`);
+        return false;
+      }
+      await streamResponse(res, contextInfo, searchQueries, genMedia, retryMessages);
+      return true;
+    } catch (e) {
+      if (e.name !== 'AbortError') console.warn('[思考のみ救済] 引き直し失敗:', e.message);
+      return false;
     }
   }
 
@@ -8642,6 +9396,9 @@ function App() {
         </div>
       </div>
 
+      {csvRegisterData && (
+        <CsvRegisterDialog data={csvRegisterData} onClose={() => setCsvRegisterData(null)} />
+      )}
       {loadingMessage && <div className="loading-toast">{loadingMessage}</div>}
       {error && <div className="error-toast">{error}</div>}
       {lightboxSrc && (
