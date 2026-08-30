@@ -24,6 +24,11 @@ API (すべて JSON, localhost 内部用):
     POST /create {name, spec}     -> スキーマ指定でゼロから新規エージェント
     POST /act {name, state, epsilon?}   -> {action, actionIndex, qValues, explored}
     POST /learn {name, state, action, reward, next_state?, done?}  (or {experiences:[...]})
+
+視覚エージェント (V-JEPA 2 埋め込みを使うもの) の state:
+    {"speed": 1.2, "_embedding": [...]}  ← 表の列に加えて埋め込みを配列で渡す
+    埋め込みの生成はこのワーカーの外 (vjepa2_encode.py / 呼び出し側) で行う。
+    生フレームを直接受け取る常駐エンコーダは Phase 3 で追加予定。
     POST /checkpoint {name}       -> model.pt / config.json / metrics.json を保存
     POST /status {name}           -> 学習状況
     POST /unload {name}           -> メモリから解放 (dirty なら checkpoint)
@@ -98,9 +103,12 @@ class Agent:
         self.n_actions = n_actions
         self.action_labels = action_labels
         self.is_value = self.algo in ('dqn', 'ddqn', 'cql')
+        # 視覚エージェント: 状態ベクトル末尾 emb_dim 次元は V-JEPA 2 埋め込み。
+        # act/learn では state['_embedding'] で渡す (rl_common.encode_state_dict 参照)。
+        self.emb_dim = int(meta.get('embDim') or 0)
 
-        self.qnet = build_qnet(torch, nn, state_dim, n_actions, hidden).to(DEVICE)
-        self.target = build_qnet(torch, nn, state_dim, n_actions, hidden).to(DEVICE)
+        self.qnet = build_qnet(torch, nn, state_dim, n_actions, hidden, self.emb_dim).to(DEVICE)
+        self.target = build_qnet(torch, nn, state_dim, n_actions, hidden, self.emb_dim).to(DEVICE)
         self.target.load_state_dict(self.qnet.state_dict())
         self.target.eval()
         self.optimizer = torch.optim.Adam(self.qnet.parameters(), lr=lr)
@@ -287,6 +295,8 @@ class Agent:
                 'datasetMode': self.mode,
                 'tableName': None,
                 'stateDim': self.state_dim,
+                'embDim': self.emb_dim,
+                'vjepa2': self.meta.get('vjepa2'),
                 'nActions': self.n_actions,
                 'actionLabels': self.action_labels,
                 'hiddenSize': self.hidden,
@@ -329,6 +339,7 @@ class Agent:
             'algo': self.algo,
             'mode': self.mode,
             'stateDim': self.state_dim,
+            'embDim': self.emb_dim,
             'nActions': self.n_actions,
             'actionLabels': self.action_labels,
             'bufferSize': len(self.buffer),
@@ -369,7 +380,13 @@ def _build_fresh_meta(spec):
         'actionClasses': [str(a) for a in spec['actionLabels']],
         'hasNext': spec.get('mode') == 'transition',
         'doneColumn': None,
+        # 視覚エージェント (V-JEPA 2 等の埋め込みを状態に連結する場合)
+        'videoColumn': spec.get('videoColumn'),
+        'nextVideoColumn': None,
+        'embDim': max(0, int(spec.get('embDim') or 0)),
+        'vjepa2': spec.get('vjepa2'),
         # オンライン実行統計 (Welford)。カテゴリ列は更新せず index を通す。
+        # 埋め込み側には掛けないので、長さは表の列数 d のまま。
         'runningCount': 0,
         'runningMean': [0.0] * d,
         'runningM2': [0.0] * d,
@@ -379,8 +396,9 @@ def _build_fresh_meta(spec):
 def create_agent(name, spec):
     state_cols = spec.get('stateColumns')
     labels = spec.get('actionLabels')
-    if not isinstance(state_cols, list) or len(state_cols) == 0:
-        raise ValueError('stateColumns を1つ以上指定してください')
+    emb_dim = max(0, int(spec.get('embDim') or 0))
+    if not isinstance(state_cols, list) or (len(state_cols) == 0 and emb_dim == 0):
+        raise ValueError('stateColumns を1つ以上指定してください (視覚のみの場合は embDim を指定)')
     if not isinstance(labels, list) or len(labels) < 2:
         raise ValueError('actionLabels は2つ以上指定してください')
     meta = _build_fresh_meta(spec)
@@ -395,7 +413,7 @@ def create_agent(name, spec):
         batch_size=int(spec.get('batchSize', 64)),
         target_update=int(spec.get('targetUpdate', 200)),
         cql_alpha=float(spec.get('cqlAlpha', 0.5)),
-        state_dim=len(meta['stateColumns']),
+        state_dim=len(meta['stateColumns']) + emb_dim,
         n_actions=len(meta['actionClasses']),
         action_labels=meta['actionClasses'],
     )
@@ -428,6 +446,17 @@ def load_offline_agent(name):
     with open(cfg_path, 'r', encoding='utf-8') as f:
         cfg = json.load(f)
     meta = cfg['meta']
+    # 連続行動 / 行動チャンキングは出力の意味が Q値ではないため、
+    # このワーカーの act(argmax) / learn(経験再生) がそのままでは成立しない。
+    # 誤った形のネットを黙って組み立てるより、明示的に断る。
+    if (cfg.get('actionType') or meta.get('actionType') or 'discrete') != 'discrete':
+        raise ValueError(
+            f'エージェント {name} は連続行動 (BC回帰) のため、オンライン学習に未対応です '
+            '(オフライン学習と /policy 推論は使えます)')
+    if int(cfg.get('chunkSize') or meta.get('chunkSize') or 1) > 1:
+        raise ValueError(
+            f'エージェント {name} は行動チャンキング付きのため、オンライン学習に未対応です '
+            '(オフライン学習と /policy 推論は使えます)')
     mode = cfg.get('datasetMode') or ('transition' if meta.get('hasNext') else 'bandit')
     # 既にオンライン実行統計があればそれを使い、なければ scaler から種付け
     if meta.get('runningMean') is None:

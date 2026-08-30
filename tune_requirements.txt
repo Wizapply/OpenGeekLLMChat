@@ -28,7 +28,7 @@
 # 4. config.json で venv パスを指定:
 #    "pythonPath": "/home/wizapply-ai/opengeek-llm-chat/venv-tuning/bin/python"
 
-transformers>=4.40.0
+transformers>=4.52.0  # V-JEPA 2 (VJEPA2Model / AutoVideoProcessor) は 4.52 以降
 peft>=0.10.0
 trl>=0.12.0           # SFTTrainer + SFTConfig 用
 datasets>=2.14.0
@@ -36,6 +36,17 @@ accelerate>=0.27.0
 sentencepiece>=0.1.99
 protobuf>=4.21.0
 einops>=0.7.0
+
+# V-JEPA 2 で観測から強化学習/Behavior Cloning する場合（rl_runner.py の videoColumn）
+#   pillow             : フレーム連番ディレクトリ・静止画の読み込み
+#   torchcodec         : 動画デコード（必要なフレームだけ取り出せるので一番速い）
+#                        入らない環境では av（torchvision.io.read_video 経由）か decord で代替可
+# ROCm では attn_implementation="sdpa" を使うので flash-attn は不要。
+# 動作確認: python3 vjepa2_encode.py --probe
+pillow>=10.0.0
+torchcodec>=0.2.0
+# av>=12.0.0
+# decord>=0.6.0
 
 # QLoRA を使う場合（AMD ROCm では制限あり、LoRA推奨）
 # bitsandbytes>=0.43.0

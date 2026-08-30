@@ -272,7 +272,17 @@
     "apiTokens": [],
     "onlinePort": 11600,
     "onlineIdleMs": 0,
-    "onlineReadyTimeoutMs": 60000
+    "onlineReadyTimeoutMs": 60000,
+    "vjepa2": {
+      "modelId": "facebook/vjepa2-vitl-fpc64-256",
+      "frames": 16,
+      "stride": 4,
+      "pooling": "mean",
+      "batchSize": 4
+    },
+    "vjepa2Port": 11601,
+    "vjepa2IdleMs": 600000,
+    "vjepa2TimeoutMs": 600000
   },
   "tuning": {
     "pythonPath": "/home/[user]/opengeek-llm-chat/venv-tuning/bin/python",

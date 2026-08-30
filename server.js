@@ -1495,6 +1495,8 @@ function cleanup() {
   try { llmPool.killAll(); } catch {}
   // オンラインRLワーカー (SIGTERM で dirty なエージェントを自動 checkpoint)
   if (rlOnlineWorker && rlOnlineWorker.proc) try { rlOnlineWorker.proc.kill('SIGTERM'); } catch {}
+  // V-JEPA 2 常駐エンコーダ (保持している状態は無いので落とすだけ)
+  if (vjepa2Worker && vjepa2Worker.proc) try { vjepa2Worker.proc.kill('SIGTERM'); } catch {}
   // 外部APIサーバーも全停止
   for (const [, s] of externalServers) {
     if (s.proc && !s.proc.killed) {
@@ -2933,8 +2935,14 @@ const KEYPOINT_MODELS_DIR = path.join(ML_DIR, 'keypoint_models');     // 学習�
 const RL_MODELS_DIR = path.join(ML_DIR, 'rl_models');  // 学習済みエージェント (名前毎にディレクトリ)
 const RL_JOBS_FILE = path.join(ML_DIR, 'rl_jobs.json'); // RL 学習ジョブ履歴
 
+// V-JEPA 2 の視覚埋め込みキャッシュ (エンコード設定ごとにサブディレクトリ)
+// エンコードは学習より2〜3桁遅いので、一度作った埋め込みは必ず使い回す
+const VJEPA2_CACHE_DIR = path.join(ML_DIR, 'vjepa2_cache');
+// 世界モデル (V-JEPA 2-AC: 行動条件付き predictor)。名前毎にディレクトリ
+const AC_MODELS_DIR = path.join(ML_DIR, 'ac_models');
+
 // ディレクトリ作成
-for (const d of [TUNING_DIR, TUNING_DATA_DIR, TUNING_RUNS_DIR, TUNING_HF_CACHE_DIR, ML_DIR, ML_MODELS_DIR, RAG_DIR, TORCH_CACHE_DIR, IMAGE_DATASETS_DIR, IMAGE_MODELS_DIR, KEYPOINT_DATASETS_DIR, KEYPOINT_MODELS_DIR, RL_MODELS_DIR]) {
+for (const d of [TUNING_DIR, TUNING_DATA_DIR, TUNING_RUNS_DIR, TUNING_HF_CACHE_DIR, ML_DIR, ML_MODELS_DIR, RAG_DIR, TORCH_CACHE_DIR, IMAGE_DATASETS_DIR, IMAGE_MODELS_DIR, KEYPOINT_DATASETS_DIR, KEYPOINT_MODELS_DIR, RL_MODELS_DIR, VJEPA2_CACHE_DIR, AC_MODELS_DIR]) {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 }
 
@@ -5526,12 +5534,19 @@ function getDuckDB() {
   }
 }
 
-function getMlDb() {
-  // 学習中(currentMlJob 実行中)は ML DB を絶対に開かない
-  // Python(ml_runner)が排他ロックを取得しているため、Node側で開こうとすると失敗する
-  if (currentMlJob || _mlDbExternalHold) {
-    throw new Error('現在 ML 学習ジョブ実行中のため DuckDB は一時的にアクセスできません (ジョブ終了後に再試行してください)');
+// 学習ジョブ (教師あり/RL/世界モデル) が DB を使っている間の理由文字列。null なら利用可
+function mlDbBusyReason() {
+  if (_mlDbExternalHold || currentMlJob) {
+    return '学習ジョブがデータベースを使用中のため、一時的にアクセスできません (完了後に再試行してください)';
   }
+  return null;
+}
+
+function getMlDb() {
+  // 学習中は ML DB を絶対に開かない。Python 側が排他ロックを取得しているため、
+  // Node 側で開き直すと Python が落ちる (または Node 側が失敗する)
+  const busy = mlDbBusyReason();
+  if (busy) throw new Error(busy);
   if (_mlDbConn) return _mlDbConn;
   const duckdb = getDuckDB();
   if (!duckdb) return null;
@@ -5566,20 +5581,25 @@ function mlExec(sql) {
 // Node 側の接続を CHECKPOINT してから完全クローズし、排他ロック競合を避ける。
 // 解放後は _mlDbExternalHold=true の間 Node 側からはアクセス不可。reacquireMlDb() で再開。
 async function releaseMlDbForExternal(ip) {
+  // ⚠ フラグは close の「前」に立てる。以前は最後に立てていたため、close の await 中に
+  // 別リクエストが getMlDb() で DB を開き直し、そのハンドルが握りっぱなしになって
+  // Python 側が "Conflicting lock is held in node" で落ちる競合があった。
+  _mlDbExternalHold = true;
+  const conn = _mlDbConn, db = _mlDb;
+  _mlDbConn = null;
+  _mlDb = null;
   try {
-    if (_mlDbConn) {
-      await mlExec('CHECKPOINT');
-      await new Promise((resolve) => _mlDbConn.close(resolve));
-      _mlDbConn = null;
+    if (conn) {
+      // getMlDb() はもう使えない (hold中) ので、ハンドルを直接叩く
+      await new Promise((resolve) => conn.exec('CHECKPOINT', () => resolve()));
+      await new Promise((resolve) => conn.close(resolve));
     }
-    if (_mlDb) {
-      await new Promise((resolve) => _mlDb.close(resolve));
-      _mlDb = null;
+    if (db) {
+      await new Promise((resolve) => db.close(resolve));
     }
   } catch (e) {
     log(ip || '-', `[ML] DB一時クローズ警告: ${e.message} (続行します)`);
   }
-  _mlDbExternalHold = true;
 }
 // 外部プロセス終了後に呼ぶ。次回 getMlDb() で遅延再接続される。
 function reacquireMlDb() {
@@ -5626,11 +5646,26 @@ function isSafeReadOnlySql(sql) {
 }
 
 // ─── テーブル一覧 ───
+// テーブルの用途種別。'ml' (教師あり学習) と 'rl' (強化学習の経験ログ) を分けて扱う。
+// 同じ DuckDB に同居させたまま、一覧を用途別に絞れるようにするための印。
+// 明示的な kind が無い古いテーブルは、rl 定義があれば 'rl'、無ければ 'ml' とみなす。
+function tableKind(metaEntry) {
+  if (!metaEntry) return 'ml';
+  if (metaEntry.kind === 'rl' || metaEntry.kind === 'ml') return metaEntry.kind;
+  return metaEntry.rl ? 'rl' : 'ml';
+}
+
 app.get('/ml/datasets', requireAuth, requirePermission('ml:read'), async (req, res) => {
   try {
     if (_mlDbInitFailed || !getDuckDB()) {
       return res.json({ tables: [], duckdbAvailable: false, hint: 'npm install duckdb を実行してください' });
     }
+    // 学習ジョブが DB を握っている間は、エラーではなく busy を返す
+    // (UI はこれを見て前回の一覧を保持し、DB を開き直さない)
+    const busyMsg = mlDbBusyReason();
+    if (busyMsg) return res.json({ tables: [], duckdbAvailable: true, busy: true, hint: busyMsg });
+    // kind=ml / rl で絞り込み。既定は all (外部APIの互換維持。UIは明示的に渡す)
+    const want = ['ml', 'rl'].includes(req.query.kind) ? req.query.kind : 'all';
     const meta = loadMlMeta();
     const rows = await mlQuery(`
       SELECT table_name, estimated_size
@@ -5638,8 +5673,9 @@ app.get('/ml/datasets', requireAuth, requirePermission('ml:read'), async (req, r
       WHERE schema_name = 'main'
       ORDER BY table_name
     `);
-    const tables = await Promise.all(rows.map(async (r) => {
+    const all = await Promise.all(rows.map(async (r) => {
       const name = r.table_name;
+      const m = meta.tables?.[name];
       let rowCount = 0;
       try {
         const cnt = await mlQuery(`SELECT COUNT(*) AS c FROM "${name}"`);
@@ -5648,12 +5684,40 @@ app.get('/ml/datasets', requireAuth, requirePermission('ml:read'), async (req, r
       return {
         name,
         rowCount,
-        description: meta.tables?.[name]?.description || '',
-        createdAt: meta.tables?.[name]?.createdAt || null,
-        importedFrom: meta.tables?.[name]?.importedFrom || null,
+        kind: tableKind(m),
+        rl: m?.rl || null,
+        description: m?.description || '',
+        createdAt: m?.createdAt || null,
+        importedFrom: m?.importedFrom || null,
       };
     }));
-    res.json({ tables, duckdbAvailable: true });
+    const tables = want === 'all' ? all : all.filter(t => t.kind === want);
+    res.json({
+      tables, duckdbAvailable: true, kind: want,
+      counts: { ml: all.filter(t => t.kind === 'ml').length, rl: all.filter(t => t.kind === 'rl').length },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── テーブルの用途種別を変更 ───
+// CSV で取り込んだ表を強化学習用に回す (またはその逆) ためのもの。
+// body: { kind: 'ml' | 'rl' }
+app.put('/ml/datasets/:name/kind', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  const ip = getIP(req);
+  const name = req.params.name;
+  const kind = (req.body || {}).kind;
+  if (!isValidTableName(name)) return res.status(400).json({ error: '無効なテーブル名' });
+  if (!['ml', 'rl'].includes(kind)) return res.status(400).json({ error: "kind は 'ml' か 'rl' です" });
+  try {
+    const meta = loadMlMeta();
+    if (!meta.tables) meta.tables = {};
+    const prev = meta.tables[name] || {};
+    meta.tables[name] = { ...prev, kind, createdAt: prev.createdAt || Date.now() };
+    saveMlMeta(meta);
+    log(ip, `[MLデータ] 用途種別を変更: ${name} → ${kind}`);
+    res.json({ ok: true, name, kind });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -8523,6 +8587,36 @@ app.get('/ml/rl/envs', requireAuth, requirePermission('ml:read'), (req, res) => 
       label: '⚡ リアルタイム/オンライン学習 (外部API)',
       desc: '常駐ワーカーがモデルをメモリ保持し、act(推論)/learn(経験投入で即更新)をHTTPで提供。学習済みエージェントのウォームスタート、またはスキーマ指定でゼロから作成。',
     },
+    vjepa2: {
+      supported: true,
+      label: '👁 V-JEPA 2 で観測から学習 (視覚 + Behavior Cloning)',
+      desc: '観測(動画/フレーム連番/画像)のパス列を指定すると、凍結した V-JEPA 2 エンコーダで埋め込みに変換し、状態ベクトルに連結する。埋め込みはキャッシュされるので、再学習は2回目以降すぐ始まる。BC と組み合わせるとデモ動画の模倣学習になる。',
+      spec: buildVjepa2Spec(null),
+      poolings: [
+        { name: 'mean', label: '全体平均', desc: '全トークンの平均。最も汎用' },
+        { name: 'mean_last', label: '最終時刻のみ', desc: '直近フレームのトークンだけ平均。「今の観測」を重視する制御向け' },
+      ],
+      baseDir: 'uploads',
+      note: '観測パスは uploads フォルダからの相対パスで書いてください (この外は読みません)。',
+    },
+    bc: {
+      label: '🤖 Behavior Cloning の拡張オプション',
+      desc: 'デモの模倣に効くオプション。いずれも algo=bc のときだけ使えます。',
+      actionTypes: [
+        { name: 'discrete', label: '離散 (ラベル1列)', desc: '行動カラムの値をクラスとみなして分類する。従来どおり' },
+        { name: 'continuous', label: '連続 (数値の複数列)', desc: '関節角やスティック入力など、数値ベクトルを Huber 損失で回帰する。actionColumns で列を指定' },
+      ],
+      chunking: {
+        maxChunkSize: 64,
+        desc: '1つの状態から K ステップ先までの行動をまとめて予測する (ACT / π0 系の定番)。1手ずつ予測して誤差が積み上がる BC の弱点が緩和され、動きが滑らかになる。エピソード列の指定が必須。',
+      },
+      valSplit: {
+        max: 0.5,
+        desc: '学習データの一部を検証用に取り分ける。BC は過学習しやすいので、学習データ上の一致率だけでは実力が分からない。エピソード列を指定するとエピソード単位で分割する (行単位だと隣接フレームが学習側と検証側に分かれて検証値が甘くなる)。',
+      },
+      rewardOptional: true,
+      note: 'BC は報酬を使わないので、報酬カラムは省略できます。連続行動と行動チャンキングはオンライン学習には未対応です (オフライン学習と推論は可能)。',
+    },
   });
 });
 
@@ -8550,6 +8644,16 @@ app.get('/ml/rl/models', requireAuth, requirePermission('ml:read'), (req, res) =
               nTransitions: m.nTransitions,
               epochs: m.epochs,
               elapsedSec: m.elapsedSec,
+              // 検証分割の指標 (valSplit > 0 で学習した場合のみ)
+              actionType: m.actionType,
+              chunkSize: m.chunkSize,
+              nTrain: m.nTrain,
+              nVal: m.nVal,
+              trainAgreement: m.trainAgreement,
+              valAgreement: m.valAgreement,
+              trainMAE: m.trainMAE,
+              valMAE: m.valMAE,
+              finalValLoss: m.finalValLoss,
               // オンライン学習の指標
               totalSteps: m.totalSteps,
               bufferSize: m.bufferSize,
@@ -8569,6 +8673,16 @@ app.get('/ml/rl/models', requireAuth, requirePermission('ml:read'), (req, res) =
           stateColumns: cfg.meta?.stateColumns,
           actionColumn: cfg.meta?.actionColumn,
           actionLabels: cfg.actionLabels,
+          // 視覚エージェント (V-JEPA 2 埋め込みを使う場合のみ非0)
+          videoColumn: cfg.meta?.videoColumn || null,
+          embDim: cfg.embDim || cfg.meta?.embDim || 0,
+          vjepa2: cfg.vjepa2 || null,
+          // 行動仕様 (既定は discrete / chunk=1)
+          actionType: cfg.actionType || cfg.meta?.actionType || 'discrete',
+          actionColumns: cfg.meta?.actionColumns || null,
+          chunkSize: cfg.chunkSize || cfg.meta?.chunkSize || 1,
+          episodeColumn: cfg.meta?.episodeColumn || null,
+          valSplit: cfg.valSplit || 0,
           trainedAt: cfg.trainedAt,
           metrics,
         });
@@ -8590,6 +8704,62 @@ function isValidRlColumn(c) {
   return typeof c === 'string' && c.length > 0 && c.length <= 128 && !/["\\;]/.test(c);
 }
 
+// ─── V-JEPA 2 (視覚エンコーダ) の設定 ───
+// config.json の ml.vjepa2 で既定を上書きできる。学習リクエストの vjepa2 でさらに上書き。
+// 観測パスの基点は必ず uploads 配下に固定する (テーブルの中身はユーザーデータなので、
+// python 側の resolve_source がこの外を指すパスを拒否する)。
+const VJEPA2_POOLINGS = ['mean', 'mean_last'];
+function buildVjepa2Spec(body) {
+  const base = (appConfig.ml && appConfig.ml.vjepa2) || {};
+  const b = body || {};
+  const pick = (k, def) => (b[k] !== undefined ? b[k] : (base[k] !== undefined ? base[k] : def));
+  const clampInt = (v, def, lo, hi) => Math.min(Math.max(parseInt(v) || def, lo), hi);
+  const pooling = String(pick('pooling', 'mean'));
+  const modelId = String(pick('modelId', 'facebook/vjepa2-vitl-fpc64-256'));
+  return {
+    // モデルIDは HF のリポジトリID形式のみ許可 (任意のローカルパスを読ませない)
+    modelId: /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(modelId) ? modelId : 'facebook/vjepa2-vitl-fpc64-256',
+    frames: clampInt(pick('frames', 16), 16, 2, 128),
+    stride: clampInt(pick('stride', 4), 4, 1, 16),
+    pooling: VJEPA2_POOLINGS.includes(pooling) ? pooling : 'mean',
+    batchSize: clampInt(pick('batchSize', 4), 4, 1, 32),
+  };
+}
+
+// V-JEPA 2 を使う python プロセス共通の環境変数 (HF キャッシュをアプリ内に閉じ込める)
+function rlPythonEnv() {
+  // AMD ROCm: MIOpen はカーネルキャッシュを ~/.config/miopen と ~/.cache/miopen に
+  // 書こうとするが、systemd の ProtectHome=read-only 配下では書けず、Conv 演算が
+  // miopenStatusInternalError で落ちる (V-JEPA 2 のパッチ埋め込みは Conv3d)。
+  // image_train.py と同じく、書き込み可能な ml/torch_cache 配下へ向ける。
+  // NVIDIA 環境ではこれらの変数は単に無視される。
+  const miopenDir = path.join(TORCH_CACHE_DIR, 'miopen');
+  const hipDir = path.join(TORCH_CACHE_DIR, 'hip');
+  try { fs.mkdirSync(miopenDir, { recursive: true }); } catch {}
+  try { fs.mkdirSync(hipDir, { recursive: true }); } catch {}
+  return {
+    ...process.env,
+    PYTHONUNBUFFERED: '1',
+    HF_HOME: TUNING_HF_CACHE_DIR,
+    HUGGINGFACE_HUB_CACHE: path.join(TUNING_HF_CACHE_DIR, 'hub'),
+    TRANSFORMERS_CACHE: TUNING_HF_CACHE_DIR,
+    XDG_CACHE_HOME: TUNING_HF_CACHE_DIR,
+    TORCH_HOME: TORCH_CACHE_DIR,
+    // systemd の unit ファイル等で明示されていればそちらを尊重する
+    MIOPEN_USER_DB_PATH: process.env.MIOPEN_USER_DB_PATH || miopenDir,
+    MIOPEN_CUSTOM_CACHE_DIR: process.env.MIOPEN_CUSTOM_CACHE_DIR || miopenDir,
+    HIP_CACHE_DIR: process.env.HIP_CACHE_DIR || hipDir,
+  };
+}
+
+// 学習済みエージェントが視覚埋め込みを使うか (config.json の embDim で判定)
+function getRlAgentEmbDim(name) {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(RL_MODELS_DIR, name, 'config.json'), 'utf-8'));
+    return parseInt(cfg.embDim || (cfg.meta && cfg.meta.embDim) || 0) || 0;
+  } catch { return 0; }
+}
+
 // RL 学習の中核処理 (HTTPルートと agent_proxy ツールから共用)。
 // 成功時 { jobId } を返し、失敗時は Error を throw する。
 async function startRlTraining(b, ip) {
@@ -8608,14 +8778,57 @@ async function startRlTraining(b, ip) {
   // データテーブル由来 (オフラインRL) の列マッピングを検証
   if (!isValidTableName(b.table)) { const e = new Error('無効なテーブル名'); e.status = 400; throw e; }
   const stateCols = Array.isArray(b.stateColumns) ? b.stateColumns : [];
-  if (stateCols.length === 0 || !stateCols.every(isValidRlColumn)) {
-    const e = new Error('stateColumns は1個以上の有効な列名が必要です'); e.status = 400; throw e;
+  // 観測 (動画/フレーム/画像) のパス列。指定すると V-JEPA 2 の埋め込みを状態に連結する
+  const videoCol = (b.videoColumn && isValidRlColumn(b.videoColumn)) ? b.videoColumn : null;
+  if (b.videoColumn && !videoCol) { const e = new Error('videoColumn が無効です'); e.status = 400; throw e; }
+  // 視覚のみ (表の列0本) の構成も許す。両方無い場合だけエラー
+  if (!stateCols.every(isValidRlColumn)) {
+    const e = new Error('stateColumns に無効な列名が含まれています'); e.status = 400; throw e;
   }
-  if (!isValidRlColumn(b.actionColumn)) { const e = new Error('actionColumn が無効です'); e.status = 400; throw e; }
-  if (!isValidRlColumn(b.rewardColumn)) { const e = new Error('rewardColumn が無効です'); e.status = 400; throw e; }
+  if (stateCols.length === 0 && !videoCol) {
+    const e = new Error('stateColumns か videoColumn のどちらかは必要です'); e.status = 400; throw e;
+  }
+  // 行動: 離散 (1列のラベル) か 連続 (複数列の数値ベクトル)
+  const actionType = b.actionType === 'continuous' ? 'continuous' : 'discrete';
+  const actionColumns = Array.isArray(b.actionColumns) ? b.actionColumns.filter(c => c) : [];
+  if (actionType === 'continuous') {
+    if (actionColumns.length === 0 || !actionColumns.every(isValidRlColumn)) {
+      const e = new Error('actionType=continuous には有効な actionColumns が1つ以上必要です'); e.status = 400; throw e;
+    }
+    if (algo !== 'bc') {
+      const e = new Error('連続行動は Behavior Cloning 専用です (algo に bc を指定してください)'); e.status = 400; throw e;
+    }
+  } else if (!isValidRlColumn(b.actionColumn)) {
+    const e = new Error('actionColumn が無効です'); e.status = 400; throw e;
+  }
+  // 報酬列は BC のときだけ省略できる (模倣用のデモには報酬が無いことが多い)
+  if (b.rewardColumn) {
+    if (!isValidRlColumn(b.rewardColumn)) { const e = new Error('rewardColumn が無効です'); e.status = 400; throw e; }
+  } else if (algo !== 'bc') {
+    const e = new Error('rewardColumn が必要です (省略できるのは BC のときだけです)'); e.status = 400; throw e;
+  }
+  // エピソード列: 行動チャンキングと、エピソード単位の検証分割に使う
+  const episodeCol = (b.episodeColumn && isValidRlColumn(b.episodeColumn)) ? b.episodeColumn : null;
+  if (b.episodeColumn && !episodeCol) { const e = new Error('episodeColumn が無効です'); e.status = 400; throw e; }
+  const stepCol = (b.stepColumn && isValidRlColumn(b.stepColumn)) ? b.stepColumn : null;
+  if (b.stepColumn && !stepCol) { const e = new Error('stepColumn が無効です'); e.status = 400; throw e; }
+  const chunkSize = Math.min(Math.max(parseInt(b.chunkSize) || 1, 1), 64);
+  if (chunkSize > 1) {
+    if (!episodeCol) {
+      const e = new Error('chunkSize > 1 には episodeColumn が必要です (エピソード境界をまたいだ未来の行動を教師にしないため)'); e.status = 400; throw e;
+    }
+    if (algo !== 'bc') {
+      const e = new Error('行動チャンキングは Behavior Cloning 専用です (algo に bc を指定してください)'); e.status = 400; throw e;
+    }
+  }
   const nextCols = Array.isArray(b.nextStateColumns) ? b.nextStateColumns.filter(c => c) : [];
   if (nextCols.length > 0 && (nextCols.length !== stateCols.length || !nextCols.every(isValidRlColumn))) {
     const e = new Error('nextStateColumns は stateColumns と同数・同順で指定してください'); e.status = 400; throw e;
+  }
+  const nextVideoCol = (b.nextVideoColumn && isValidRlColumn(b.nextVideoColumn)) ? b.nextVideoColumn : null;
+  if (b.nextVideoColumn && !nextVideoCol) { const e = new Error('nextVideoColumn が無効です'); e.status = 400; throw e; }
+  if (nextVideoCol && !videoCol) {
+    const e = new Error('nextVideoColumn を使うには videoColumn が必要です'); e.status = 400; throw e;
   }
   const doneCol = (b.doneColumn && isValidRlColumn(b.doneColumn)) ? b.doneColumn : null;
 
@@ -8631,9 +8844,22 @@ async function startRlTraining(b, ip) {
     batchSize: clampInt(b.batchSize, 64, 8, 512),
     cqlAlpha: clampNum(b.cqlAlpha, 0.5, 0.0, 10.0),
     tableName: b.table, stateColumns: stateCols, actionColumn: b.actionColumn,
-    rewardColumn: b.rewardColumn, nextStateColumns: nextCols, doneColumn: doneCol,
+    rewardColumn: b.rewardColumn || null, nextStateColumns: nextCols, doneColumn: doneCol,
+    // 行動仕様 (既定は discrete / chunk=1 で従来と同じ挙動)
+    actionType, actionColumns, chunkSize,
+    episodeColumn: episodeCol, stepColumn: stepCol,
+    // 検証分割 (0 で無効。エピソード列があればエピソード単位で分ける)
+    valSplit: clampNum(b.valSplit, 0, 0, 0.5),
     dbPath: ML_DB_FILE, outputDir,
   };
+  if (videoCol) {
+    runConfig.videoColumn = videoCol;
+    runConfig.nextVideoColumn = nextVideoCol;
+    runConfig.vjepa2 = buildVjepa2Spec(b.vjepa2);
+    runConfig.vjepa2CacheDir = VJEPA2_CACHE_DIR;
+    runConfig.videoBaseDir = UPLOADS_DIR;   // この外を指すパスは python 側が拒否する
+    runConfig.skipUnreadableVideos = b.skipUnreadableVideos === true;
+  }
 
   // Python が DuckDB を read_only で開くため、Node 側接続を一旦解放
   log(ip, `[RL学習] DuckDB を学習用に一時クローズ (table=${b.table})`);
@@ -8647,11 +8873,12 @@ async function startRlTraining(b, ip) {
   const pythonCmd = appConfig.pythonPath || 'python3';
   const { spawn } = require('child_process');
   const proc = spawn(pythonCmd, [scriptPath, tmpCfg], {
-    cwd: __dirname, env: { ...process.env, PYTHONUNBUFFERED: '1' }, detached: true,
+    cwd: __dirname, env: rlPythonEnv(), detached: true,
   });
 
   currentRlJob = { jobId, name: b.name, env: 'dataset', algo, isDataset: true, proc, log: [], startedAt: Date.now() };
-  log(ip, `[RL学習] 開始: ${b.name} (table=${b.table}, algo=${algo}, epochs=${runConfig.episodes})`);
+  log(ip, `[RL学習] 開始: ${b.name} (table=${b.table}, algo=${algo}, epochs=${runConfig.episodes}`
+        + (videoCol ? `, 観測=${videoCol} / ${runConfig.vjepa2.modelId}` : '') + ')');
 
   const handleData = (d) => {
     if (!currentRlJob) return;
@@ -8676,6 +8903,14 @@ async function startRlTraining(b, ip) {
       datasetMode: result?.datasetMode ?? null,
       finalLoss: result?.finalLoss ?? null,
       policyAgreement: result?.policyAgreement ?? null,
+      actionType: result?.actionType ?? null,
+      chunkSize: result?.chunkSize ?? null,
+      trainAgreement: result?.trainAgreement ?? null,
+      valAgreement: result?.valAgreement ?? null,
+      trainMAE: result?.trainMAE ?? null,
+      valMAE: result?.valMAE ?? null,
+      nTrain: result?.nTrain ?? null,
+      nVal: result?.nVal ?? null,
       meanQ: result?.meanQ ?? null,
       loggedMeanReward: result?.loggedMeanReward ?? null,
       device: result?.device ?? null,
@@ -8874,6 +9109,192 @@ function checkRlOnlineIdle() {
 }
 setInterval(checkRlOnlineIdle, 30000);
 
+// ─── 👁 V-JEPA 2 常駐エンコーダ (Phase 3) ───
+// vjepa2_server.py をメモリ常駐させ、観測→埋め込みの変換を localhost HTTP で受ける。
+// 狙いは「推論のたびに 1.3GB のモデルを読み直す」のをやめること
+// (offline /policy は従来 python 起動 + ViT-L ロードで30秒以上かかっていた)。
+// rl-online ワーカーと同じ遅延起動・identity-guard・アイドル停止の作法に揃える。
+let vjepa2Worker = { proc: null, port: null, starting: false, lastUsed: 0 };
+
+async function ensureVjepa2Worker() {
+  const ml = appConfig.ml || {};
+  const port = ml.vjepa2Port || 11601;
+  if (vjepa2Worker.proc && !vjepa2Worker.proc.killed) {
+    vjepa2Worker.lastUsed = Date.now();
+    return port;
+  }
+  if (vjepa2Worker.starting) {
+    const ok = await waitForReady('127.0.0.1', port, ml.onlineReadyTimeoutMs || 60000, false);
+    if (!ok) throw new Error('V-JEPA 2 エンコーダの起動待ちがタイムアウトしました');
+    vjepa2Worker.lastUsed = Date.now();
+    return port;
+  }
+  vjepa2Worker.starting = true;
+  try {
+    const scriptPath = path.join(__dirname, 'vjepa2_server.py');
+    if (!fs.existsSync(scriptPath)) throw new Error('vjepa2_server.py が見つかりません');
+    const pythonCmd = appConfig.pythonPath || 'python3';
+    const { spawn } = require('child_process');
+    const proc = spawn(pythonCmd, [scriptPath, String(port)], {
+      cwd: __dirname,
+      env: {
+        ...rlPythonEnv(),
+        VJEPA2_CACHE_DIR: VJEPA2_CACHE_DIR,
+        VJEPA2_BASE_DIR: UPLOADS_DIR,
+        VJEPA2_AC_DIR: AC_MODELS_DIR,
+        ...(ml.vjepa2Device ? { VJEPA2_DEVICE: ml.vjepa2Device } : {}),
+      },
+    });
+    const quiet = appConfig.logLevel === 'quiet';
+    proc.stdout.on('data', d => { if (!quiet) process.stdout.write(`[vjepa2] ${d}`); });
+    proc.stderr.on('data', d => { if (!quiet) process.stderr.write(`[vjepa2] ${d}`); });
+    proc.on('exit', (code) => {
+      if (vjepa2Worker.proc === proc) vjepa2Worker.proc = null;
+      log('-', `[vjepa2] ワーカー終了 (code=${code})`);
+    });
+    proc.on('error', (err) => {
+      if (vjepa2Worker.proc === proc) vjepa2Worker.proc = null;
+      log('-', `[vjepa2] 起動エラー: ${err.message}`);
+    });
+    vjepa2Worker.proc = proc;
+    vjepa2Worker.port = port;
+    const failPromise = new Promise((resolve) => {
+      proc.once('error', () => resolve('error'));
+      proc.once('exit', () => resolve('exit'));
+    });
+    const ok = await Promise.race([
+      waitForReady('127.0.0.1', port, ml.onlineReadyTimeoutMs || 60000, false),
+      failPromise,
+    ]);
+    if (ok !== true) {
+      try { proc.kill('SIGKILL'); } catch {}
+      vjepa2Worker.proc = null;
+      throw new Error('V-JEPA 2 エンコーダが起動しませんでした (torch / transformers を確認してください)');
+    }
+    vjepa2Worker.lastUsed = Date.now();
+    log('-', `[vjepa2] エンコーダ常駐開始 (:${port})`);
+    return port;
+  } finally {
+    vjepa2Worker.starting = false;
+  }
+}
+
+// エンコードは重いので、rl-online (30秒) より長めのタイムアウトを取る。
+// 初回はモデルのロード (数十秒〜、未DLならダウンロードも) が入る。
+function vjepa2WorkerRequest(reqPath, body, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const data = Buffer.from(JSON.stringify(body || {}), 'utf-8');
+    const req = http.request({
+      hostname: '127.0.0.1', port: vjepa2Worker.port, path: reqPath, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': data.length },
+      timeout: timeoutMs || (appConfig.ml?.vjepa2TimeoutMs || 600000),
+    }, (resp) => {
+      let b = '';
+      resp.on('data', d => b += d);
+      resp.on('end', () => {
+        let j;
+        try { j = JSON.parse(b); } catch { return reject(new Error('エンコーダ応答の解析に失敗しました')); }
+        if (resp.statusCode >= 400) {
+          const e = new Error(j.error || `エンコーダエラー ${resp.statusCode}`);
+          e.status = resp.statusCode;
+          return reject(e);
+        }
+        resolve(j);
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('エンコーダへのリクエストがタイムアウトしました')); });
+    req.write(data); req.end();
+  });
+}
+
+// アイドル停止 (既定 vjepa2IdleMs=600000 = 10分)。
+// VRAM を長時間占有しないよう、rl-online (既定 0 = 常駐) より積極的に落とす。
+function checkVjepa2Idle() {
+  const idleMs = appConfig.ml?.vjepa2IdleMs ?? 600000;
+  if (!idleMs || idleMs <= 0) return;
+  if (!vjepa2Worker.proc || vjepa2Worker.starting) return;
+  if (Date.now() - vjepa2Worker.lastUsed >= idleMs) {
+    log('-', '[vjepa2] アイドルのためエンコーダを停止 (VRAM解放)');
+    try { vjepa2Worker.proc.kill('SIGTERM'); } catch {}
+  }
+}
+setInterval(checkVjepa2Idle, 30000);
+
+// 学習済みエージェントの視覚設定 (埋め込み次元・エンコード設定・観測カラム)
+function getRlAgentVision(name) {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(RL_MODELS_DIR, name, 'config.json'), 'utf-8'));
+    return {
+      embDim: parseInt(cfg.embDim || cfg.meta?.embDim || 0) || 0,
+      // エンコード設定は必ず学習時に保存したものを使う (ズレると方策が静かに壊れる)
+      spec: cfg.vjepa2 || cfg.meta?.vjepa2 || null,
+      videoColumn: cfg.meta?.videoColumn || null,
+    };
+  } catch { return { embDim: 0, spec: null, videoColumn: null }; }
+}
+
+// 観測 (パス / 生フレーム) を埋め込みに変換して state に注入する。
+// - state._embedding が既にあれば何もしない (呼び出し側が自前で用意した場合)
+// - state.frames  : base64 画像の配列 → その場でエンコード (ロボット等のリアルタイム用)
+// - state[観測カラム] : uploads 配下のパス → キャッシュ付きでエンコード
+// 常駐エンコーダが使えない場合は null を返し、呼び出し側は従来の経路
+// (rl_runner.py が自前でエンコード) にフォールバックする。
+// 複数の state をまとめて処理する。パス指定のものは1回の /embed で束ねるので、
+// 経験をバッチ投入しても往復とエンコードが1回で済む (キャッシュも効く)。
+// 観測が無い state はそのまま返す (next_state 省略時など)。
+async function attachEmbeddingsBatch(states, vision) {
+  if (!vision.embDim) return states;
+  const spec = vision.spec || {};
+  const byPath = [], byFrames = [];
+  states.forEach((s, i) => {
+    if (!s || typeof s !== 'object' || Array.isArray(s._embedding)) return;
+    if (Array.isArray(s.frames) && s.frames.length > 0) { byFrames.push(i); return; }
+    const p = vision.videoColumn ? s[vision.videoColumn] : null;
+    if (p) byPath.push(i);
+  });
+  if (byPath.length === 0 && byFrames.length === 0) return states;
+
+  await ensureVjepa2Worker();
+  const out = states.slice();
+  const check = (vec) => {
+    if (!Array.isArray(vec) || vec.length !== vision.embDim) {
+      const e = new Error(`埋め込みの次元が学習時と違います (期待 ${vision.embDim}, 実際 ${vec?.length})`);
+      e.status = 500; throw e;
+    }
+    return vec;
+  };
+  if (byPath.length) {
+    const r = await vjepa2WorkerRequest('/embed', {
+      paths: byPath.map(i => states[i][vision.videoColumn]), spec,
+    });
+    byPath.forEach((i, k) => { out[i] = { ...states[i], _embedding: check(r.embeddings[k]) }; });
+  }
+  for (const i of byFrames) {
+    const r = await vjepa2WorkerRequest('/embed_frames', { frames: states[i].frames, spec });
+    const s = { ...states[i], _embedding: check(r.embedding) };
+    delete s.frames;   // ワーカーに渡した生フレームは以降不要 (巨大なので落とす)
+    out[i] = s;
+  }
+  vjepa2Worker.lastUsed = Date.now();
+  return out;
+}
+
+// 1件用。観測が全く無ければ 400 で弾く (act/policy は観測が必須のため)。
+async function attachEmbedding(state, vision) {
+  if (!vision.embDim) return state;
+  if (Array.isArray(state._embedding)) return state;
+  const hasFrames = Array.isArray(state.frames) && state.frames.length > 0;
+  const src = vision.videoColumn ? state[vision.videoColumn] : null;
+  if (!hasFrames && !src) {
+    const e = new Error(
+      `観測が指定されていません。state に "${vision.videoColumn}" (uploads からの相対パス)、`
+      + 'frames (base64画像の配列)、_embedding のいずれかを入れてください');
+    e.status = 400; throw e;
+  }
+  return (await attachEmbeddingsBatch([state], vision))[0];
+}
+
 // 学習済みエージェント一覧 (HTTPルートと agent_proxy ツールから共用)
 function loadRlAgents() {
   const models = [];
@@ -8916,20 +9337,28 @@ function runRlEval(name, episodes) {
     if (!fs.existsSync(scriptPath)) return reject(new Error('rl_runner.py が見つかりません'));
 
     const isDataset = getRlAgentEnv(name) === 'dataset';
+    const embDim = getRlAgentEmbDim(name);
     const ep = Math.min(Math.max(parseInt(episodes) || 5, 1), 20);
     const evalCfg = path.join(modelDir, '_eval_config.json');
     const evalConfig = { mode: 'eval', modelDir, episodes: ep, outputDir: modelDir };
     if (isDataset) evalConfig.dbPath = ML_DB_FILE;
+    // 視覚エージェント: エンコード設定は model の config.json から読むので、
+    // ここではキャッシュ先とパス基点だけ渡す
+    if (embDim > 0) {
+      evalConfig.vjepa2CacheDir = VJEPA2_CACHE_DIR;
+      evalConfig.videoBaseDir = UPLOADS_DIR;
+    }
 
     const run = () => {
       fs.writeFileSync(evalCfg, JSON.stringify(evalConfig, null, 2));
       const pythonCmd = appConfig.pythonPath || 'python3';
       const { spawn } = require('child_process');
-      const proc = spawn(pythonCmd, [scriptPath, evalCfg], { cwd: __dirname, env: { ...process.env, PYTHONUNBUFFERED: '1' } });
+      const proc = spawn(pythonCmd, [scriptPath, evalCfg], { cwd: __dirname, env: rlPythonEnv() });
       let stdout = '', stderr = '';
       proc.stdout.on('data', d => { stdout += d.toString(); });
       proc.stderr.on('data', d => { stderr += d.toString(); });
-      const timeout = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 120000);
+      // 視覚エージェントは初回にモデルのロード/DLとエンコードが入るので長めに取る
+      const timeout = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, embDim > 0 ? 1800000 : 120000);
       proc.on('close', (code) => {
         clearTimeout(timeout);
         try { fs.unlinkSync(evalCfg); } catch {}
@@ -8960,15 +9389,25 @@ function runRlPolicy(name, state) {
     if (!fs.existsSync(path.join(modelDir, 'model.pt'))) return reject(new Error('エージェントが学習されていません'));
     const scriptPath = path.join(__dirname, 'rl_runner.py');
     if (!fs.existsSync(scriptPath)) return reject(new Error('rl_runner.py が見つかりません'));
+    const embDim = getRlAgentEmbDim(name);
     const polCfg = path.join(modelDir, `_policy_${Date.now()}.json`);
-    fs.writeFileSync(polCfg, JSON.stringify({ mode: 'policy', modelDir, state: state || {} }, null, 2));
+    const polConfig = { mode: 'policy', modelDir, state: state || {} };
+    if (embDim > 0) {
+      polConfig.vjepa2CacheDir = VJEPA2_CACHE_DIR;
+      polConfig.videoBaseDir = UPLOADS_DIR;
+    }
+    fs.writeFileSync(polCfg, JSON.stringify(polConfig, null, 2));
     const pythonCmd = appConfig.pythonPath || 'python3';
     const { spawn } = require('child_process');
-    const proc = spawn(pythonCmd, [scriptPath, polCfg], { cwd: __dirname, env: { ...process.env, PYTHONUNBUFFERED: '1' } });
+    const proc = spawn(pythonCmd, [scriptPath, polCfg], { cwd: __dirname, env: rlPythonEnv() });
     let stdout = '', stderr = '';
     proc.stdout.on('data', d => { stdout += d.toString(); });
     proc.stderr.on('data', d => { stderr += d.toString(); });
-    const timeout = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 30000);
+    // 埋め込みが既に state に入っていれば (常駐エンコーダ経由)、rl_runner は
+    // 小さな方策ヘッドを読むだけなので短いタイムアウトで足りる。
+    // 入っていない場合は rl_runner 自身が ViT-L をロードしてエンコードするので長めに取る。
+    const needsEncode = embDim > 0 && !Array.isArray((state || {})._embedding);
+    const timeout = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, needsEncode ? 300000 : 30000);
     proc.on('close', (code) => {
       clearTimeout(timeout);
       try { fs.unlinkSync(polCfg); } catch {}
@@ -9001,10 +9440,620 @@ app.post('/ml/rl/models/:name/eval', requireAuth, requirePermission('ml:read'), 
 // body: { state: { 列名: 値, ... } }  (dataset) または { state: [v0, v1, ...] } (組み込み環境)
 app.post('/ml/rl/models/:name/policy', requireAuth, requirePermission('ml:read'), jsonParser, async (req, res) => {
   try {
-    const result = await runRlPolicy(req.params.name, (req.body || {}).state);
+    const name = req.params.name;
+    let state = (req.body || {}).state;
+    const vision = getRlAgentVision(name);
+    if (vision.embDim > 0 && state && typeof state === 'object' && !Array.isArray(state)) {
+      try {
+        // 常駐エンコーダで埋め込みを作っておくと、rl_runner 側は ViT-L を
+        // 読み込まずに済む (30秒超 → 1秒程度)
+        state = await attachEmbedding(state, vision);
+      } catch (e) {
+        if (e.status === 400) throw e;      // 入力不備はそのまま返す
+        // エンコーダが使えないときは従来経路 (rl_runner が自前でエンコード) に落とす。
+        // 遅いが動くので、ワーカーの不調で推論そのものが止まらないようにする。
+        log(getIP(req), `[vjepa2] 常駐エンコーダを使えないため従来経路にフォールバック: ${e.message}`);
+      }
+    }
+    const result = await runRlPolicy(name, state);
     res.json(result);
   } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// ─── 👁 常駐エンコーダの操作 ───
+app.get('/ml/rl/vjepa2/status', requireAuth, requirePermission('ml:read'), async (req, res) => {
+  const running = !!(vjepa2Worker.proc && !vjepa2Worker.proc.killed);
+  if (!running) return res.json({ running: false, encoders: [], defaultSpec: buildVjepa2Spec(null) });
+  try {
+    const s = await vjepa2WorkerRequest('/status', {}, 10000);
+    res.json({ running: true, port: vjepa2Worker.port, lastUsed: vjepa2Worker.lastUsed,
+               idleMs: appConfig.ml?.vjepa2IdleMs ?? 600000, ...s, defaultSpec: buildVjepa2Spec(null) });
+  } catch (e) {
+    res.json({ running: true, error: e.message, encoders: [] });
+  }
+});
+
+// VRAM を明示的に返す (llama-server に譲りたいとき等)
+app.post('/ml/rl/vjepa2/unload', requireAuth, requirePermission('ml:write'), jsonParser, async (req, res) => {
+  if (!vjepa2Worker.proc || vjepa2Worker.proc.killed) return res.json({ ok: true, running: false });
+  try {
+    const r = await vjepa2WorkerRequest('/unload', {}, 30000);
+    if ((req.body || {}).stopWorker) {
+      try { vjepa2Worker.proc.kill('SIGTERM'); } catch {}
+    }
+    log(getIP(req), '[vjepa2] エンコーダを手動解放');
+    res.json({ ok: true, ...r });
+  } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// 観測 → 埋め込み (外部クライアントが自前で状態を組み立てる場合用)
+// body: { paths: ["demos/a.mp4"] } または { frames: ["<base64>", ...] }、spec? / fromAgent?
+app.post('/ml/rl/vjepa2/embed', requireAuth, requirePermission('ml:read'), jsonParser, async (req, res) => {
+  try {
+    const b = req.body || {};
+    // fromAgent を指定すると、そのエージェントの学習時設定でエンコードする (取り違え防止)
+    let spec = buildVjepa2Spec(b.spec);
+    if (b.fromAgent) {
+      if (!isValidAgentName(b.fromAgent)) return res.status(400).json({ error: '無効なエージェント名' });
+      const v = getRlAgentVision(b.fromAgent);
+      if (!v.embDim) return res.status(400).json({ error: `${b.fromAgent} は視覚エージェントではありません` });
+      spec = v.spec || spec;
+    }
+    await ensureVjepa2Worker();
+    if (Array.isArray(b.frames) && b.frames.length) {
+      const r = await vjepa2WorkerRequest('/embed_frames', { frames: b.frames, spec });
+      return res.json({ ...r, spec });
+    }
+    if (Array.isArray(b.paths) && b.paths.length) {
+      const r = await vjepa2WorkerRequest('/embed', { paths: b.paths, spec });
+      return res.json({ ...r, spec });
+    }
+    res.status(400).json({ error: 'paths か frames のどちらかを指定してください' });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 🎬 強化学習用データテーブル (経験ログの収集)
+// ═══════════════════════════════════════════════════════════════════
+// ロボット/ゲーム/シミュレータ側から「状態・行動・報酬・観測」を1ステップずつ
+// POST して溜めるための系統。観測 (カメラ画像) は同じリクエストで一緒に送れる。
+//
+// 表データの取り込み (/ml/datasets/import/csv) は「手元にCSVがある」前提だが、
+// 強化学習では「これから溜める」ことの方が多い。RL 用のスキーマを持った表を作り、
+// 追記していく導線をここに用意する。
+
+// 観測ファイルの置き場 (uploads 配下。videoBaseDir と同じ基点になる)
+const RL_DATASETS_DIR = path.join(UPLOADS_DIR, 'rl_datasets');
+
+// エピソードIDはディレクトリ名になるので、パス区切りを含まない文字だけ許す
+function isValidEpisodeId(s) {
+  return typeof s === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(s) && s !== '.' && s !== '..';
+}
+// DDL で使う列名 (二重引用符で囲むが、素性の悪い名前は最初から通さない)
+function isValidDdlColumn(s) {
+  return typeof s === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(s);
+}
+
+const RL_RECORD_LIMITS = { steps: 200, framesPerStep: 64, frameBytes: 8 * 1024 * 1024 };
+
+// base64 / data URL の画像を検証してバイト列にする。
+// 拡張子は中身のマジックバイトから決める (拡張子詐称でおかしなファイルを書かないため)
+function decodeObservationImage(raw) {
+  if (typeof raw !== 'string') throw new Error('frames の要素は base64 文字列で指定してください');
+  let s = raw.trim();
+  if (s.startsWith('data:')) {
+    const c = s.indexOf(',');
+    if (c < 0) throw new Error('data URL の形式が不正です');
+    s = s.slice(c + 1);
+  }
+  let buf;
+  try { buf = Buffer.from(s, 'base64'); } catch { throw new Error('base64 のデコードに失敗しました'); }
+  if (!buf.length) throw new Error('画像が空です');
+  if (buf.length > RL_RECORD_LIMITS.frameBytes) {
+    throw new Error(`1フレームが大きすぎます (${buf.length} bytes)`);
+  }
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return { buf, ext: '.png' };
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return { buf, ext: '.jpg' };
+  if (buf.slice(0, 4).toString('ascii') === 'RIFF' && buf.slice(8, 12).toString('ascii') === 'WEBP') {
+    return { buf, ext: '.webp' };
+  }
+  throw new Error('対応していない画像形式です (PNG / JPEG / WebP のみ)');
+}
+
+// RL テーブルの定義を ML メタに書く (通常の表と区別して一覧に出すため)
+function saveRlDatasetMeta(tableName, spec, description) {
+  const meta = loadMlMeta();
+  if (!meta.tables) meta.tables = {};
+  const prev = meta.tables[tableName] || {};
+  meta.tables[tableName] = {
+    ...prev,
+    kind: 'rl',                      // 📊 データタブの一覧からは外れ、🎮 強化学習側に出る
+    description: description || prev.description || '',
+    createdAt: prev.createdAt || Date.now(),
+    rl: { ...spec, updatedAt: Date.now() },
+  };
+  saveMlMeta(meta);
+}
+function getRlDatasetMeta(tableName) {
+  return loadMlMeta().tables?.[tableName]?.rl || null;
+}
+
+// 経験の行をテーブルへ追記する (無ければ最初の行から作る)。
+// /ml/datasets/append と同じく NDJSON → read_json_auto 経由。
+async function appendRlRows(tableName, rows, createIfMissing) {
+  const tmpFile = path.join(ML_DIR, `_rlrec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`);
+  try {
+    fs.writeFileSync(tmpFile, rows.map(r => JSON.stringify(r)).join('\n'), 'utf-8');
+    const exists = Number((await mlQuery(
+      `SELECT COUNT(*) AS c FROM duckdb_tables() WHERE schema_name = 'main' AND table_name = ?`,
+      [tableName]))[0].c) > 0;
+    const esc = tmpFile.replace(/'/g, "''");
+    if (!exists) {
+      if (!createIfMissing) {
+        const e = new Error(`テーブル "${tableName}" がありません (createIfMissing: true を指定してください)`);
+        e.status = 404; throw e;
+      }
+      await mlExec(`CREATE TABLE "${tableName}" AS SELECT * FROM read_json_auto('${esc}', format='newline_delimited')`);
+    } else {
+      await mlExec(`INSERT INTO "${tableName}" BY NAME SELECT * FROM read_json_auto('${esc}', format='newline_delimited')`);
+    }
+    return Number((await mlQuery(`SELECT COUNT(*) AS c FROM "${tableName}"`))[0].c) || 0;
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch {}
+  }
+}
+
+// ─── RL データテーブル一覧 ───
+app.get('/ml/rl/datasets', requireAuth, requirePermission('ml:read'), async (req, res) => {
+  try {
+    // 学習中は DB を開き直さない (エラーではなく busy として返し、UI は前回値を保持)
+    const busyMsg = mlDbBusyReason();
+    if (busyMsg) return res.json({ datasets: [], busy: true, hint: busyMsg });
+    const meta = loadMlMeta();
+    const out = [];
+    for (const [name, t] of Object.entries(meta.tables || {})) {
+      if (tableKind(t) !== 'rl') continue;
+      let rowCount = 0, episodes = 0, lastRecordedAt = null;
+      try {
+        // episode / recorded_at が無い表 (CSV取り込みを RL 用に付け替えた等) でも
+        // 一覧から消えないよう、行数だけの取得にフォールバックする
+        const r = (await mlQuery(
+          `SELECT COUNT(*) AS rows, COUNT(DISTINCT episode) AS eps, MAX(recorded_at) AS last FROM "${name}"`))[0];
+        rowCount = Number(r.rows) || 0;
+        episodes = Number(r.eps) || 0;
+        lastRecordedAt = r.last || null;
+      } catch {
+        try {
+          rowCount = Number((await mlQuery(`SELECT COUNT(*) AS c FROM "${name}"`))[0].c) || 0;
+        } catch { continue; }   // 表そのものが無い
+      }
+      out.push({ name, description: t.description || '', rl: t.rl || null, rowCount, episodes, lastRecordedAt });
+    }
+    out.sort((a, b) => (b.rl?.updatedAt || 0) - (a.rl?.updatedAt || 0));
+    res.json({ datasets: out, uploadsSubdir: 'rl_datasets', limits: RL_RECORD_LIMITS });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── RL データテーブルを作成 (空のスキーマだけ用意する) ───
+// body: { tableName, actionType, actionColumns?[], stateColumns?[{name,type}], useObservation?, useReward?, description? }
+app.post('/ml/rl/datasets/create', requireAuth, requirePermission('ml:write'), jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  const b = req.body || {};
+  try {
+    if (!isValidTableName(b.tableName)) {
+      return res.status(400).json({ error: 'テーブル名は英字で始まり英数字とアンダースコアのみ (64文字以内)' });
+    }
+    const actionType = b.actionType === 'continuous' ? 'continuous' : 'discrete';
+    const stateColumns = Array.isArray(b.stateColumns) ? b.stateColumns : [];
+    const actionColumns = Array.isArray(b.actionColumns) ? b.actionColumns : [];
+    const useObservation = b.useObservation !== false;
+    const useReward = b.useReward !== false;
+
+    for (const c of stateColumns) {
+      if (!isValidDdlColumn(c?.name)) return res.status(400).json({ error: `無効な状態カラム名: ${c?.name}` });
+    }
+    if (actionType === 'continuous') {
+      if (actionColumns.length === 0) return res.status(400).json({ error: '連続行動には actionColumns が必要です' });
+      for (const c of actionColumns) {
+        if (!isValidDdlColumn(c)) return res.status(400).json({ error: `無効な行動カラム名: ${c}` });
+      }
+    }
+    if (stateColumns.length === 0 && !useObservation) {
+      return res.status(400).json({ error: '状態カラムか観測のどちらかは必要です' });
+    }
+    const exists = Number((await mlQuery(
+      `SELECT COUNT(*) AS c FROM duckdb_tables() WHERE schema_name = 'main' AND table_name = ?`,
+      [b.tableName]))[0].c) > 0;
+    if (exists) return res.status(409).json({ error: `テーブル "${b.tableName}" は既にあります` });
+
+    // 列の並びは「エピソード → 状態 → 観測 → 行動 → 報酬」の順にして読みやすくする
+    const cols = ['"episode" VARCHAR', '"step" INTEGER'];
+    for (const c of stateColumns) {
+      cols.push(`"${c.name}" ${c.type === 'category' ? 'VARCHAR' : 'DOUBLE'}`);
+    }
+    if (useObservation) cols.push('"frame" VARCHAR');
+    if (actionType === 'continuous') {
+      for (const c of actionColumns) cols.push(`"${c}" DOUBLE`);
+    } else {
+      cols.push('"action" VARCHAR');
+    }
+    if (useReward) cols.push('"reward" DOUBLE');
+    cols.push('"done" INTEGER', '"recorded_at" TIMESTAMP');
+
+    await mlExec(`CREATE TABLE "${b.tableName}" (${cols.join(', ')})`);
+    const spec = {
+      actionType, actionColumns: actionType === 'continuous' ? actionColumns : [],
+      stateColumns: stateColumns.map(c => ({ name: c.name, type: c.type === 'category' ? 'category' : 'numeric' })),
+      useObservation, useReward,
+    };
+    saveRlDatasetMeta(b.tableName, spec, b.description);
+    log(ip, `[RLデータ] テーブル作成: ${b.tableName} (${actionType}${useObservation ? ' + 観測' : ''})`);
+    res.json({ ok: true, tableName: b.tableName, rl: spec, columns: cols.length });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// ─── 経験の記録 (観測のアップロードも同時に行う) ───
+// body: {
+//   table, episode, createIfMissing?, finishEpisode?,
+//   steps: [{ state?{}, frames?[base64], framePath?, action?, actionVector?{}, reward?, done? }]
+// }
+app.post('/ml/rl/datasets/record', requireAuth, requirePermission('ml:write'), jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  const b = req.body || {};
+  try {
+    if (!isValidTableName(b.table)) return res.status(400).json({ error: '無効なテーブル名' });
+    if (!isValidEpisodeId(b.episode)) {
+      return res.status(400).json({ error: 'episode は英数字・ハイフン・アンダースコア・ドット (1〜64文字)' });
+    }
+    if (!Array.isArray(b.steps) || b.steps.length === 0) {
+      return res.status(400).json({ error: 'steps は1件以上の配列で指定してください' });
+    }
+    if (b.steps.length > RL_RECORD_LIMITS.steps) {
+      return res.status(400).json({ error: `steps は ${RL_RECORD_LIMITS.steps} 件以下にしてください (分割して送信)` });
+    }
+    // 学習中は Python 側が DuckDB を握っているので書き込めない
+    if (currentRlJob) {
+      return res.status(409).json({ error: `RL学習中は記録できません: ${currentRlJob.name}` });
+    }
+
+    const spec = getRlDatasetMeta(b.table) || {};
+    const createIfMissing = b.createIfMissing !== false;
+
+    // 既存エピソードの続きから step を振る (クライアントが step を持たなくてよいように)
+    let step = 0;
+    try {
+      const r = await mlQuery(
+        `SELECT COALESCE(MAX("step"), -1) + 1 AS next FROM "${b.table}" WHERE "episode" = ?`, [b.episode]);
+      step = Number(r[0].next) || 0;
+    } catch { step = 0; }   // 表がまだ無い
+
+    const epDir = path.join(RL_DATASETS_DIR, b.table, b.episode);
+    const saved = [];
+    const rows = [];
+    const nowIso = new Date().toISOString().replace('T', ' ').replace('Z', '');
+
+    for (let i = 0; i < b.steps.length; i++) {
+      const s = b.steps[i] || {};
+      const row = { episode: b.episode, step: step + i, recorded_at: nowIso };
+
+      if (s.state && typeof s.state === 'object' && !Array.isArray(s.state)) {
+        for (const [k, v] of Object.entries(s.state)) {
+          if (!isValidDdlColumn(k)) throw Object.assign(new Error(`無効な状態カラム名: ${k}`), { status: 400 });
+          row[k] = v;
+        }
+      }
+
+      // 観測: frames (アップロード) か framePath (既にサーバ上にある) のどちらか
+      if (Array.isArray(s.frames) && s.frames.length > 0) {
+        if (s.frames.length > RL_RECORD_LIMITS.framesPerStep) {
+          throw Object.assign(new Error(`frames は ${RL_RECORD_LIMITS.framesPerStep} 枚以下にしてください`), { status: 400 });
+        }
+        fs.mkdirSync(epDir, { recursive: true });
+        const stepName = String(row.step).padStart(4, '0');
+        if (s.frames.length === 1) {
+          const { buf, ext } = decodeObservationImage(s.frames[0]);
+          const rel = `rl_datasets/${b.table}/${b.episode}/${stepName}${ext}`;
+          fs.writeFileSync(path.join(UPLOADS_DIR, rel), buf);
+          row.frame = rel; saved.push(rel);
+        } else {
+          // 複数枚はディレクトリにまとめる (read_clip がフレーム連番として読む)
+          const dir = path.join(epDir, stepName);
+          fs.mkdirSync(dir, { recursive: true });
+          s.frames.forEach((f, k) => {
+            const { buf, ext } = decodeObservationImage(f);
+            fs.writeFileSync(path.join(dir, `${String(k).padStart(4, '0')}${ext}`), buf);
+          });
+          const rel = `rl_datasets/${b.table}/${b.episode}/${stepName}`;
+          row.frame = rel; saved.push(rel);
+        }
+      } else if (typeof s.framePath === 'string' && s.framePath.trim()) {
+        // uploads の外を指させない (python 側の resolve_source と同じ考え方)
+        const abs = path.resolve(UPLOADS_DIR, s.framePath);
+        if (abs !== UPLOADS_DIR && !abs.startsWith(UPLOADS_DIR + path.sep)) {
+          throw Object.assign(new Error(`framePath が uploads の外を指しています: ${s.framePath}`), { status: 400 });
+        }
+        row.frame = s.framePath.trim();
+      }
+
+      // 行動: 離散は action、連続は actionVector の各列
+      if (s.actionVector && typeof s.actionVector === 'object' && !Array.isArray(s.actionVector)) {
+        for (const [k, v] of Object.entries(s.actionVector)) {
+          if (!isValidDdlColumn(k)) throw Object.assign(new Error(`無効な行動カラム名: ${k}`), { status: 400 });
+          const n = Number(v);
+          if (!isFinite(n)) throw Object.assign(new Error(`行動 ${k} が数値ではありません`), { status: 400 });
+          row[k] = n;
+        }
+      } else if (s.action != null) {
+        row.action = String(s.action);
+      } else {
+        throw Object.assign(new Error(`steps[${i}] に action か actionVector が必要です`), { status: 400 });
+      }
+
+      if (s.reward != null) {
+        const n = Number(s.reward);
+        if (!isFinite(n)) throw Object.assign(new Error(`steps[${i}] の reward が数値ではありません`), { status: 400 });
+        row.reward = n;
+      } else if (spec.useReward !== false) {
+        row.reward = 0;
+      }
+      row.done = s.done ? 1 : 0;
+      rows.push(row);
+    }
+    // エピソードの最後を明示的に終端にする (BC のチャンク境界にも効く)
+    if (b.finishEpisode) rows[rows.length - 1].done = 1;
+
+    const rowCount = await appendRlRows(b.table, rows, createIfMissing);
+    if (!getRlDatasetMeta(b.table)) {
+      // append で自動作成された場合も RL テーブルとして登録しておく
+      saveRlDatasetMeta(b.table, {
+        actionType: rows[0].action != null ? 'discrete' : 'continuous',
+        useObservation: rows.some(r => r.frame != null),
+        useReward: rows.some(r => r.reward != null),
+        autoCreated: true,
+      }, b.description);
+    }
+    log(ip, `[RLデータ] 記録: ${b.table}/${b.episode} step ${step}〜${step + rows.length - 1} (${saved.length}件の観測を保存)`);
+    res.json({
+      ok: true, table: b.table, episode: b.episode,
+      rowsAdded: rows.length, startStep: step, endStep: step + rows.length - 1,
+      rowCount, savedObservations: saved.length, observations: saved.slice(0, 20),
+    });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// ─── エピソード単位の削除 (失敗したデモを捨てる) ───
+// 行と、そのエピソードで保存した観測ファイルの両方を消す。
+app.delete('/ml/rl/datasets/:table/episodes/:episode', requireAuth, requirePermission('ml:write'), async (req, res) => {
+  const ip = getIP(req);
+  const { table, episode } = req.params;
+  try {
+    if (!isValidTableName(table)) return res.status(400).json({ error: '無効なテーブル名' });
+    if (!isValidEpisodeId(episode)) return res.status(400).json({ error: '無効なエピソードID' });
+    if (currentRlJob) return res.status(409).json({ error: `RL学習中は削除できません: ${currentRlJob.name}` });
+
+    const before = Number((await mlQuery(
+      `SELECT COUNT(*) AS c FROM "${table}" WHERE "episode" = ?`, [episode]))[0].c) || 0;
+    if (before === 0) return res.status(404).json({ error: `エピソード "${episode}" の行がありません` });
+    await mlExec(`DELETE FROM "${table}" WHERE "episode" = '${episode.replace(/'/g, "''")}'`);
+
+    // 観測ファイルは、このエンドポイントが作った場所にあるものだけ消す
+    const epDir = path.join(RL_DATASETS_DIR, table, episode);
+    let filesRemoved = false;
+    if (epDir.startsWith(RL_DATASETS_DIR + path.sep) && fs.existsSync(epDir)) {
+      try { fs.rmSync(epDir, { recursive: true, force: true }); filesRemoved = true; } catch {}
+    }
+    log(ip, `[RLデータ] エピソード削除: ${table}/${episode} (${before}行${filesRemoved ? ' + 観測ファイル' : ''})`);
+    res.json({ ok: true, deletedRows: before, filesRemoved });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 🌍 世界モデル (V-JEPA 2-AC): 学習・一覧・削除・計画
+// ═══════════════════════════════════════════════════════════════════
+// 経験ログの (観測, 行動, 次の観測) から「行動で潜在がどう変わるか」を学習し、
+// ゴール画像を渡すだけで CEM が行動系列を探索できるようにする。
+// 学習ジョブは RL 学習と同じスロット (currentRlJob) を使う。DuckDB を read_only で
+// 開くのは同時に1プロセスだけ、という排他をここでも守るため。
+
+async function startAcTraining(b, ip) {
+  if (currentRlJob) {
+    const e = new Error(`既に学習中: ${currentRlJob.name}`); e.status = 409; throw e;
+  }
+  if (!isValidAgentName(b.name)) {
+    const e = new Error('モデル名は英数字・ハイフン・アンダースコア (1〜64文字)'); e.status = 400; throw e;
+  }
+  if (!isValidTableName(b.table)) { const e = new Error('無効なテーブル名'); e.status = 400; throw e; }
+  const scriptPath = path.join(__dirname, 'vjepa2_ac_runner.py');
+  if (!fs.existsSync(scriptPath)) { const e = new Error('vjepa2_ac_runner.py が見つかりません'); e.status = 500; throw e; }
+
+  const actionType = b.actionType === 'continuous' ? 'continuous' : 'discrete';
+  const actionColumns = Array.isArray(b.actionColumns) ? b.actionColumns.filter(c => c) : [];
+  if (actionType === 'continuous') {
+    if (actionColumns.length === 0 || !actionColumns.every(isValidRlColumn)) {
+      const e = new Error('連続行動には有効な actionColumns が必要です'); e.status = 400; throw e;
+    }
+  } else if (!isValidRlColumn(b.actionColumn)) {
+    const e = new Error('actionColumn が無効です'); e.status = 400; throw e;
+  }
+  for (const [k, v] of [['videoColumn', b.videoColumn], ['episodeColumn', b.episodeColumn], ['stepColumn', b.stepColumn]]) {
+    if (v && !isValidRlColumn(v)) { const e = new Error(`${k} が無効です`); e.status = 400; throw e; }
+  }
+
+  const clampInt = (v, def, lo, hi) => Math.min(Math.max(parseInt(v) || def, lo), hi);
+  const clampNum = (v, def, lo, hi) => Math.min(Math.max(typeof v === 'number' ? v : (parseFloat(v) || def), lo), hi);
+  const outputDir = path.join(AC_MODELS_DIR, b.name);
+  const runConfig = {
+    mode: 'train', name: b.name, tableName: b.table, dbPath: ML_DB_FILE, outputDir,
+    videoColumn: b.videoColumn || 'frame',
+    episodeColumn: b.episodeColumn || 'episode',
+    stepColumn: b.stepColumn || 'step',
+    actionType, actionColumn: b.actionColumn || null, actionColumns,
+    epochs: clampInt(b.epochs, 200, 10, 5000),
+    batchSize: clampInt(b.batchSize, 256, 8, 2048),
+    learningRate: clampNum(b.learningRate, 0.001, 1e-5, 0.1),
+    hiddenSize: clampInt(b.hiddenSize, 1024, 64, 4096),
+    numBlocks: clampInt(b.numBlocks, 2, 1, 8),
+    rolloutK: clampInt(b.rolloutK, 3, 1, 16),
+    valSplit: clampNum(b.valSplit, 0.2, 0, 0.5),
+    vjepa2: buildVjepa2Spec(b.vjepa2),
+    vjepa2CacheDir: VJEPA2_CACHE_DIR,
+    videoBaseDir: UPLOADS_DIR,
+  };
+
+  log(ip, `[世界モデル] DuckDB を学習用に一時クローズ (table=${b.table})`);
+  await releaseMlDbForExternal(ip);
+
+  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+  const tmpCfg = path.join(outputDir, '_run_config.json');
+  fs.writeFileSync(tmpCfg, JSON.stringify(runConfig, null, 2));
+
+  const jobId = `acjob_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const pythonCmd = appConfig.pythonPath || 'python3';
+  const { spawn } = require('child_process');
+  const proc = spawn(pythonCmd, [scriptPath, tmpCfg], {
+    cwd: __dirname, env: rlPythonEnv(), detached: true,
+  });
+  currentRlJob = { jobId, name: b.name, env: 'worldmodel', algo: 'ac', isDataset: true, proc, log: [], startedAt: Date.now() };
+  log(ip, `[世界モデル] 学習開始: ${b.name} (table=${b.table}, ${actionType}, rolloutK=${runConfig.rolloutK})`);
+
+  const handleData = (d) => {
+    if (!currentRlJob) return;
+    currentRlJob.log.push(d.toString());
+    if (currentRlJob.log.length > 1000) currentRlJob.log = currentRlJob.log.slice(-800);
+  };
+  proc.stdout.on('data', handleData);
+  proc.stderr.on('data', handleData);
+  proc.on('close', (code) => {
+    try { fs.unlinkSync(tmpCfg); } catch {}
+    const fullLog = currentRlJob ? currentRlJob.log.join('') : '';
+    const wasCancelled = currentRlJob && currentRlJob.cancelled;
+    let result = null;
+    const m = fullLog.match(/RESULT_JSON:(.+)/);
+    if (m) { try { result = JSON.parse(m[1]); } catch {} }
+    const jobs = loadRlJobs();
+    jobs.unshift({
+      jobId, name: b.name, env: 'worldmodel', algo: 'ac',
+      status: wasCancelled ? 'cancelled' : ((code === 0 && result?.status === 'completed') ? 'completed' : 'failed'),
+      finalLoss: result?.finalLoss ?? null,
+      improveRatio: result?.improveRatio ?? null,
+      actionSensitivity: result?.actionSensitivity ?? null,
+      device: result?.device ?? null,
+      error: wasCancelled ? null : (result?.error ?? (code !== 0 ? `exit ${code}` : null)),
+      startedAt: currentRlJob ? currentRlJob.startedAt : Date.now(),
+      finishedAt: Date.now(),
+      log: fullLog.slice(-5000),
+    });
+    saveRlJobs(jobs);
+    log('-', `[世界モデル] 学習終了: ${b.name} (exit ${code})`);
+    currentRlJob = null;
+    reacquireMlDb();
+  });
+  proc.on('error', (err) => {
+    try { fs.unlinkSync(tmpCfg); } catch {}
+    log('-', `[世界モデル] プロセスエラー: ${err.message}`);
+    currentRlJob = null;
+    reacquireMlDb();
+  });
+  return { jobId };
+}
+
+app.post('/ml/rl/ac/train', requireAuth, requirePermission('ml:write'), jsonParser, async (req, res) => {
+  try {
+    const out = await startAcTraining(req.body || {}, getIP(req));
+    res.json({ ok: true, jobId: out.jobId });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// ─── 世界モデル一覧 ───
+app.get('/ml/rl/ac/models', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const models = [];
+  try {
+    for (const name of fs.readdirSync(AC_MODELS_DIR)) {
+      const cfgPath = path.join(AC_MODELS_DIR, name, 'config.json');
+      if (!fs.existsSync(cfgPath) || !fs.existsSync(path.join(AC_MODELS_DIR, name, 'model.pt'))) continue;
+      try {
+        const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+        let metrics = null;
+        try { metrics = JSON.parse(fs.readFileSync(path.join(AC_MODELS_DIR, name, 'metrics.json'), 'utf-8')); } catch {}
+        models.push({
+          name,
+          tableName: cfg.tableName,
+          actionType: cfg.actionSpec?.type,
+          actionColumns: cfg.actionSpec?.columns || null,
+          actionClasses: cfg.actionSpec?.classes || null,
+          embDim: cfg.embDim, rolloutK: cfg.rolloutK,
+          vjepa2: cfg.vjepa2 || null,
+          trainedAt: cfg.trainedAt,
+          metrics: metrics && {
+            val1StepMSE: metrics.val1StepMSE, identityMSE: metrics.identityMSE,
+            improveRatio: metrics.improveRatio, actionSensitivity: metrics.actionSensitivity,
+            rolloutMSE: metrics.rolloutMSE, nTransitions: metrics.nTransitions,
+            hasVal: metrics.hasVal, elapsedSec: metrics.elapsedSec,
+            lossHistory: metrics.lossHistory, valLossHistory: metrics.valLossHistory,
+            lossName: metrics.lossName, finalLoss: metrics.finalLoss,
+          },
+        });
+      } catch {}
+    }
+  } catch {}
+  models.sort((a, b) => (b.trainedAt || 0) - (a.trainedAt || 0));
+  res.json({ models, planDefaults: { horizon: 8, samples: 256, iterations: 4 } });
+});
+
+// ─── 世界モデル削除 ───
+app.delete('/ml/rl/ac/models/:name', requireAuth, requirePermission('ml:write'), (req, res) => {
+  const name = req.params.name;
+  if (!isValidAgentName(name)) return res.status(400).json({ error: '無効なモデル名' });
+  if (currentRlJob && currentRlJob.name === name) {
+    return res.status(409).json({ error: '学習中のモデルは削除できません' });
+  }
+  const dir = path.join(AC_MODELS_DIR, name);
+  if (!fs.existsSync(dir)) return res.status(404).json({ error: 'モデルが見つかりません' });
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  log(getIP(req), `[世界モデル] 削除: ${name}`);
+  res.json({ ok: true });
+});
+
+// ─── 計画: ゴール画像に近づく行動系列を CEM で探索 ───
+// body: { framePath|frames, goalPath|goalFrames, horizon?, samples?, iterations?, seed? }
+// 観測とゴールはパス (uploads相対) か base64 フレームのどちらでも渡せる。
+app.post('/ml/rl/ac/models/:name/plan', requireAuth, requirePermission('ml:read'), jsonParser, async (req, res) => {
+  try {
+    const name = req.params.name;
+    if (!isValidAgentName(name)) return res.status(400).json({ error: '無効なモデル名' });
+    if (!fs.existsSync(path.join(AC_MODELS_DIR, name, 'model.pt'))) {
+      return res.status(404).json({ error: '世界モデルが見つかりません (先に学習してください)' });
+    }
+    const b = req.body || {};
+    await ensureVjepa2Worker();
+    const result = await vjepa2WorkerRequest('/plan', {
+      name,
+      frames: Array.isArray(b.frames) ? b.frames : undefined,
+      framePath: typeof b.framePath === 'string' ? b.framePath : undefined,
+      goalFrames: Array.isArray(b.goalFrames) ? b.goalFrames : undefined,
+      goalPath: typeof b.goalPath === 'string' ? b.goalPath : undefined,
+      horizon: b.horizon, samples: b.samples, iterations: b.iterations, seed: b.seed,
+    });
+    vjepa2Worker.lastUsed = Date.now();
+    res.json(result);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
   }
 });
 
@@ -9060,8 +10109,10 @@ app.post('/ml/rl/models/:name/act', requireAuth, requirePermission('ml:read'), j
     if (epsilon != null && (typeof epsilon !== 'number' || epsilon < 0 || epsilon > 1)) {
       return res.status(400).json({ error: 'epsilon は 0〜1 の数値で指定してください' });
     }
+    // 視覚エージェントなら、観測 (パス / frames) を常駐エンコーダで埋め込みに変換
+    const state = await attachEmbedding(body.state, getRlAgentVision(name));
     await ensureRlOnlineWorker();
-    const result = await rlWorkerRequest('/act', { name, state: body.state, epsilon });
+    const result = await rlWorkerRequest('/act', { name, state, epsilon });
     res.json(result);
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });
@@ -9091,6 +10142,23 @@ app.post('/ml/rl/models/:name/learn', requireAuth, requirePermission('ml:write')
         state: body.state, action: body.action, reward: body.reward,
         next_state: body.next_state, done: body.done,
       });
+    }
+    // 視覚エージェント: 経験に含まれる観測をまとめて埋め込みに変換する
+    // (パス指定ぶんは1回の /embed に束ねるので、バッチ投入でも往復は1回)
+    const vision = getRlAgentVision(name);
+    if (vision.embDim > 0) {
+      if (payload.experiences) {
+        const flat = [];
+        for (const ex of payload.experiences) flat.push(ex.state, ex.next_state);
+        const done = await attachEmbeddingsBatch(flat, vision);
+        payload.experiences = payload.experiences.map((ex, i) => ({
+          ...ex, state: done[i * 2], next_state: done[i * 2 + 1],
+        }));
+      } else {
+        const [s, s2] = await attachEmbeddingsBatch([payload.state, payload.next_state], vision);
+        payload.state = s;
+        payload.next_state = s2;
+      }
     }
     await ensureRlOnlineWorker();
     const result = await rlWorkerRequest('/learn', payload);

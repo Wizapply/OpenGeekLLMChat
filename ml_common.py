@@ -12,6 +12,34 @@ ml_common.py — OpenGeekLLMChat 機械学習機能の共通ロジック
 不具合に直結する。共通化することで一箇所メンテになる。
 """
 import datetime as _dt
+import time as _time
+
+
+def connect_duckdb_ro(db_path, retries=15, delay=2.0, log=None):
+    """DuckDB を read_only で開く。ロック競合時はリトライする。
+
+    Node 側は学習ジョブ開始前に接続を閉じるが、close の完了と本プロセスの connect の
+    間にわずかな時間差があり、稀に "Conflicting lock is held" になる。数秒待てば
+    解消するので、即死せずリトライする (既定: 2秒間隔 × 15回 = 最大30秒)。
+    それでも取れない場合は、Node 側がロックを握りっぱなし (要サーバー再起動) の疑い。
+    """
+    import duckdb
+    last = None
+    for i in range(max(1, int(retries))):
+        try:
+            return duckdb.connect(db_path, read_only=True)
+        except Exception as e:  # duckdb.IOException 等。型名がバージョンで揺れるため広く取る
+            msg = str(e)
+            if 'lock' not in msg.lower():
+                raise                     # ロック以外のエラーは即時失敗
+            last = e
+            if log and i == 0:
+                log(f"  DuckDB がロック中のため待機します (最大{int(retries * delay)}秒)...")
+            _time.sleep(delay)
+    raise RuntimeError(
+        f"DuckDB のロックを {int(retries * delay)}秒待ちましたが取得できませんでした。"
+        f"Node 側がハンドルを握りっぱなしの可能性があります (サーバー再起動で解消)。"
+        f" 元エラー: {last}")
 
 
 # 日時列を分解する際の派生特徴名 (固定、6特徴量)

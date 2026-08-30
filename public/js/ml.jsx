@@ -4,6 +4,8 @@ function App() {
   const [authenticated, setAuthenticated] = useState(false);
   const [authRequired, setAuthRequired] = useState(false);
   const [tables, setTables] = useState([]);
+  // 用途別の件数 ({ml, rl})。RL 用テーブルが別管理であることを画面で示すのに使う
+  const [tableCounts, setTableCounts] = useState(null);
   const [duckdbAvailable, setDuckdbAvailable] = useState(true);
   const [duckdbHint, setDuckdbHint] = useState('');
   // サイドバー統計（モデル数・画像学習・強化学習などの件数）
@@ -62,10 +64,14 @@ function App() {
     setStats({ models, imageDatasets, imageModels, keypointDatasets, keypointModels, rlModels });
   }
 
+  // 📊 データタブは「モデル学習用」のテーブルだけを見る。
+  // 強化学習の経験ログは 🎮 強化学習タブ側で管理する (用途が違うので一覧を分ける)。
   async function loadTables() {
     try {
-      const data = await (await fetch('/ml/datasets')).json();
+      const data = await (await fetch('/ml/datasets?kind=ml')).json();
+      if (data.busy) return;   // 学習中はDBを開けない。前回の一覧を保持する
       setTables(data.tables || []);
+      setTableCounts(data.counts || null);
       if (data.duckdbAvailable === false) {
         setDuckdbAvailable(false);
         setDuckdbHint(data.hint || '');
@@ -73,6 +79,23 @@ function App() {
         setDuckdbAvailable(true);
       }
     } catch (e) { showToast(`一覧取得失敗: ${e.message}`, 'error'); }
+  }
+
+  // CSV で取り込んだ表を強化学習用に回す (またはその逆)
+  async function setTableKind(name, kind) {
+    try {
+      const r = await fetch(`/ml/datasets/${encodeURIComponent(name)}/kind`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      showToast(kind === 'rl'
+        ? `${name} を強化学習用に移しました (🎮 強化学習タブに表示されます)`
+        : `${name} をモデル学習用に戻しました`, 'success');
+      if (kind === 'rl' && selectedTable === name) setSelectedTable(null);
+      loadTables();
+    } catch (e) { showToast(`変更失敗: ${e.message}`, 'error'); }
   }
 
   async function loadTableDetails(name) {
@@ -229,6 +252,8 @@ function App() {
               tablesPanel={
                 <DataTablesView
                   tables={tables}
+                  tableCounts={tableCounts}
+                  onSetKind={setTableKind}
                   duckdbAvailable={duckdbAvailable}
                   selectedTable={selectedTable}
                   schema={tableSchema}
@@ -276,7 +301,7 @@ function App() {
 }
 
 // ─── 🗂️ データテーブル (モデル学習タブ内のサブタブとして表示) ───
-function DataTablesView({ tables, duckdbAvailable, selectedTable, schema, preview, onImport, onApiImport, onReload, onSelectTable, onDeleteTable, onQueryHere }) {
+function DataTablesView({ tables, tableCounts, duckdbAvailable, selectedTable, schema, preview, onImport, onApiImport, onReload, onSelectTable, onDeleteTable, onQueryHere, onSetKind }) {
   return (
     <>
       <div className="toolbar">
@@ -287,12 +312,26 @@ function DataTablesView({ tables, duckdbAvailable, selectedTable, schema, previe
           🌐 Web API をインポート
         </button>
         <button className="btn" onClick={onReload}>🔄 更新</button>
+        {tableCounts?.rl > 0 && (
+          <span style={{
+            background: 'var(--bg-tertiary)', color: 'var(--text-muted)',
+            padding: '4px 10px', borderRadius: 10, fontSize: 12,
+          }}>
+            🎮 強化学習用のテーブル {tableCounts.rl} 件は「強化学習」タブで管理しています
+          </span>
+        )}
       </div>
 
       <div className="ml-layout">
         <div className="ml-table-list">
           {tables.length === 0 ? (
-            <div className="empty-state">テーブルがありません。<br />「📥 CSVをインポート」から開始してください。</div>
+            <div className="empty-state">
+              モデル学習用のテーブルがありません。<br />「📥 CSVをインポート」から開始してください。
+              {tableCounts?.rl > 0 && <><br /><br />
+                <span style={{ fontSize: 12 }}>
+                  強化学習用のテーブルが {tableCounts.rl} 件あります（「🎮 強化学習」タブ）
+                </span></>}
+            </div>
           ) : tables.map(t => (
             <div
               key={t.name}
@@ -302,6 +341,12 @@ function DataTablesView({ tables, duckdbAvailable, selectedTable, schema, previe
               <div className="ml-table-name">🗂️ {t.name}</div>
               <div className="ml-table-meta">{t.rowCount.toLocaleString()} 行</div>
               {t.description && <div className="ml-table-desc">{t.description}</div>}
+              {/* 経験ログを CSV で取り込んだ場合など、後から用途を移せるようにする */}
+              <button className="btn small" style={{ marginTop: 6 }}
+                onClick={(e) => { e.stopPropagation(); onSetKind(t.name, 'rl'); }}
+                title="強化学習タブの一覧に移します (データはそのまま)">
+                🎮 強化学習用に移す
+              </button>
             </div>
           ))}
         </div>
@@ -3410,9 +3455,18 @@ function ModelEditDialog({ tables, initial, onClose, onDone, showToast }) {
 // エージェントを学習し、損失曲線・オフライン方策評価・推論(推奨行動)までを行う。
 const RL_ALGO_SHORT = { dqn: 'DQN', ddqn: 'Double DQN', cql: 'CQL', bc: 'BC' };
 
+// V-JEPA 2 各チェックポイントの hidden_size (プーリング後の次元表示に使う)
+const VJEPA2_HIDDEN = {
+  'facebook/vjepa2-vitl-fpc64-256': 1024,
+  'facebook/vjepa2-vith-fpc64-256': 1280,
+  'facebook/vjepa2-vitg-fpc64-256': 1408,
+  'facebook/vjepa2-vitg-fpc64-384': 1408,
+};
+
 // オフラインRL の学習損失曲線を canvas に描画
 function LossChart({ metrics, height = 200 }) {
   const ref = useRef(null);
+  const valLoss = (metrics && metrics.valLossHistory) || [];
   useEffect(() => {
     const cv = ref.current;
     const loss = (metrics && metrics.lossHistory) || [];
@@ -3423,7 +3477,9 @@ function LossChart({ metrics, height = 200 }) {
     const ctx = cv.getContext('2d'); ctx.scale(dpr, dpr); ctx.clearRect(0, 0, W, H);
     const pad = { l: 56, r: 10, t: 12, b: 24 };
     const plotW = W - pad.l - pad.r, plotH = H - pad.t - pad.b;
-    let yMin = Math.min(...loss), yMax = Math.max(...loss);
+    // 検証曲線があれば同じスケールに載せる (学習と検証の乖離を見るため)
+    const all = valLoss.length ? loss.concat(valLoss) : loss;
+    let yMin = Math.min(...all), yMax = Math.max(...all);
     if (yMin === yMax) { yMin = 0; yMax = yMax || 1; } else { yMin = Math.min(yMin, 0); }
     const n = loss.length;
     const x = i => pad.l + (n <= 1 ? 0 : (i / (n - 1)) * plotW);
@@ -3432,6 +3488,7 @@ function LossChart({ metrics, height = 200 }) {
     const cBorder = (css.getPropertyValue('--border') || '#2a2a3e').trim();
     const cAccent = (css.getPropertyValue('--accent') || '#7c4dff').trim();
     const cMuted = (css.getPropertyValue('--text-muted') || '#888').trim();
+    const cVal = (css.getPropertyValue('--orange') || '#f5a623').trim();
     ctx.strokeStyle = cBorder; ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(pad.l, pad.t); ctx.lineTo(pad.l, pad.t + plotH); ctx.lineTo(pad.l + plotW, pad.t + plotH); ctx.stroke();
     ctx.fillStyle = cMuted; ctx.font = '10px monospace'; ctx.textAlign = 'right';
@@ -3443,11 +3500,26 @@ function LossChart({ metrics, height = 200 }) {
     }
     ctx.textAlign = 'center'; ctx.fillStyle = cMuted;
     ctx.fillText('エポック', pad.l + plotW / 2, pad.t + plotH + 14);
-    ctx.strokeStyle = cAccent; ctx.lineWidth = 2; ctx.beginPath();
-    loss.forEach((v, i) => { i === 0 ? ctx.moveTo(x(i), y(v)) : ctx.lineTo(x(i), y(v)); });
-    ctx.stroke();
+    const line = (arr, color, dash) => {
+      ctx.setLineDash(dash || []); ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+      arr.forEach((v, i) => { i === 0 ? ctx.moveTo(x(i), y(v)) : ctx.lineTo(x(i), y(v)); });
+      ctx.stroke(); ctx.setLineDash([]);
+    };
+    line(loss, cAccent);
+    if (valLoss.length) line(valLoss, cVal, [4, 3]);
   }, [metrics, height]);
-  return <canvas ref={ref} style={{ width: '100%', height, display: 'block' }} />;
+  return (
+    <>
+      <canvas ref={ref} style={{ width: '100%', height, display: 'block' }} />
+      {valLoss.length > 0 && (
+        <div className="field-hint" style={{ textAlign: 'center', marginTop: 4 }}>
+          <span style={{ color: 'var(--accent)' }}>━ 学習</span>{'　'}
+          <span style={{ color: 'var(--orange, #f5a623)' }}>┅ 検証</span>{'　'}
+          検証が下げ止まって上に転じたら、そこから先は過学習です
+        </div>
+      )}
+    </>
+  );
 }
 
 // ─── オンラインRL 用: 単系列のライブ折れ線グラフ (reward EMA / loss EMA の推移) ───
@@ -3514,7 +3586,75 @@ function QValueBars({ qValues, chosen }) {
 }
 
 // オフラインRL のオフライン評価結果 (方策一致率・行動分布・推薦サンプル) を表示
+// 連続行動 (BC回帰) の評価結果。一致率ではなく誤差で見る
+function ContinuousEvalResult({ result }) {
+  const cols = result.actionColumns || [];
+  const fmt = v => (v == null ? '—' : v);
+  return (
+    <div>
+      <div className="rl-eval-stats">
+        <div className="rl-stat"><div className="rl-stat-v">{fmt(result.actionMAE)}</div><div className="rl-stat-l">行動MAE<br />(元スケール)</div></div>
+        <div className="rl-stat"><div className="rl-stat-v">{fmt(result.actionRMSE)}</div><div className="rl-stat-l">行動RMSE<br />(元スケール)</div></div>
+        <div className="rl-stat"><div className="rl-stat-v">{result.nRows}</div><div className="rl-stat-l">評価<br />行数</div></div>
+        <div className="rl-stat"><div className="rl-stat-v">{result.chunkSize || 1}</div><div className="rl-stat-l">チャンク<br />長</div></div>
+      </div>
+      <div className="rl-agent-meta" style={{ margin: '4px 0 10px' }}>
+        MAE はログ行動との平均絶対誤差です。<b>下のログ標準偏差より十分小さければ</b>模倣できています
+        (標準偏差と同程度なら「平均を出しているだけ」の状態)。
+        {result.trainedValSplit && <>
+          {' '}学習時の検証MAE は <b>{fmt(result.trainedValSplit.valMAE)}</b> (正規化空間、
+          {result.trainedValSplit.nVal}行)。この評価は表の全行が対象なので学習した行も含みます。
+        </>}
+      </div>
+      <div className="rl-panel-title" style={{ fontSize: 12 }}>次元ごとの誤差</div>
+      <div className="rl-sample-wrap">
+        <table className="rl-sample-table">
+          <thead><tr><th>行動カラム</th><th>MAE</th><th>ログの標準偏差</th><th>MAE / 標準偏差</th></tr></thead>
+          <tbody>
+            {cols.map(c => {
+              const mae = result.actionMAEPerDim?.[c];
+              const sd = result.loggedActionStd?.[c];
+              const ratio = (mae != null && sd) ? mae / sd : null;
+              return (
+                <tr key={c}>
+                  <td>{c}</td>
+                  <td style={{ fontFamily: 'var(--font-mono)' }}>{fmt(mae)}</td>
+                  <td style={{ fontFamily: 'var(--font-mono)' }}>{fmt(sd)}</td>
+                  <td style={{ fontFamily: 'var(--font-mono)',
+                    color: ratio == null ? 'inherit' : (ratio < 0.5 ? 'var(--accent)' : 'var(--orange, #f5a623)') }}>
+                    {ratio == null ? '—' : ratio.toFixed(3)}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div className="rl-panel-title" style={{ fontSize: 12, marginTop: 12 }}>推薦サンプル (先頭{(result.samples || []).length}件)</div>
+      <div className="rl-sample-wrap">
+        <table className="rl-sample-table">
+          <thead><tr><th>状態</th><th>実績</th><th>推奨</th><th>誤差</th></tr></thead>
+          <tbody>
+            {(result.samples || []).map((s, i) => (
+              <tr key={i}>
+                <td>{Object.entries(s.state).map(([k, v]) => `${k}=${v}`).join(', ')}</td>
+                <td style={{ fontFamily: 'var(--font-mono)' }}>
+                  {cols.map(c => `${c}=${s.loggedAction?.[c]}`).join(', ')}</td>
+                <td style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent)' }}>
+                  {cols.map(c => `${c}=${s.recommendedAction?.[c]}`).join(', ')}</td>
+                <td style={{ fontFamily: 'var(--font-mono)' }}>
+                  {cols.map(c => s.absError?.[c]).join(', ')}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function DatasetEvalResult({ result }) {
+  if (result.actionType === 'continuous') return <ContinuousEvalResult result={result} />;
   const labels = result.actionLabels || [];
   const maxCount = Math.max(1, ...labels.map(l => Math.max(result.loggedActionDist?.[l] || 0, result.policyActionDist?.[l] || 0)));
   return (
@@ -3528,6 +3668,11 @@ function DatasetEvalResult({ result }) {
       <div className="rl-agent-meta" style={{ margin: '4px 0 10px' }}>
         {result.datasetMode === 'transition' ? '遷移ベース' : 'バンディット'} · {result.nRows}行で評価。
         「推奨一致時平均報酬」が「ログ平均報酬」より高ければ、学習した方策の方が良い選択をしています。
+        {result.trainedValSplit && <>
+          {' '}この評価は<b>表の全行が対象</b>なので学習に使った行も含みます。汎化性能は学習時の
+          検証一致率 <b>{Math.round((result.trainedValSplit.valAgreement || 0) * 100)}%</b>
+          ({result.trainedValSplit.nVal}行) を見てください。
+        </>}
       </div>
       <div className="rl-panel-title" style={{ fontSize: 12 }}>行動の分布 (ログ vs 学習方策)</div>
       <div className="rl-dist">
@@ -3589,6 +3734,17 @@ function RLView({ showToast }) {
   const [onlineStatus, setOnlineStatus] = useState(null);
   const [onlineHist, setOnlineHist] = useState([]);     // [{step, loss, reward}] パネル表示中のEMA推移
   const [evalOnline, setEvalOnline] = useState(false);  // 評価パネルがオンライン用か
+  // 👁 V-JEPA 2 常駐エンコーダの状態 (VRAM を占有するので手動解放できるようにする)
+  const [vjStatus, setVjStatus] = useState(null);
+  const [vjBusy, setVjBusy] = useState(false);
+  // 🎬 経験ログ用データテーブル (モデル学習タブと同じくサブタブで切り替える)
+  const [subTab, setSubTab] = useState('datasets');
+  const [showDataset, setShowDataset] = useState(false);
+  const [rlDatasets, setRlDatasets] = useState([]);
+  // 🔍 SQLクエリ (モデル学習タブと同じ QueryView を使う。経験ログの中身確認用)
+  const [sqlText, setSqlText] = useState('SELECT * FROM ');
+  const [sqlResult, setSqlResult] = useState(null);
+  const [sqlError, setSqlError] = useState('');
   const [onlineEvalResult, setOnlineEvalResult] = useState(null); // オンライン評価(act, ε=0)の結果
   const [actInput, setActInput] = useState('{}');       // act/learn 用 state(JSON)
   const [actResult, setActResult] = useState(null);
@@ -3608,15 +3764,22 @@ function RLView({ showToast }) {
     loadModels();
     loadStatus();
     loadTables();
+    loadVjStatus();
+    loadRlDatasets();
     const t = setInterval(() => { loadModels(); loadStatus(); }, 3000);
-    return () => clearInterval(t);
+    // エンコーダの状態はアイドル停止の確認用なので、そこまで頻繁でなくてよい
+    const tv = setInterval(loadVjStatus, 15000);
+    return () => { clearInterval(t); clearInterval(tv); };
   }, []);
 
+  // 学習ダイアログでは既定で「強化学習用」のテーブルだけを出す。
+  // kind を持ったまま全件取っておき、必要ならダイアログ側でモデル学習用も表示する。
   async function loadTables() {
     try {
-      const r = await fetch('/ml/datasets');
+      const r = await fetch('/ml/datasets?kind=all');
       const d = await r.json();
-      setTables(d.datasets || d.tables || []);
+      if (d.busy) return;   // 学習中は前回の一覧を保持
+      setTables(d.tables || d.datasets || []);
     } catch {}
   }
 
@@ -3709,7 +3872,9 @@ function RLView({ showToast }) {
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
       setEvalResult(d);
-      appendLog(`🔍 評価完了: ${name} · 方策一致率 ${Math.round((d.policyAgreement || 0) * 100)}% · ログ平均報酬 ${d.loggedMeanReward ?? '-'}`);
+      appendLog(d.actionType === 'continuous'
+        ? `🔍 評価完了: ${name} · 行動MAE ${d.actionMAE ?? '-'} · ${d.nRows}行`
+        : `🔍 評価完了: ${name} · 方策一致率 ${Math.round((d.policyAgreement || 0) * 100)}% · ログ平均報酬 ${d.loggedMeanReward ?? '-'}`);
     } catch (e) { showToast(`評価失敗: ${e.message}`, 'error'); appendLog(`❌ 評価失敗: ${name} (${e.message})`); setEvalFor(null); }
     finally { setEvaluating(false); }
   }
@@ -3729,6 +3894,91 @@ function RLView({ showToast }) {
       appendLog(`🔍 act評価 ${evalFor}: action=${d.action} · Q={${Object.entries(d.qValues || {}).map(([k, v]) => `${k}:${v}`).join(', ')}}`);
     } catch (e) { showToast(`評価失敗: ${e.message}`, 'error'); appendLog(`❌ act評価失敗: ${evalFor} (${e.message})`); }
     finally { setOnlineBusy(false); }
+  }
+
+  // 🔍 SQL 実行 (読み取り専用。モデル学習タブと同じ /ml/query を使う)
+  async function runSql() {
+    setSqlError(''); setSqlResult(null);
+    try {
+      const r = await fetch('/ml/query', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sql: sqlText, limit: 1000 }),
+      });
+      const d = await r.json();
+      if (!r.ok) { setSqlError(d.error || `HTTP ${r.status}`); return; }
+      setSqlResult(d);
+    } catch (e) { setSqlError(e.message); }
+  }
+
+  // 経験ログの詳細から「SQLで開く」→ クエリタブへ遷移
+  function openInSql(table) {
+    setSqlText(`SELECT * FROM "${table}" ORDER BY episode, step LIMIT 100`);
+    setSqlResult(null); setSqlError('');
+    setSubTab('query');
+  }
+
+  // 🎬 経験ログ用データテーブルの一覧
+  async function loadRlDatasets() {
+    try {
+      const r = await fetch('/ml/rl/datasets');
+      const d = r.ok ? await r.json() : {};
+      if (d.busy) return;   // 学習中は前回の一覧を保持
+      setRlDatasets(d.datasets || []);
+    } catch { /* 一時エラーでは前回値を保持 */ }
+  }
+
+  // テーブルの用途を変更 (モデル学習用 ⇄ 強化学習用)。データは動かない
+  async function changeTableKind(name, kind) {
+    try {
+      const r = await fetch(`/ml/datasets/${encodeURIComponent(name)}/kind`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      showToast(kind === 'ml' ? `${name} をモデル学習用に戻しました` : `${name} を強化学習用に移しました`, 'success');
+      appendLog(`${kind === 'ml' ? '📊' : '🎮'} ${name} の用途を ${kind} に変更`);
+      loadRlDatasets(); loadTables();
+    } catch (e) { showToast(`変更失敗: ${e.message}`, 'error'); }
+  }
+
+  // 経験ログのエピソード削除 (行 + 観測ファイル)
+  async function deleteEpisodeFromPanel(table, episode, onDone) {
+    if (!window.confirm(`「${table}」のエピソード "${episode}" を削除します。\n行と観測ファイルの両方が消えます。よろしいですか？`)) return;
+    try {
+      const r = await fetch(`/ml/rl/datasets/${encodeURIComponent(table)}/episodes/${encodeURIComponent(episode)}`,
+        { method: 'DELETE' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      showToast(`削除しました (${d.deletedRows}行)`, 'success');
+      appendLog(`🗑 エピソード削除: ${table}/${episode} (${d.deletedRows}行)`);
+      loadRlDatasets();
+      if (onDone) onDone();
+    } catch (e) { showToast(`削除失敗: ${e.message}`, 'error'); }
+  }
+
+  // 👁 常駐エンコーダの状態取得 / VRAM 解放
+  async function loadVjStatus() {
+    try {
+      const r = await fetch('/ml/rl/vjepa2/status');
+      setVjStatus(r.ok ? await r.json() : null);
+    } catch { setVjStatus(null); }
+  }
+
+  async function unloadVjepa2() {
+    setVjBusy(true);
+    try {
+      const r = await fetch('/ml/rl/vjepa2/unload', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stopWorker: true }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      showToast('エンコーダを解放しました (次の推論で自動起動します)', 'success');
+      appendLog('⏏ V-JEPA 2 エンコーダを解放 (VRAM を返却)');
+      loadVjStatus();
+    } catch (e) { showToast(`解放失敗: ${e.message}`, 'error'); }
+    finally { setVjBusy(false); }
   }
 
   async function deleteAgent(name) {
@@ -3838,6 +4088,62 @@ function RLView({ showToast }) {
 
   return (
     <div className="ml-models-view">
+      {/* モデル学習タブと同じ構成: データ(経験ログ) と エージェント学習 をサブタブで切替 */}
+      <div className="image-train-subtabs" style={{ marginBottom: 16 }}>
+        <button className={`subtab ${subTab === 'datasets' ? 'active' : ''}`}
+          onClick={() => setSubTab('datasets')}>🎬 経験ログ</button>
+        <button className={`subtab ${subTab === 'query' ? 'active' : ''}`}
+          onClick={() => setSubTab('query')}>🔍 SQLクエリ</button>
+        <button className={`subtab ${subTab === 'agents' ? 'active' : ''}`}
+          onClick={() => setSubTab('agents')}>🤖 エージェント</button>
+        <button className={`subtab ${subTab === 'world' ? 'active' : ''}`}
+          onClick={() => setSubTab('world')}>🌍 世界モデル</button>
+      </div>
+
+      {subTab === 'world' && (
+        <WorldModelPanel
+          datasets={rlDatasets}
+          running={running}
+          showToast={showToast}
+          appendLog={appendLog}
+        />
+      )}
+
+      {subTab === 'datasets' && (
+        <RLDatasetsPanel
+          datasets={rlDatasets}
+          onCreate={() => setShowDataset(true)}
+          onReload={() => { loadRlDatasets(); loadTables(); }}
+          onDeleteEpisode={deleteEpisodeFromPanel}
+          onSetKind={changeTableKind}
+          onQueryHere={openInSql}
+          showToast={showToast}
+        />
+      )}
+
+      {subTab === 'query' && (
+        <>
+          <QueryView
+            sql={sqlText}
+            setSql={setSqlText}
+            result={sqlResult}
+            error={sqlError}
+            onRun={runSql}
+            tables={rlDatasets}
+          />
+          <div className="field-hint" style={{ marginTop: 8 }}>
+            読み取り専用です。経験ログの中身を確認するのに使ってください。よく使う例:
+            <ul style={{ margin: '4px 0 0 18px', padding: 0 }}>
+              <li><code>SELECT episode, COUNT(*) steps, MAX(done) fin FROM "表" GROUP BY episode</code> — エピソードごとの長さと終端</li>
+              <li><code>SELECT action, COUNT(*) FROM "表" GROUP BY action ORDER BY 2 DESC</code> — 行動の偏り（BC の一致率の下限がここで決まります）</li>
+              <li><code>SELECT * FROM "表" WHERE frame IS NULL</code> — 観測が欠けている行</li>
+            </ul>
+          </div>
+        </>
+      )}
+
+      {subTab === 'agents' && (
+      <>
       <div className="toolbar">
         <button className="btn primary" onClick={() => setShowTrain(true)} disabled={!!running}>
           ➕ エージェントを新規作成 (学習)
@@ -3854,6 +4160,36 @@ function RLView({ showToast }) {
       <div className="ml-layout">
         {/* 左: エージェント一覧 (モデルカード調) */}
         <div className="ml-table-list">
+
+          {/* 👁 常駐エンコーダ。VRAM を占有するので、視覚エージェントがある時だけ出す */}
+          {(vjStatus || models.some(m => m.embDim > 0)) && (
+            <div className="ml-table-item" style={{ marginBottom: 8 }}>
+              <div className="ml-table-name">
+                👁 V-JEPA 2 エンコーダ
+                <span style={{
+                  marginLeft: 6, fontSize: 10,
+                  background: vjStatus?.running ? 'var(--accent-dim)' : 'var(--bg-tertiary)',
+                  color: vjStatus?.running ? 'var(--accent)' : 'var(--text-muted)',
+                  padding: '1px 6px', borderRadius: 8,
+                }}>{vjStatus?.running ? '常駐中' : '停止中'}</span>
+              </div>
+              <div className="ml-table-meta">
+                {vjStatus?.running
+                  ? (vjStatus.encoders?.length
+                    ? vjStatus.encoders.map(e => `${e.spec?.modelId?.split('/').pop()} (${e.device}, ${e.calls}回)`).join(', ')
+                    : 'モデル未ロード (最初の推論で読み込み)')
+                  : '推論時に自動で起動します'}
+              </div>
+              <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
+                <button className="btn small" onClick={loadVjStatus}>🔄 状態を更新</button>
+                {vjStatus?.running && (
+                  <button className="btn small" onClick={unloadVjepa2} disabled={vjBusy}>
+                    ⏏ VRAM を解放
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
 
           {models.length === 0 ? (
             <div className="empty-state">
@@ -3885,7 +4221,11 @@ function RLView({ showToast }) {
                 <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4, fontFamily: 'var(--font-mono)' }}>
                   {m.online
                     ? `steps: ${m.metrics.totalSteps ?? '-'}${m.metrics.rewardEMA != null ? ` · rewardEMA: ${m.metrics.rewardEMA}` : ''}${m.metrics.bufferSize != null ? ` · buffer: ${m.metrics.bufferSize}` : ''}`
-                    : `一致率: ${Math.round((m.metrics.policyAgreement || 0) * 100)}% · 推定価値: ${m.metrics.meanQ}`}
+                    : (m.metrics.actionType === 'continuous'
+                      ? `MAE: ${m.metrics.valMAE != null ? `${m.metrics.valMAE} (検証)` : `${m.metrics.trainMAE ?? '-'} (学習)`}`
+                      : `一致率: ${Math.round((m.metrics.policyAgreement || 0) * 100)}%${
+                          m.metrics.valAgreement != null ? ' (検証)' : ''} · 推定価値: ${m.metrics.meanQ ?? '-'}`)}
+                  {m.embDim > 0 ? ' · 👁 V-JEPA2' : ''}{m.chunkSize > 1 ? ` · chunk ${m.chunkSize}` : ''}
                 </div>
               )}
               <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
@@ -3946,12 +4286,31 @@ function RLView({ showToast }) {
                   <div className="rl-agent-meta" style={{ marginTop: 8 }}>
                     {RL_ALGO_SHORT[chartFor.metrics.algo] || chartFor.metrics.algo || 'DQN'} ·
                     方式 <b>{chartFor.metrics.datasetMode === 'transition' ? '遷移' : 'バンディット'}</b> ·
-                    最終損失 <b>{chartFor.metrics.finalLoss}</b> ·
-                    方策一致率 <b>{Math.round((chartFor.metrics.policyAgreement || 0) * 100)}%</b> ·
-                    推定価値(平均maxQ) <b>{chartFor.metrics.meanQ}</b> ·
-                    ログ平均報酬 {chartFor.metrics.loggedMeanReward} ·
+                    最終損失 <b>{chartFor.metrics.finalLoss}</b>
+                    {chartFor.metrics.finalValLoss != null && <> (検証 <b>{chartFor.metrics.finalValLoss}</b>)</>} ·
+                    {chartFor.metrics.actionType === 'continuous'
+                      ? <> 行動MAE <b>{chartFor.metrics.trainMAE ?? '-'}</b>
+                          {chartFor.metrics.valMAE != null && <> / 検証 <b>{chartFor.metrics.valMAE}</b></>} · </>
+                      : <> 方策一致率 <b>{Math.round((chartFor.metrics.policyAgreement || 0) * 100)}%</b> ·
+                          推定価値(平均maxQ) <b>{chartFor.metrics.meanQ ?? '-'}</b> · </>}
+                    ログ平均報酬 {chartFor.metrics.loggedMeanReward ?? '—'} ·
+                    {chartFor.metrics.chunkSize > 1 ? `チャンク ${chartFor.metrics.chunkSize}手 · ` : ''}
                     {chartFor.metrics.nTransitions}件 · {chartFor.metrics.elapsedSec}秒
                   </div>
+                  {chartFor.metrics.nVal > 0 && chartFor.metrics.actionType !== 'continuous' && (
+                    <div className="rl-agent-meta" style={{ marginTop: 4 }}>
+                      学習 {chartFor.metrics.nTrain}行 → 一致率 <b>{Math.round((chartFor.metrics.trainAgreement || 0) * 100)}%</b> ／
+                      検証 {chartFor.metrics.nVal}行 → 一致率 <b>{Math.round((chartFor.metrics.valAgreement || 0) * 100)}%</b>
+                      {(chartFor.metrics.trainAgreement - chartFor.metrics.valAgreement) > 0.15 &&
+                        <b style={{ color: 'var(--orange, #f5a623)' }}> ← 差が大きい (過学習の疑い)</b>}
+                    </div>
+                  )}
+                  {chartFor.metrics.nVal > 0 && chartFor.metrics.actionType === 'continuous' && (
+                    <div className="rl-agent-meta" style={{ marginTop: 4 }}>
+                      学習 {chartFor.metrics.nTrain}行 → MAE <b>{chartFor.metrics.trainMAE}</b> ／
+                      検証 {chartFor.metrics.nVal}行 → MAE <b>{chartFor.metrics.valMAE}</b> (正規化空間)
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -4058,7 +4417,12 @@ function RLView({ showToast }) {
                         {j.status === 'completed' ? '✅' : j.status === 'cancelled' ? '⏹' : '❌'} {j.name}
                       </span>
                       <div className="ml-table-meta">
-                        {j.policyAgreement != null ? `一致率 ${Math.round(j.policyAgreement * 100)}%` : '—'}
+                        {j.actionType === 'continuous'
+                          ? (j.valMAE != null ? `検証MAE ${j.valMAE}` : (j.trainMAE != null ? `学習MAE ${j.trainMAE}` : '—'))
+                          : (j.policyAgreement != null
+                            ? `${j.valAgreement != null ? '検証' : ''}一致率 ${Math.round(j.policyAgreement * 100)}%` : '—')}
+                        {j.nVal > 0 ? ` (検証${j.nVal}行)` : ''}
+                        {j.chunkSize > 1 ? ` · chunk ${j.chunkSize}` : ''}
                         {j.error && <span style={{ color: 'var(--red)' }}> · {j.error}</span>}
                       </div>
                     </div>
@@ -4087,6 +4451,8 @@ function RLView({ showToast }) {
           </div>
         </div>
       </div>
+      </>
+      )}
 
       {showTrain && (
         <RLTrainDialog
@@ -4097,6 +4463,648 @@ function RLView({ showToast }) {
           showToast={showToast}
         />
       )}
+      {showDataset && (
+        <RLDatasetDialog
+          onClose={() => setShowDataset(false)}
+          onCreated={(name) => { loadRlDatasets(); loadTables(); appendLog(`🎬 経験ログ用テーブルを作成: ${name}`); }}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── 🌍 世界モデル (V-JEPA 2-AC) パネル ───
+// 経験ログから「行動で観測がどう変わるか」を学習し、ゴール画像を渡すだけで
+// CEM が行動系列を探索する。デモの真似 (BC) と違い、タスク変更に再学習が要らない。
+function WorldModelPanel({ datasets, running, showToast, appendLog }) {
+  const [models, setModels] = useState([]);
+  const [showTrain, setShowTrain] = useState(false);
+  const [chartFor, setChartFor] = useState(null);
+  // 計画テスト用フォーム
+  const [planFor, setPlanFor] = useState(null);
+  const [planForm, setPlanForm] = useState({ framePath: '', goalPath: '', horizon: 8, samples: 256, iterations: 4 });
+  const [planResult, setPlanResult] = useState(null);
+  const [planBusy, setPlanBusy] = useState(false);
+
+  async function load() {
+    try {
+      const r = await fetch('/ml/rl/ac/models');
+      const d = r.ok ? await r.json() : {};
+      setModels(d.models || []);
+    } catch {}
+  }
+  useEffect(() => { load(); const t = setInterval(load, 5000); return () => clearInterval(t); }, []);
+
+  async function deleteModel(name) {
+    if (!window.confirm(`世界モデル「${name}」を削除します。よろしいですか？`)) return;
+    try {
+      const r = await fetch(`/ml/rl/ac/models/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      showToast(`削除しました: ${name}`, 'success');
+      if (planFor === name) setPlanFor(null);
+      load();
+    } catch (e) { showToast(`削除失敗: ${e.message}`, 'error'); }
+  }
+
+  async function runPlan() {
+    if (!planForm.framePath || !planForm.goalPath) {
+      showToast('現在の観測とゴールのパスを入力してください (uploads からの相対パス)', 'error'); return;
+    }
+    setPlanBusy(true); setPlanResult(null);
+    try {
+      const r = await fetch(`/ml/rl/ac/models/${encodeURIComponent(planFor)}/plan`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(planForm),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      setPlanResult(d);
+      appendLog(`🌍 計画 ${planFor}: 1手目=${JSON.stringify(d.firstAction)} · 距離 ${d.initialDistance} → ${d.predictedFinalDistance} (予測)`);
+    } catch (e) { showToast(`計画失敗: ${e.message}`, 'error'); appendLog(`❌ 計画失敗: ${e.message}`); }
+    finally { setPlanBusy(false); }
+  }
+
+  const fmtR = (v) => (v == null ? '—' : `${v}x`);
+  return (
+    <>
+      <div className="toolbar">
+        <button className="btn primary" onClick={() => setShowTrain(true)} disabled={!!running}>
+          ➕ 世界モデルを学習
+        </button>
+        {running && <span style={{ background: 'var(--orange-dim)', color: 'var(--orange)',
+          padding: '4px 10px', borderRadius: 10, fontSize: 12, fontFamily: 'var(--font-mono)' }}>
+          ⚙️ 学習中: {running.name}</span>}
+      </div>
+
+      <div className="ml-layout">
+        <div className="ml-table-list">
+          {models.length === 0 ? (
+            <div className="empty-state">
+              世界モデルがありません。<br />
+              経験ログを溜めてから「➕ 世界モデルを学習」で作成します。<br /><br />
+              <span style={{ fontSize: 12 }}>
+                世界モデルは「行動で観測がどう変わるか」を学習し、<br />
+                <b>ゴール画像を渡すだけ</b>で行動系列を探索できます。<br />
+                BC と違い、タスクを変えても再学習は不要です。
+              </span>
+            </div>
+          ) : models.map(m => (
+            <div key={m.name} className="ml-table-item" style={{ position: 'relative' }}>
+              <button className="ml-model-delete-btn" disabled={!!running}
+                onClick={(e) => { e.stopPropagation(); deleteModel(m.name); }}>×</button>
+              <div className="ml-table-name" style={{ paddingRight: 24 }}>🌍 {m.name}</div>
+              <div className="ml-table-meta">
+                {m.tableName} | {m.actionType === 'continuous'
+                  ? `連続 (${(m.actionColumns || []).join(', ')})`
+                  : `離散 ${(m.actionClasses || []).length}種`} | k={m.rolloutK}
+              </div>
+              {m.metrics && (
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4, fontFamily: 'var(--font-mono)' }}>
+                  改善比 {fmtR(m.metrics.improveRatio)} · 行動感度 {fmtR(m.metrics.actionSensitivity)}
+                  {!m.metrics.hasVal && ' (検証なし)'}
+                  {m.metrics.improveRatio != null && m.metrics.improveRatio < 1.1 &&
+                    <b style={{ color: 'var(--orange)' }}> ⚠ 恒等並み</b>}
+                  {m.metrics.actionSensitivity != null && m.metrics.actionSensitivity < 1.1 &&
+                    <b style={{ color: 'var(--red, #e55)' }}> ⚠ 行動を無視</b>}
+                </div>
+              )}
+              <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
+                <button className="btn small" onClick={() => { setChartFor(chartFor?.name === m.name ? null : { name: m.name, metrics: m.metrics }); setPlanFor(null); }}>📈 学習曲線</button>
+                <button className="btn small primary" onClick={() => { setPlanFor(planFor === m.name ? null : m.name); setChartFor(null); setPlanResult(null); }}>🎯 計画を試す</button>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="ml-table-detail">
+          {chartFor && chartFor.metrics && (
+            <div className="rl-panel">
+              <div className="rl-panel-title">📈 学習曲線: {chartFor.name}
+                <button className="btn small" style={{ float: 'right' }} onClick={() => setChartFor(null)}>✕ 閉じる</button>
+              </div>
+              <LossChart metrics={chartFor.metrics} />
+              <div className="rl-agent-meta" style={{ marginTop: 8 }}>
+                1ステップMSE <b>{chartFor.metrics.val1StepMSE ?? '—'}</b>（恒等 {chartFor.metrics.identityMSE ?? '—'}）·
+                改善比 <b>{fmtR(chartFor.metrics.improveRatio)}</b> ·
+                行動感度 <b>{fmtR(chartFor.metrics.actionSensitivity)}</b> ·
+                {chartFor.metrics.nTransitions} 遷移 · {chartFor.metrics.elapsedSec}秒
+              </div>
+              <div className="field-hint" style={{ marginTop: 6 }}>
+                <b>改善比</b> = 恒等ベースライン（何も動かないと予測）÷ モデルの誤差。1.0x を超えなければ何も学習していません。<br />
+                <b>行動感度</b> = 行動をシャッフルした時の誤差 ÷ 本来の誤差。1.0x 付近なら行動を無視しており、計画には使えません。
+              </div>
+            </div>
+          )}
+
+          {planFor && (
+            <div className="rl-panel">
+              <div className="rl-panel-title">🎯 計画を試す: {planFor}
+                <button className="btn small" style={{ float: 'right' }} onClick={() => setPlanFor(null)}>✕ 閉じる</button>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                <div className="field"><label className="field-label">現在の観測 (uploads相対パス)</label>
+                  <input className="input" value={planForm.framePath}
+                    onChange={e => setPlanForm(f => ({ ...f, framePath: e.target.value }))}
+                    placeholder="rl_datasets/robot_demos/ep001/0000.png" /></div>
+                <div className="field"><label className="field-label">ゴール画像 (uploads相対パス)</label>
+                  <input className="input" value={planForm.goalPath}
+                    onChange={e => setPlanForm(f => ({ ...f, goalPath: e.target.value }))}
+                    placeholder="goals/target.png" /></div>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+                <div className="field"><label className="field-label">ホライズン (何手先)</label>
+                  <input className="input" type="number" min="1" max="32" value={planForm.horizon}
+                    onChange={e => setPlanForm(f => ({ ...f, horizon: parseInt(e.target.value) || 8 }))} /></div>
+                <div className="field"><label className="field-label">候補数</label>
+                  <input className="input" type="number" min="16" max="2048" value={planForm.samples}
+                    onChange={e => setPlanForm(f => ({ ...f, samples: parseInt(e.target.value) || 256 }))} /></div>
+                <div className="field"><label className="field-label">反復回数</label>
+                  <input className="input" type="number" min="1" max="16" value={planForm.iterations}
+                    onChange={e => setPlanForm(f => ({ ...f, iterations: parseInt(e.target.value) || 4 }))} /></div>
+              </div>
+              <button className="btn primary" onClick={runPlan} disabled={planBusy}>
+                {planBusy ? '⏳ 探索中...' : '🎯 行動系列を探索'}
+              </button>
+              {planResult && (
+                <div className="ml-section" style={{ marginTop: 10 }}>
+                  <div className="rl-agent-meta">
+                    潜在距離: <b>{planResult.initialDistance}</b> → <b>{planResult.predictedFinalDistance}</b> (予測) ·
+                    エンコード {planResult.encodeSec}s · 探索 {planResult.planSec}s
+                    {planResult.predictedFinalDistance >= planResult.initialDistance &&
+                      <b style={{ color: 'var(--orange)' }}> ⚠ 近づく系列を見つけられていません</b>}
+                  </div>
+                  <div className="rl-panel-title" style={{ fontSize: 12, marginTop: 8 }}>行動系列 (先頭から実行)</div>
+                  <div className="rl-sample-wrap">
+                    <table className="rl-sample-table">
+                      <thead><tr><th>#</th><th>行動</th></tr></thead>
+                      <tbody>
+                        {planResult.actions.map((a, i) => (
+                          <tr key={i} style={i === 0 ? { fontWeight: 600 } : {}}>
+                            <td>{i + 1}{i === 0 ? ' ★' : ''}</td>
+                            <td style={{ fontFamily: 'var(--font-mono)' }}>
+                              {typeof a === 'string' ? a : Object.entries(a).map(([k, v]) => `${k}=${v}`).join(', ')}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="field-hint">
+                    MPC として使う場合は★の1手だけ実行し、新しい観測で再度計画します。
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {!chartFor && !planFor && (
+            <div className="empty-state">
+              ← モデルの「📈 学習曲線」か「🎯 計画を試す」を選択してください
+            </div>
+          )}
+        </div>
+      </div>
+
+      {showTrain && (
+        <WorldModelTrainDialog
+          datasets={datasets}
+          onClose={() => setShowTrain(false)}
+          onStarted={() => { setShowTrain(false); appendLog('🌍 世界モデルの学習を開始'); }}
+          showToast={showToast}
+        />
+      )}
+    </>
+  );
+}
+
+// ─── 🌍 世界モデルの学習ダイアログ ───
+function WorldModelTrainDialog({ datasets, onClose, onStarted, showToast }) {
+  const first = datasets[0] || null;
+  const [form, setForm] = useState({
+    name: 'world_model',
+    table: first?.name || '',
+    actionType: first?.rl?.actionType === 'continuous' ? 'continuous' : 'discrete',
+    actionColumn: 'action',
+    actionColumns: (first?.rl?.actionColumns || []).join(', '),
+    epochs: 200, rolloutK: 3, hiddenSize: 1024, valSplit: 0.2,
+  });
+  const [busy, setBusy] = useState(false);
+  const upd = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  // テーブルを選んだら、経験ログの定義から行動仕様を引き継ぐ
+  function pickTable(name) {
+    const d = datasets.find(x => x.name === name);
+    setForm(f => ({
+      ...f, table: name,
+      actionType: d?.rl?.actionType === 'continuous' ? 'continuous' : 'discrete',
+      actionColumns: (d?.rl?.actionColumns || []).join(', ') || f.actionColumns,
+    }));
+  }
+
+  async function start() {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(form.name)) { showToast('モデル名が無効です', 'error'); return; }
+    if (!form.table) { showToast('テーブルを選択してください', 'error'); return; }
+    const payload = {
+      name: form.name, table: form.table,
+      actionType: form.actionType,
+      epochs: form.epochs, rolloutK: form.rolloutK,
+      hiddenSize: form.hiddenSize, valSplit: form.valSplit,
+    };
+    if (form.actionType === 'continuous') {
+      payload.actionColumns = form.actionColumns.split(',').map(c => c.trim()).filter(Boolean);
+      if (payload.actionColumns.length === 0) { showToast('行動カラムを入力してください', 'error'); return; }
+    } else {
+      payload.actionColumn = form.actionColumn || 'action';
+    }
+    setBusy(true);
+    try {
+      const r = await fetch('/ml/rl/ac/train', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      showToast(`学習開始: ${form.name}`, 'success');
+      onStarted();
+    } catch (e) { showToast(`開始失敗: ${e.message}`, 'error'); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 640 }}>
+        <div className="modal-header">
+          <div className="modal-title">🌍 世界モデルを学習 (V-JEPA 2-AC)</div>
+          <button className="modal-close" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          <div className="field-hint" style={{ marginBottom: 10 }}>
+            経験ログの「観測 → 行動 → 次の観測」から、<b>行動で観測がどう変わるか</b>を学習します。
+            成功デモである必要はなく、<b>雑な操作ログでも学習できます</b>（力学を学ぶため）。
+            学習後は「🎯 計画を試す」でゴール画像を渡すと行動系列を探索できます。
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div className="field"><label className="field-label">モデル名</label>
+              <input className="input" value={form.name} onChange={e => upd('name', e.target.value)} /></div>
+            <div className="field"><label className="field-label">経験ログテーブル</label>
+              <select className="select" value={form.table} onChange={e => pickTable(e.target.value)}>
+                <option value="">— 選択 —</option>
+                {datasets.map(d => <option key={d.name} value={d.name}>{d.name} ({d.rowCount}行 / {d.episodes}エピソード)</option>)}
+              </select></div>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div className="field"><label className="field-label">行動の種類</label>
+              <select className="select" value={form.actionType} onChange={e => upd('actionType', e.target.value)}>
+                <option value="discrete">離散</option>
+                <option value="continuous">連続</option>
+              </select></div>
+            {form.actionType === 'continuous' ? (
+              <div className="field"><label className="field-label">行動カラム (カンマ区切り)</label>
+                <input className="input" value={form.actionColumns} onChange={e => upd('actionColumns', e.target.value)}
+                  placeholder="dx, dy" /></div>
+            ) : (
+              <div className="field"><label className="field-label">行動カラム</label>
+                <input className="input" value={form.actionColumn} onChange={e => upd('actionColumn', e.target.value)} /></div>
+            )}
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 12 }}>
+            <div className="field"><label className="field-label">エポック数</label>
+              <input className="input" type="number" min="10" max="5000" value={form.epochs}
+                onChange={e => upd('epochs', parseInt(e.target.value) || 200)} /></div>
+            <div className="field"><label className="field-label">ロールアウト k</label>
+              <input className="input" type="number" min="1" max="16" value={form.rolloutK}
+                onChange={e => upd('rolloutK', parseInt(e.target.value) || 3)} /></div>
+            <div className="field"><label className="field-label">隠れ層</label>
+              <input className="input" type="number" min="64" max="4096" value={form.hiddenSize}
+                onChange={e => upd('hiddenSize', parseInt(e.target.value) || 1024)} /></div>
+            <div className="field"><label className="field-label">検証割合</label>
+              <input className="input" type="number" step="0.05" min="0" max="0.5" value={form.valSplit}
+                onChange={e => upd('valSplit', parseFloat(e.target.value) || 0)} /></div>
+          </div>
+          <div className="field-hint">
+            ロールアウト k は「学習中に自分の予測で何手先まで転がすか」。1 だと計画時の多段予測で誤差が
+            爆発しやすいので、3 前後を推奨。エピソードカラム / ステップカラム / 観測カラムは
+            経験ログの標準列 (episode / step / frame) を自動で使います。
+          </div>
+        </div>
+        <div className="modal-footer">
+          <button className="btn" onClick={onClose} disabled={busy}>キャンセル</button>
+          <button className="btn primary" onClick={start} disabled={busy}>▶ 学習を開始</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── 🎬 経験ログのデータテーブル一覧 (モデル学習の「データテーブル」と同じ2ペイン構成) ───
+// 左に一覧、右にスキーマ+プレビュー。詳細は共通の TableDetailView を使い回して
+// モデル学習タブと見た目・操作感を揃える。RL 固有の情報 (エピソード) だけ上に足す。
+function RLDatasetsPanel({ datasets, onCreate, onReload, onDeleteEpisode, onSetKind, onQueryHere, showToast }) {
+  const [selected, setSelected] = useState(null);
+  const [schema, setSchema] = useState(null);
+  const [preview, setPreview] = useState([]);
+  const [episodes, setEpisodes] = useState([]);
+
+  async function select(name) {
+    setSelected(name); setSchema(null); setPreview([]); setEpisodes([]);
+    try {
+      const [s, p] = await Promise.all([
+        fetch(`/ml/datasets/${encodeURIComponent(name)}/schema`).then(r => r.json()),
+        fetch(`/ml/datasets/${encodeURIComponent(name)}/preview?limit=50`).then(r => r.json()),
+      ]);
+      setSchema(s); setPreview(p.rows || []);
+      // エピソードごとの行数。episode 列が無い表 (CSVから移した等) では空になる
+      try {
+        const q = await fetch('/ml/query', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sql: `SELECT episode, COUNT(*) AS steps, MAX(done) AS finished FROM "${name}" GROUP BY episode ORDER BY episode`,
+            limit: 500,
+          }),
+        }).then(r => r.json());
+        setEpisodes(q.rows || []);
+      } catch {}
+    } catch (e) { showToast(`詳細取得失敗: ${e.message}`, 'error'); }
+  }
+
+  async function deleteTable(name) {
+    if (!window.confirm(`テーブル「${name}」を削除します。よろしいですか？`)) return;
+    try {
+      const r = await fetch(`/ml/datasets/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      showToast(`削除しました: ${name}`, 'success');
+      setSelected(null); onReload();
+    } catch (e) { showToast(`削除失敗: ${e.message}`, 'error'); }
+  }
+
+  return (
+    <>
+      <div className="toolbar">
+        <button className="btn primary" onClick={onCreate}>🎬 テーブルを作成 (経験ログ)</button>
+        <button className="btn" onClick={onReload}>🔄 更新</button>
+      </div>
+
+      <div className="ml-layout">
+        <div className="ml-table-list">
+          {datasets.length === 0 ? (
+            <div className="empty-state">
+              経験ログ用のテーブルがありません。<br />
+              「🎬 テーブルを作成 (経験ログ)」から開始してください。<br /><br />
+              <span style={{ fontSize: 12 }}>
+                既にモデル学習タブに経験ログがある場合は、そちらの<br />
+                「🎮 強化学習用に移す」でこちらに移動できます。
+              </span>
+            </div>
+          ) : datasets.map(d => (
+            <div key={d.name}
+              className={`ml-table-item ${selected === d.name ? 'selected' : ''}`}
+              onClick={() => select(d.name)}>
+              <div className="ml-table-name">🎬 {d.name}{d.rl?.useObservation ? ' 👁' : ''}</div>
+              <div className="ml-table-meta">
+                {(d.rowCount || 0).toLocaleString()} 行 / {d.episodes || 0} エピソード
+                {d.rl?.actionType === 'continuous' ? ' · 連続行動' : ' · 離散行動'}
+              </div>
+              {d.description && <div className="ml-table-desc">{d.description}</div>}
+              {d.lastRecordedAt && (
+                <div className="ml-table-desc" style={{ fontSize: 11 }}>
+                  最終記録: {String(d.lastRecordedAt).slice(0, 19)}
+                </div>
+              )}
+              <button className="btn small" style={{ marginTop: 6 }}
+                onClick={(e) => { e.stopPropagation(); onSetKind(d.name, 'ml'); }}
+                title="モデル学習タブの一覧に戻します (データはそのまま)">📊 モデル学習用に戻す</button>
+            </div>
+          ))}
+        </div>
+
+        <div className="ml-table-detail">
+          {selected ? (
+            <>
+              {episodes.length > 0 && (
+                <div className="ml-section">
+                  <div className="rl-panel-title" style={{ fontSize: 12 }}>
+                    エピソード ({episodes.length}本)
+                  </div>
+                  <div className="rl-sample-wrap" style={{ maxHeight: 220 }}>
+                    <table className="rl-sample-table">
+                      <thead><tr><th>エピソード</th><th>ステップ数</th><th>終端</th><th></th></tr></thead>
+                      <tbody>
+                        {episodes.map(e => (
+                          <tr key={String(e.episode)}>
+                            <td>{String(e.episode)}</td>
+                            <td style={{ fontFamily: 'var(--font-mono)' }}>{Number(e.steps)}</td>
+                            <td>{Number(e.finished) === 1 ? '✓' : '—'}</td>
+                            <td>
+                              <button className="btn small danger"
+                                onClick={() => onDeleteEpisode(selected, String(e.episode), () => select(selected))}>
+                                🗑
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="field-hint">
+                    「終端」が付いていないエピソードは <code>done</code> が立っていません
+                    （記録時に <code>finishEpisode: true</code> を付けると立ちます）。
+                  </div>
+                </div>
+              )}
+              <TableDetailView
+                name={selected}
+                schema={schema}
+                preview={preview}
+                onDelete={() => deleteTable(selected)}
+                onQueryHere={() => onQueryHere(selected)}
+              />
+            </>
+          ) : (
+            <div className="empty-state">← 左のテーブルを選択してください</div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ─── 🎬 経験ログ用データテーブルの作成 / 記録方法の案内 ───
+// 表データの取り込みは「手元にCSVがある」前提だが、強化学習は「これから溜める」ことが多い。
+// RL 用のスキーマを持った表を作り、外部プログラムから記録するための導線をここに置く。
+function RLDatasetDialog({ onClose, onCreated, showToast }) {
+  const [form, setForm] = useState({
+    tableName: 'robot_demos',
+    actionType: 'discrete',
+    actionColumns: 'dx, dy',
+    stateColumns: '',
+    useObservation: true,
+    useReward: false,
+    description: '',
+  });
+  const [busy, setBusy] = useState(false);
+  const [created, setCreated] = useState(null);   // 作成後にサンプルコードを出す対象
+  const upd = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const parseCols = (s) => s.split(',').map(c => c.trim()).filter(Boolean);
+
+  async function create() {
+    if (!/^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(form.tableName)) {
+      showToast('テーブル名は英字で始まり、英数字とアンダースコアのみ', 'error'); return;
+    }
+    const stateColumns = parseCols(form.stateColumns).map(n => ({ name: n, type: 'numeric' }));
+    const actionColumns = parseCols(form.actionColumns);
+    if (form.actionType === 'continuous' && actionColumns.length === 0) {
+      showToast('連続行動では行動カラムを1つ以上入れてください', 'error'); return;
+    }
+    if (stateColumns.length === 0 && !form.useObservation) {
+      showToast('状態カラムか観測のどちらかは必要です', 'error'); return;
+    }
+    setBusy(true);
+    try {
+      const r = await fetch('/ml/rl/datasets/create', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tableName: form.tableName, actionType: form.actionType,
+          actionColumns, stateColumns,
+          useObservation: form.useObservation, useReward: form.useReward,
+          description: form.description,
+        }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      showToast(`テーブルを作成しました: ${form.tableName}`, 'success');
+      setCreated({ name: form.tableName, ...form, stateColumns, actionColumns });
+      onCreated(form.tableName);
+    } catch (e) { showToast(`作成失敗: ${e.message}`, 'error'); }
+    finally { setBusy(false); }
+  }
+
+  // 記録用のサンプルコード。作成直後のスキーマに合わせて出す
+  const sample = (() => {
+    const t = created || { name: form.tableName, ...form,
+      stateColumns: parseCols(form.stateColumns).map(n => ({ name: n })),
+      actionColumns: parseCols(form.actionColumns) };
+    const stateLine = t.stateColumns.length
+      ? `        "state": {${t.stateColumns.map(c => `"${c.name}": 0.0`).join(', ')}},\n` : '';
+    const obsLine = t.useObservation
+      ? '        "frames": [b64(frame)],          # 直近フレーム(複数可)。1枚なら静止画扱い\n' : '';
+    const actLine = t.actionType === 'continuous'
+      ? `        "actionVector": {${t.actionColumns.map(c => `"${c}": 0.0`).join(', ')}},`
+      : '        "action": "grasp",';
+    const rewardLine = t.useReward ? '\n        "reward": 1.0,' : '';
+    return `import base64, requests
+
+BASE = "${window.location.origin}"
+H = {"Authorization": "Bearer <ml:write のトークン>"}
+
+def b64(path):
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+# 1エピソード分をまとめて送る (1ステップずつ送っても構いません)
+steps = []
+for frame, action in my_demo:          # ← あなたの収集ループ
+    steps.append({
+${stateLine}${obsLine}${actLine}${rewardLine}
+    })
+
+r = requests.post(f"{BASE}/ml/rl/datasets/record", headers=H, json={
+    "table": "${t.name}",
+    "episode": "ep001",                # エピソードごとに変える
+    "steps": steps,
+    "finishEpisode": True,             # 最後の step の done を 1 にする
+})
+print(r.json())`;
+  })();
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 760 }}>
+        <div className="modal-header">
+          <div className="modal-title">🎬 経験ログ用データテーブル</div>
+          <button className="modal-close" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          <div className="field-hint" style={{ marginBottom: 12 }}>
+            ロボット・ゲーム・シミュレータから <b>「状態・行動・報酬・観測」を1ステップずつ送って溜める</b>ための表を作ります。
+            観測（カメラ画像）は記録と同じリクエストでアップロードでき、<code>uploads/rl_datasets/</code> 配下に保存されて
+            そのパスが行に埋まります。溜まったらそのまま「➕ エージェントを新規作成」で学習できます。
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div className="field">
+              <label className="field-label">テーブル名</label>
+              <input className="input" value={form.tableName} onChange={e => upd('tableName', e.target.value)} />
+            </div>
+            <div className="field">
+              <label className="field-label">行動の種類</label>
+              <select className="select" value={form.actionType} onChange={e => upd('actionType', e.target.value)}>
+                <option value="discrete">離散 — ラベル1列 (grasp / release など)</option>
+                <option value="continuous">連続 — 数値の複数列 (関節角など)</option>
+              </select>
+            </div>
+          </div>
+
+          {form.actionType === 'continuous' && (
+            <div className="field">
+              <label className="field-label">行動カラム (カンマ区切り)</label>
+              <input className="input" value={form.actionColumns} onChange={e => upd('actionColumns', e.target.value)}
+                placeholder="dx, dy, gripper" />
+            </div>
+          )}
+
+          <div className="field">
+            <label className="field-label">状態カラム (カンマ区切り・任意)</label>
+            <input className="input" value={form.stateColumns} onChange={e => upd('stateColumns', e.target.value)}
+              placeholder="joint1, joint2, gripper_pos" />
+            <span className="field-hint">
+              関節角やセンサ値など、画像以外の数値。観測だけで学習するなら空でも構いません。
+            </span>
+          </div>
+
+          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 12 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+              <input type="checkbox" checked={form.useObservation}
+                onChange={e => upd('useObservation', e.target.checked)} />
+              👁 観測カラムを作る (カメラ画像を記録する)
+            </label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+              <input type="checkbox" checked={form.useReward}
+                onChange={e => upd('useReward', e.target.checked)} />
+              報酬カラムを作る (BC だけなら不要)
+            </label>
+          </div>
+
+          <div className="field">
+            <label className="field-label">説明 (任意)</label>
+            <input className="input" value={form.description} onChange={e => upd('description', e.target.value)} />
+          </div>
+
+          <div className="field">
+            <label className="field-label">
+              {created ? `✅ 記録用のサンプルコード (${created.name})` : '記録用のサンプルコード (作成後にこの形で送ります)'}
+            </label>
+            <pre style={{
+              background: 'var(--bg-tertiary)', border: '1px solid var(--border)', borderRadius: 4,
+              padding: 10, fontSize: 11, overflowX: 'auto', maxHeight: 300, margin: 0,
+              fontFamily: 'var(--font-mono)', whiteSpace: 'pre',
+            }}>{sample}</pre>
+            <span className="field-hint">
+              トークンは「📡 API」タブで生成できます。<code>step</code> は指定しなくても、同じエピソードの続きに自動で振られます。
+              1リクエストあたり最大200ステップなので、長いエピソードは分割して送ってください。
+            </span>
+          </div>
+        </div>
+        <div className="modal-footer">
+          <button className="btn" onClick={onClose} disabled={busy}>{created ? '閉じる' : 'キャンセル'}</button>
+          <button className="btn primary" onClick={create} disabled={busy || !!created}>
+            {created ? '✅ 作成済み' : '🎬 テーブルを作成'}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -4110,11 +5118,39 @@ function RLTrainDialog({ tables, algos, onClose, onStarted, showToast }) {
   const [tableCols, setTableCols] = useState([]);
   const [dsForm, setDsForm] = useState({
     table: '', stateColumns: [], actionColumn: '', rewardColumn: '', nextStateColumns: [], doneColumn: '',
+    videoColumn: '', nextVideoColumn: '',
+    // Phase 2: BC 拡張 (連続行動・行動チャンキング・検証分割)
+    actionType: 'discrete', actionColumns: [], chunkSize: 1,
+    episodeColumn: '', stepColumn: '', valSplit: 0.2,
+  });
+  // V-JEPA 2 (視覚エンコーダ) の設定。videoColumn を選んだときだけ使う
+  const [vjForm, setVjForm] = useState({
+    modelId: 'facebook/vjepa2-vitl-fpc64-256', frames: 16, stride: 4, pooling: 'mean',
   });
   const [busy, setBusy] = useState(false);
+  // 既定では強化学習用のテーブルだけを候補に出す (モデル学習用と混ざらないように)
+  const [showAllTables, setShowAllTables] = useState(false);
+  const mlTableCount = tables.filter(t => (t.kind || 'ml') === 'ml').length;
+  const visibleTables = showAllTables ? tables : tables.filter(t => t.kind === 'rl');
 
   function upd(k, v) { setForm(f => ({ ...f, [k]: v })); }
   function dsUpd(k, v) { setDsForm(f => ({ ...f, [k]: v })); }
+  function vjUpd(k, v) { setVjForm(f => ({ ...f, [k]: v })); }
+  // 観測を使うと状態が 1024 次元級になるので、隠れ層が既定の128のままだと明らかに細い
+  function setVideoColumn(v) {
+    setDsForm(f => ({ ...f, videoColumn: v, nextVideoColumn: v ? f.nextVideoColumn : '' }));
+    if (v) setForm(f => (f.hiddenSize < 256 ? { ...f, hiddenSize: 512 } : f));
+  }
+  // 遷移ベースになる条件 (rl_runner.load_dataset_for_train と同じ判定)。
+  // 視覚を使う場合は「表側も視覚側も次状態が揃っている」ことが条件。
+  function isTransitionMode() {
+    const tabNextOk = dsForm.nextStateColumns.length > 0
+      && dsForm.nextStateColumns.length === dsForm.stateColumns.length;
+    if (dsForm.videoColumn) {
+      return !!dsForm.nextVideoColumn && (dsForm.stateColumns.length === 0 || tabNextOk);
+    }
+    return tabNextOk;
+  }
   function toggleCol(key, col) {
     setDsForm(f => {
       const arr = f[key].includes(col) ? f[key].filter(c => c !== col) : [...f[key], col];
@@ -4137,9 +5173,23 @@ function RLTrainDialog({ tables, algos, onClose, onStarted, showToast }) {
       showToast('エージェント名は英数字・ハイフン・アンダースコア (1〜64文字)', 'error'); return;
     }
     if (!dsForm.table) { showToast('テーブルを選択してください', 'error'); return; }
-    if (dsForm.stateColumns.length === 0) { showToast('状態(特徴量)カラムを1つ以上選んでください', 'error'); return; }
-    if (!dsForm.actionColumn) { showToast('行動カラムを選んでください', 'error'); return; }
-    if (!dsForm.rewardColumn) { showToast('報酬カラムを選んでください', 'error'); return; }
+    if (dsForm.stateColumns.length === 0 && !dsForm.videoColumn) {
+      showToast('状態カラムを1つ以上選ぶか、観測カラム (動画/画像) を指定してください', 'error'); return;
+    }
+    const isBC = form.algo === 'bc';
+    const isCont = isBC && dsForm.actionType === 'continuous';
+    if (isCont) {
+      if (dsForm.actionColumns.length === 0) {
+        showToast('行動カラム (数値・複数可) を1つ以上選んでください', 'error'); return;
+      }
+    } else if (!dsForm.actionColumn) { showToast('行動カラムを選んでください', 'error'); return; }
+    // 報酬は BC のときだけ省略できる (模倣用のデモには報酬が無いことが多い)
+    if (!dsForm.rewardColumn && !isBC) {
+      showToast('報酬カラムを選んでください (省略できるのは Behavior Cloning のときだけです)', 'error'); return;
+    }
+    if (isBC && dsForm.chunkSize > 1 && !dsForm.episodeColumn) {
+      showToast('行動チャンキングにはエピソードカラムが必要です', 'error'); return;
+    }
     if (dsForm.nextStateColumns.length > 0 && dsForm.nextStateColumns.length !== dsForm.stateColumns.length) {
       showToast('次状態カラムは状態カラムと同数で選んでください (遷移ベース)', 'error'); return;
     }
@@ -4148,9 +5198,22 @@ function RLTrainDialog({ tables, algos, onClose, onStarted, showToast }) {
       episodes: form.episodes, hiddenSize: form.hiddenSize, learningRate: form.learningRate,
       gamma: form.gamma, batchSize: form.batchSize, cqlAlpha: form.cqlAlpha,
       table: dsForm.table, stateColumns: dsForm.stateColumns,
-      actionColumn: dsForm.actionColumn, rewardColumn: dsForm.rewardColumn,
+      actionColumn: dsForm.actionColumn, rewardColumn: dsForm.rewardColumn || undefined,
       nextStateColumns: dsForm.nextStateColumns, doneColumn: dsForm.doneColumn || undefined,
+      episodeColumn: dsForm.episodeColumn || undefined,
+      stepColumn: dsForm.stepColumn || undefined,
+      valSplit: dsForm.valSplit,
     };
+    if (isBC) {
+      payload.actionType = dsForm.actionType;
+      payload.chunkSize = dsForm.chunkSize;
+      if (isCont) payload.actionColumns = dsForm.actionColumns;
+    }
+    if (dsForm.videoColumn) {
+      payload.videoColumn = dsForm.videoColumn;
+      payload.nextVideoColumn = dsForm.nextVideoColumn || undefined;
+      payload.vjepa2 = vjForm;
+    }
     setBusy(true);
     try {
       const r = await fetch('/ml/rl/train', {
@@ -4180,14 +5243,40 @@ function RLTrainDialog({ tables, algos, onClose, onStarted, showToast }) {
               <span className="field-hint">英数字・ハイフン・アンダースコア、最大64文字。</span>
             </div>
             <div className="field">
-              <label className="field-label">データテーブル</label>
+              <label className="field-label">データテーブル (強化学習用)</label>
               <select className="select" value={dsForm.table}
                 onChange={e => { loadTableCols(e.target.value);
-                  setDsForm({ table: e.target.value, stateColumns: [], actionColumn: '', rewardColumn: '', nextStateColumns: [], doneColumn: '' }); }}>
+                  setDsForm(f => ({ ...f, table: e.target.value, stateColumns: [], actionColumn: '', rewardColumn: '',
+                    nextStateColumns: [], doneColumn: '', videoColumn: '', nextVideoColumn: '',
+                    actionColumns: [], episodeColumn: '', stepColumn: '' })); }}>
                 <option value="">— 選択 —</option>
-                {tables.map(t => <option key={t.name} value={t.name}>{t.name} ({(t.rowCount || 0).toLocaleString()}行)</option>)}
+                {visibleTables.map(t => (
+                  <option key={t.name} value={t.name}>
+                    {t.kind === 'ml' ? '📊 ' : ''}{t.name} ({(t.rowCount || 0).toLocaleString()}行)
+                  </option>
+                ))}
               </select>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, marginTop: 6 }}>
+                <input type="checkbox" checked={showAllTables} onChange={e => setShowAllTables(e.target.checked)} />
+                モデル学習用のテーブルも表示 ({mlTableCount}件)
+              </label>
+              {visibleTables.length === 0 && (
+                <span className="field-hint">
+                  強化学習用のテーブルがありません。「🎬 データテーブルを作成 (経験ログ)」で作るか、
+                  上のチェックでモデル学習用のテーブルから選んでください。
+                </span>
+              )}
             </div>
+          </div>
+
+          {/* アルゴリズムは列マッピングより先に選ぶ (BC を選ぶと行動まわりの項目が増えるため) */}
+          <div className="field">
+            <label className="field-label">アルゴリズム</label>
+            <select className="select" value={form.algo} onChange={e => upd('algo', e.target.value)}>
+              {algos.map(a => <option key={a.name} value={a.name}>{a.label}</option>)}
+            </select>
+            {(() => { const a = algos.find(x => x.name === form.algo); return a && a.desc
+              ? <span className="field-hint">{a.desc}</span> : null; })()}
           </div>
 
           {dsForm.table && tableCols.length > 0 && (
@@ -4203,17 +5292,62 @@ function RLTrainDialog({ tables, algos, onClose, onStarted, showToast }) {
                   ))}
                 </div>
               </div>
+              {form.algo === 'bc' && (
+                <div className="field">
+                  <label className="field-label">行動の種類</label>
+                  <select className="select" value={dsForm.actionType} onChange={e => dsUpd('actionType', e.target.value)}>
+                    <option value="discrete">離散 — ラベル1列を分類 (例: grasp / release)</option>
+                    <option value="continuous">連続 — 数値の複数列を回帰 (例: 関節角・スティック入力)</option>
+                  </select>
+                </div>
+              )}
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-                <div className="field"><label className="field-label">行動カラム</label>
-                  <select className="select" value={dsForm.actionColumn} onChange={e => dsUpd('actionColumn', e.target.value)}>
-                    <option value="">— 選択 —</option>
-                    {tableCols.map(c => <option key={c} value={c}>{c}</option>)}
-                  </select></div>
-                <div className="field"><label className="field-label">報酬カラム</label>
+                {form.algo === 'bc' && dsForm.actionType === 'continuous' ? (
+                  <div className="field" style={{ gridColumn: '1 / -1' }}>
+                    <label className="field-label">行動カラム (数値・複数可)</label>
+                    <div className="rl-colpick">
+                      {tableCols.map(c => (
+                        <label key={c} className={`rl-col-chip ${dsForm.actionColumns.includes(c) ? 'on' : ''}`}>
+                          <input type="checkbox" checked={dsForm.actionColumns.includes(c)}
+                            onChange={() => toggleCol('actionColumns', c)} />{c}
+                        </label>
+                      ))}
+                    </div>
+                    <span className="field-hint">
+                      選んだ列がそのまま行動ベクトルになります。列ごとに正規化してから Huber 損失で回帰するので、
+                      スケールが違う列 (角度と開度など) が混ざっていても大丈夫です。
+                    </span>
+                  </div>
+                ) : (
+                  <div className="field"><label className="field-label">行動カラム</label>
+                    <select className="select" value={dsForm.actionColumn} onChange={e => dsUpd('actionColumn', e.target.value)}>
+                      <option value="">— 選択 —</option>
+                      {tableCols.map(c => <option key={c} value={c}>{c}</option>)}
+                    </select></div>
+                )}
+                <div className="field"><label className="field-label">
+                    報酬カラム{form.algo === 'bc' ? ' (BC では任意)' : ''}</label>
                   <select className="select" value={dsForm.rewardColumn} onChange={e => dsUpd('rewardColumn', e.target.value)}>
-                    <option value="">— 選択 —</option>
+                    <option value="">{form.algo === 'bc' ? '— なし (BC は報酬を使わない) —' : '— 選択 —'}</option>
                     {tableCols.map(c => <option key={c} value={c}>{c}</option>)}
                   </select></div>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                <div className="field"><label className="field-label">エピソードカラム (任意)</label>
+                  <select className="select" value={dsForm.episodeColumn} onChange={e => dsUpd('episodeColumn', e.target.value)}>
+                    <option value="">— なし —</option>
+                    {tableCols.map(c => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                  <span className="field-hint">
+                    1回のデモ/試行を識別する列。指定すると検証分割が<b>エピソード単位</b>になり、
+                    行動チャンキングも使えるようになります。
+                  </span></div>
+                <div className="field"><label className="field-label">ステップカラム (任意)</label>
+                  <select className="select" value={dsForm.stepColumn} onChange={e => dsUpd('stepColumn', e.target.value)}>
+                    <option value="">— なし (テーブルの行順を時間順とみなす) —</option>
+                    {tableCols.map(c => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                  <span className="field-hint">エピソード内の時刻。チャンキングの並べ替えに使います。</span></div>
               </div>
               <div className="field">
                 <label className="field-label">次状態カラム (任意・遷移ベースにする場合。状態と同数同順)</label>
@@ -4233,25 +5367,96 @@ function RLTrainDialog({ tables, algos, onClose, onStarted, showToast }) {
                   {tableCols.map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
               </div>
+
+              {/* ─── 観測 (V-JEPA 2) ─── */}
+              <div className="field">
+                <label className="field-label">👁 観測カラム (任意・動画/フレーム連番/画像のパス)</label>
+                <select className="select" value={dsForm.videoColumn} onChange={e => setVideoColumn(e.target.value)}>
+                  <option value="">— なし (表の列だけで学習) —</option>
+                  {tableCols.map(c => <option key={c} value={c}>{c}</option>)}
+                </select>
+                <span className="field-hint">
+                  指定すると、凍結した V-JEPA 2 で観測を埋め込みに変換し、状態カラムのベクトルの後ろに連結します。
+                  パスは <b>uploads フォルダからの相対パス</b> で書いてください (例: <code>demos/ep01.mp4</code>、
+                  <code>demos/ep01/</code> のようなフレーム連番ディレクトリも可)。
+                  埋め込みはキャッシュされるので、2回目以降の学習はすぐ始まります。
+                  <b>デモの模倣が目的なら、アルゴリズムに Behavior Cloning を選んでください。</b>
+                </span>
+              </div>
+              {dsForm.videoColumn && (
+                <>
+                  <div className="field">
+                    <label className="field-label">次観測カラム (任意・遷移ベースにする場合)</label>
+                    <select className="select" value={dsForm.nextVideoColumn} onChange={e => dsUpd('nextVideoColumn', e.target.value)}>
+                      <option value="">— なし —</option>
+                      {tableCols.map(c => <option key={c} value={c}>{c}</option>)}
+                    </select>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1.4fr', gap: 12 }}>
+                    <div className="field"><label className="field-label">エンコーダ</label>
+                      <select className="select" value={vjForm.modelId} onChange={e => vjUpd('modelId', e.target.value)}>
+                        <option value="facebook/vjepa2-vitl-fpc64-256">ViT-L 256 — 推奨 (0.3B / 1024次元)</option>
+                        <option value="facebook/vjepa2-vith-fpc64-256">ViT-H 256 (0.7B / 1280次元)</option>
+                        <option value="facebook/vjepa2-vitg-fpc64-256">ViT-g 256 (1B / 1408次元)</option>
+                        <option value="facebook/vjepa2-vitg-fpc64-384">ViT-g 384 — 最高精度・最重 (1B)</option>
+                      </select></div>
+                    <div className="field"><label className="field-label">フレーム数</label>
+                      <input className="input" type="number" min="2" max="128" value={vjForm.frames}
+                        onChange={e => vjUpd('frames', parseInt(e.target.value) || 0)} /></div>
+                    <div className="field"><label className="field-label">間隔</label>
+                      <input className="input" type="number" min="1" max="16" value={vjForm.stride}
+                        onChange={e => vjUpd('stride', parseInt(e.target.value) || 0)} /></div>
+                    <div className="field"><label className="field-label">プーリング</label>
+                      <select className="select" value={vjForm.pooling} onChange={e => vjUpd('pooling', e.target.value)}>
+                        <option value="mean">全体平均</option>
+                        <option value="mean_last">最終時刻のみ</option>
+                        <option value="spatial_mean">時間軸を残す</option>
+                      </select></div>
+                  </div>
+                  <div className="field-hint" style={{ marginBottom: 8 }}>
+                    末尾から {vjForm.frames} 枚を {vjForm.stride} 間隔でサンプルします
+                    (直近 {Math.max(0, (vjForm.frames - 1) * vjForm.stride) + 1} フレーム分)。
+                    フレーム数を増やすほど精度は上がりますが、エンコードは重くなります
+                    (トークン数はフレーム数に比例)。V-JEPA 2 に ViT-L より小さいモデルは無いので、
+                    VRAM が厳しいときはフレーム数を減らしてください。
+                    <br />
+                    プーリング: 「全体平均」は時間も空間も潰して {VJEPA2_HIDDEN[vjForm.modelId] || 1024} 次元。
+                    「最終時刻のみ」は直近フレームだけを見るので制御タスク向け。
+                    「時間軸を残す」は空間だけ潰して
+                    <b> {Math.max(1, Math.floor((vjForm.frames || 16) / 2))} × {VJEPA2_HIDDEN[vjForm.modelId] || 1024}
+                    = {Math.max(1, Math.floor((vjForm.frames || 16) / 2)) * (VJEPA2_HIDDEN[vjForm.modelId] || 1024)} 次元</b>
+                    になり、動きの向きや速さが効くタスクで有利ですが、キャッシュも状態次元も
+                    その分だけ大きくなります (隠れ層も大きめに)。
+                  </div>
+                </>
+              )}
+
               <div className="field-hint" style={{ marginBottom: 8 }}>
-                方式: <b>{dsForm.nextStateColumns.length > 0 ? '遷移ベース オフラインDQN' : '文脈付きバンディット'}</b>
+                方式: <b>{isTransitionMode() ? '遷移ベース オフラインDQN' : '文脈付きバンディット'}</b>
+                {dsForm.videoColumn && <> ／ 状態: <b>表の列 {dsForm.stateColumns.length} 本 + V-JEPA 2 埋め込み</b></>}
               </div>
             </>
           )}
 
-          <div className="field">
-            <label className="field-label">アルゴリズム</label>
-            <select className="select" value={form.algo} onChange={e => upd('algo', e.target.value)}>
-              {algos.map(a => <option key={a.name} value={a.name}>{a.label}</option>)}
-            </select>
-            {(() => { const a = algos.find(x => x.name === form.algo); return a && a.desc
-              ? <span className="field-hint">{a.desc}</span> : null; })()}
-          </div>
           {form.algo === 'cql' && (
             <div className="field">
               <label className="field-label">CQL の保守度 α (大きいほどログ外行動を強く抑制)</label>
               <input className="input" type="number" step="0.1" min="0" max="10" value={form.cqlAlpha}
                 onChange={e => upd('cqlAlpha', parseFloat(e.target.value) || 0)} />
+            </div>
+          )}
+          {form.algo === 'bc' && (
+            <div className="field">
+              <label className="field-label">行動チャンク長 K (1 で無効)</label>
+              <input className="input" type="number" min="1" max="64" value={dsForm.chunkSize}
+                onChange={e => dsUpd('chunkSize', Math.max(1, parseInt(e.target.value) || 1))} />
+              <span className="field-hint">
+                1つの状態から K ステップ先までの行動をまとめて予測します (ACT / π0 系の定番)。
+                1手ずつ予測して誤差が積み上がる BC の弱点が緩和され、動きが滑らかになります。
+                <b>エピソードカラムの指定が必須</b>です。推論時は先頭の1手だけ実行しても、K手まとめて実行しても構いません。
+                {dsForm.chunkSize > 1 && !dsForm.episodeColumn &&
+                  <b style={{ color: 'var(--red, #e55)' }}> ← エピソードカラムを選んでください</b>}
+              </span>
             </div>
           )}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
@@ -4270,6 +5475,17 @@ function RLTrainDialog({ tables, algos, onClose, onStarted, showToast }) {
             <div className="field"><label className="field-label">バッチサイズ</label>
               <input className="input" type="number" min="8" max="512" value={form.batchSize}
                 onChange={e => upd('batchSize', parseInt(e.target.value) || 0)} /></div>
+            <div className="field"><label className="field-label">検証データの割合</label>
+              <input className="input" type="number" step="0.05" min="0" max="0.5" value={dsForm.valSplit}
+                onChange={e => dsUpd('valSplit', Math.min(Math.max(parseFloat(e.target.value) || 0, 0), 0.5))} /></div>
+          </div>
+          <div className="field-hint" style={{ marginTop: -4 }}>
+            検証データは学習に使わず、汎化性能の測定だけに使います (0 で無効)。
+            <b>学習データ上の一致率は必ず高く出る</b>ので、これを入れないと過学習に気づけません。
+            {dsForm.episodeColumn
+              ? <> エピソードカラムがあるので<b>エピソード単位</b>で分割します。</>
+              : <> エピソードカラム未指定のため<b>行単位のランダム分割</b>になります。観測が時間的に連続するデータ
+                  (動画のフレームなど) では、ほぼ同じ画像が学習側と検証側の両方に入り、検証値が実力より良く出ます。</>}
           </div>
         </div>
         <div className="modal-footer">
@@ -4650,6 +5866,13 @@ requests.post(f"{BASE}/ml/rl/models/promo/checkpoint", headers=H)`;
             <tr><td className="mono">POST</td><td className="mono">/ml/image/detect</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>物体検出 (COCO/カスタム)</td></tr>
             <tr><td colSpan={4} style={{textAlign: 'center', background: 'var(--bg-tertiary)', padding: '4px', fontSize: 11}}>— 🎮 強化学習 (RL) —</td></tr>
             <tr><td className="mono">GET</td><td className="mono">/ml/rl/envs</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>環境・アルゴリズム一覧</td></tr>
+            <tr><td className="mono">GET</td><td className="mono">/ml/rl/datasets</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>経験ログ用テーブル一覧 (行数・エピソード数)</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/rl/datasets/create</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>経験ログ用テーブルを作成 (RLスキーマ)</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/rl/datasets/record</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td><b>経験を記録</b> (観測画像のアップロードも同時)</td></tr>
+            <tr><td className="mono">DELETE</td><td className="mono">/ml/rl/datasets/:t/episodes/:ep</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>エピソードを削除 (行+観測ファイル)</td></tr>
+            <tr><td className="mono">GET</td><td className="mono">/ml/rl/vjepa2/status</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>常駐エンコーダの状態</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/rl/vjepa2/embed</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>観測→埋め込み (paths / frames)</td></tr>
+            <tr><td className="mono">POST</td><td className="mono">/ml/rl/vjepa2/unload</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>エンコーダのVRAMを解放</td></tr>
             <tr><td className="mono">GET</td><td className="mono">/ml/rl/models</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>学習済みエージェント一覧</td></tr>
             <tr><td className="mono">POST</td><td className="mono">/ml/rl/train</td><td><span style={{color: 'var(--orange)'}}>ml:write</span></td><td>学習開始 (データテーブル)</td></tr>
             <tr><td className="mono">GET</td><td className="mono">/ml/rl/train/status</td><td><span style={{color: 'var(--accent)'}}>ml:read</span></td><td>学習状態+ログ</td></tr>
