@@ -59,6 +59,29 @@ const GOOGLE_EXPORT_OFFICE_MAP = {
   'application/vnd.google-apps.presentation': { mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', ext: 'pptx' },
 };
 
+/**
+ * VLM取り込み (OCRパイプライン) 用の PDF export マップ。
+ * テキスト export (GOOGLE_EXPORT_MAP) だと図・表・レイアウトが失われるので、
+ * 図入りの資料を永続RAGへ登録するときは PDF に変換して Vision LLM に読ませる。
+ */
+const GOOGLE_EXPORT_PDF_MAP = {
+  'application/vnd.google-apps.document':     { mimeType: 'application/pdf', ext: 'pdf' },
+  'application/vnd.google-apps.spreadsheet':  { mimeType: 'application/pdf', ext: 'pdf' },
+  'application/vnd.google-apps.presentation': { mimeType: 'application/pdf', ext: 'pdf' },
+  'application/vnd.google-apps.drawing':      { mimeType: 'application/pdf', ext: 'pdf' },
+};
+
+/**
+ * VLM取り込み (PDF化 → OCR → 永続RAG) に対応した MIME か。
+ * Google ネイティブ形式 (PDF export 可能なもの)・PDF・画像が対象。
+ */
+function isVlmImportableMime(mime) {
+  if (!mime) return false;
+  return !!GOOGLE_EXPORT_PDF_MAP[mime]
+    || mime === 'application/pdf'
+    || /^image\/(png|jpeg|webp)$/i.test(mime);
+}
+
 /** テキストとしてそのまま読める MIME か */
 function isTextualMime(mime) {
   if (!mime) return false;
@@ -722,12 +745,16 @@ function createGoogleDrive({ getConfig, baseDir, log = () => {} }) {
   /**
    * ファイル本体をダウンロードする。
    * Google ネイティブ形式は export で変換する (既定はテキスト系)。
+   * preferPdf を指定すると Docs/Slides/Sheets/図形描画を PDF で export する
+   * (VLM取り込み用。図・表・レイアウトが保たれる)。
+   * maxMB でダウンロード上限を上書きできる (OCR取り込みは googleDrive.maxDownloadMB
+   * ではなく ocr.maxUploadMB に合わせたいため)。
    * @returns {Promise<{buffer:Buffer, mimeType:string, name:string, exported:boolean, meta:object}>}
    */
-  async function downloadFile(fileIdOrName, { folderId, preferOffice = false, exportMimeType = null } = {}) {
+  async function downloadFile(fileIdOrName, { folderId, preferOffice = false, preferPdf = false, exportMimeType = null, maxMB = null } = {}) {
     assertEnabled();
     const c = cfg();
-    const maxBytes = Math.max(1, Number(c.maxDownloadMB) || 20) * 1024 * 1024;
+    const maxBytes = Math.max(1, Number(maxMB) || Number(c.maxDownloadMB) || 20) * 1024 * 1024;
 
     let fileId = await resolveFileId(fileIdOrName, folderId);
     await assertWithinRoot(fileId);
@@ -743,7 +770,9 @@ function createGoogleDrive({ getConfig, baseDir, log = () => {} }) {
       throw new Error(`「${meta.name}」はフォルダです。ファイルを指定してください`);
     }
 
-    const nativeMap = preferOffice ? { ...GOOGLE_EXPORT_MAP, ...GOOGLE_EXPORT_OFFICE_MAP } : GOOGLE_EXPORT_MAP;
+    const nativeMap = preferPdf ? { ...GOOGLE_EXPORT_MAP, ...GOOGLE_EXPORT_PDF_MAP }
+      : preferOffice ? { ...GOOGLE_EXPORT_MAP, ...GOOGLE_EXPORT_OFFICE_MAP }
+      : GOOGLE_EXPORT_MAP;
     const exportSpec = nativeMap[meta.mimeType];
 
     if (exportSpec || exportMimeType) {
@@ -958,6 +987,10 @@ function createGoogleDrive({ getConfig, baseDir, log = () => {} }) {
   /** API 応答を UI / LLM に渡しやすい形に整える */
   function simplify(f) {
     if (!f) return f;
+    // ショートカットは実体の MIME で判定する (downloadFile が実体へ辿るため)
+    const effMime = f.mimeType === 'application/vnd.google-apps.shortcut'
+      ? (f.shortcutDetails?.targetMimeType || '')
+      : f.mimeType;
     return {
       id: f.id,
       name: f.name,
@@ -970,9 +1003,12 @@ function createGoogleDrive({ getConfig, baseDir, log = () => {} }) {
       webViewLink: f.webViewLink || null,
       owner: f.owners?.[0]?.displayName || null,
       trashed: !!f.trashed,
+      shortcutTargetMimeType: f.shortcutDetails?.targetMimeType || null,
       // LLM 向けヒント: このファイルはテキストとして読めるか
       readableAsText: f.mimeType === FOLDER_MIME ? false
         : (!!GOOGLE_EXPORT_MAP[f.mimeType] || isTextualMime(f.mimeType)),
+      // UI/RAG 向けヒント: VLM取り込み (PDF化→OCR→永続RAG) に対応しているか
+      vlmImportable: effMime === FOLDER_MIME ? false : isVlmImportableMime(effMime),
     };
   }
 
@@ -984,9 +1020,9 @@ function createGoogleDrive({ getConfig, baseDir, log = () => {} }) {
     // 書き込み
     uploadFile, createFolder, deleteFile,
     // ユーティリティ (server.js から使う)
-    resolveFolderId, resolveFileId, guessMimeFromName, isTextualMime,
+    resolveFolderId, resolveFileId, guessMimeFromName, isTextualMime, isVlmImportableMime,
     assertEnabled, assertWritable, assertDeletable,
-    GOOGLE_EXPORT_MAP, FOLDER_MIME,
+    GOOGLE_EXPORT_MAP, GOOGLE_EXPORT_PDF_MAP, FOLDER_MIME,
   };
 }
 
@@ -995,7 +1031,9 @@ module.exports = {
   escapeQueryLiteral,
   guessMimeFromName,
   isTextualMime,
+  isVlmImportableMime,
   SCOPE_READONLY,
   SCOPE_FULL,
   FOLDER_MIME,
+  GOOGLE_EXPORT_PDF_MAP,
 };

@@ -88,6 +88,39 @@ function sanitizePdfName(name) {
   return `${stem}.pdf`;
 }
 
+/**
+ * sanitizePdfName の拡張子指定版 (Google Drive 取り込み用)。
+ * 「レポート.docx」+ ext=pdf → 「レポート.pdf」のように、
+ * 元の拡張子を落として指定の拡張子で終わる安全な名前を返す。
+ */
+function sanitizeSourceName(name, ext) {
+  let base = path.basename(String(name || '').replace(/\\/g, '/'));
+  base = base.replace(/\0/g, '').trim().replace(/[\/\\:*?"<>|]/g, '_').replace(/^\.+/, '');
+  if (!base) base = 'document';
+  const re = new RegExp(`\\.${ext}$`, 'i');
+  let stem = re.test(base) ? base.replace(re, '') : base.replace(/\.[a-z0-9]{1,5}$/i, '');
+  if (!stem) stem = 'document';
+  if (stem.length > 100) stem = stem.slice(0, 100);
+  return `${stem}.${ext}`;
+}
+
+/**
+ * PDF ではなく1枚画像としてOCRするソースか (Google Drive の画像取り込み等)。
+ * 画像ジョブは pdftoppm を使わず、元画像をそのまま Vision LLM に渡す。
+ */
+const IMAGE_SOURCE_RE = /\.(png|jpe?g|webp)$/i;
+function isImageSource(filename) {
+  return IMAGE_SOURCE_RE.test(String(filename || ''));
+}
+
+/** 画像ソースの MIME (data URL 用)。Vision LLM に正しい形式で渡す */
+function imageSourceMime(filename) {
+  const ext = path.extname(String(filename || '')).toLowerCase();
+  if (ext === '.png') return 'image/png';
+  if (ext === '.webp') return 'image/webp';
+  return 'image/jpeg';
+}
+
 /** uploads 内で衝突しないファイル名にする (foo.pdf → foo_2.pdf) */
 function uniqueName(dir, filename) {
   const ext = path.extname(filename);
@@ -414,6 +447,10 @@ function createOcrManager({
       filename: job.filename,
       mdFilename: job.mdFilename || null,
       category: job.category || null,
+      origin: job.origin || 'upload',        // 'upload' | 'gdrive' (取り込み元)
+      sourceLink: job.sourceLink || null,    // Google Drive の webViewLink 等
+      gdriveFileId: job.gdriveFileId || null,            // Drive のファイルID (更新検知用)
+      gdriveModifiedTime: job.gdriveModifiedTime || null, // 取り込んだ時点の Drive 側 modifiedTime
       title: job.title,
       sizeBytes: job.sizeBytes,
       status: job.status,
@@ -620,7 +657,7 @@ function createOcrManager({
   }
 
   /** Vision LLM に1ページ投げて Markdown を得る (vlm は acquireVlm() の戻り値) */
-  async function ocrImage(pngPath, ctl, vlm) {
+  async function ocrImage(pngPath, ctl, vlm, mime = 'image/png') {
     const c = cfg();
     // processJob は未処理ページがある時しか確保しないので、ここに来て null は
     // 呼び出し順の壊れ。TypeError で潰れるより何が起きたか分かる形で落とす
@@ -633,7 +670,7 @@ function createOcrManager({
         role: 'user',
         content: [
           { type: 'text', text: c.prompt || '' },
-          { type: 'image_url', image_url: { url: `data:image/png;base64,${b64}` } },
+          { type: 'image_url', image_url: { url: `data:${mime};base64,${b64}` } },
         ],
       }],
       max_tokens: parseInt(c.maxTokens) || 6144,
@@ -708,7 +745,9 @@ function createOcrManager({
     const ctl = { cancelled: false, abort: null, proc: null, runStartedAt: Date.now(), pagesThisRun: 0 };
     running.set(job.jobId, ctl);
 
-    const pdfPath = path.join(uploadsDir, job.filename);
+    const srcPath = path.join(uploadsDir, job.filename);
+    // 画像ソース (Drive の画像取り込み等) は pdftoppm を使わず 1枚=1ページで直接 VLM へ
+    const isImage = isImageSource(job.filename);
     const cacheDir = jobCacheDir(job.jobId);
     const imgPrefix = path.join(cacheDir, 'page');
     // プール管理時はジョブが握っている間だけ VLM が載る。finally で必ず返す
@@ -716,7 +755,7 @@ function createOcrManager({
 
     try {
       fs.mkdirSync(cacheDir, { recursive: true });
-      if (!fs.existsSync(pdfPath)) throw new Error(`PDFが見つかりません: ${job.filename}`);
+      if (!fs.existsSync(srcPath)) throw new Error(`${isImage ? '画像' : 'PDF'}が見つかりません: ${job.filename}`);
 
       // 前回実行の終了時刻が残っていると経過時間の計算が壊れるので必ず消す
       job.startedAt = Date.now();
@@ -727,7 +766,7 @@ function createOcrManager({
 
       // ページ数 (再開時は保存済みの値を使い回す)
       if (!job.totalPages) {
-        job.totalPages = await getPageCount(pdfPath);
+        job.totalPages = isImage ? 1 : await getPageCount(srcPath);
         saveJobs();
       }
       if (ctl.cancelled) throw new Error('__CANCELLED__');
@@ -763,9 +802,10 @@ function createOcrManager({
         for (let attempt = 0; attempt <= retries; attempt++) {
           if (ctl.cancelled) throw new Error('__CANCELLED__');
           try {
-            const png = await renderPage(pdfPath, page, imgPrefix, ctl);
-            md = await ocrImage(png, ctl, vlm);
-            try { fs.unlinkSync(png); } catch {}
+            // 画像ソースは元ファイルをそのまま VLM に渡す (変換不要・削除もしない)
+            const png = isImage ? srcPath : await renderPage(srcPath, page, imgPrefix, ctl);
+            md = await ocrImage(png, ctl, vlm, isImage ? imageSourceMime(job.filename) : 'image/png');
+            if (!isImage) { try { fs.unlinkSync(png); } catch {} }
             break;
           } catch (e) {
             if (ctl.cancelled) throw new Error('__CANCELLED__');
@@ -862,9 +902,9 @@ function createOcrManager({
         }
       }
 
-      // 元PDFを残さない設定なら片付ける
+      // 元PDF/画像を残さない設定なら片付ける
       if (c.keepPdf === false) {
-        try { fs.unlinkSync(pdfPath); } catch {}
+        try { fs.unlinkSync(srcPath); } catch {}
       }
 
       setStatus(job, 'completed', { phase: null, finishedAt: Date.now(), currentPage: 0 });
@@ -1002,39 +1042,102 @@ function createOcrManager({
       fs.renameSync(tmpPath, path.join(destDir, baseName));
 
       const filename = category ? `${category}/${baseName}` : baseName;
-      const title = baseName.replace(/\.pdf$/i, '');
-      const job = {
-        jobId: `ocr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-        filename,
-        category: category || null,
-        title,
-        mdFilename: uniqueMdName(title, category),
-        sizeBytes: bytes,
-        status: 'pending',
-        phase: null,
-        totalPages: 0,
-        donePages: 0,
-        currentPage: 0,
-        failedPages: [],
-        charCount: 0,
-        ragDocId: null,
-        ragChunkCount: null,
-        ragError: null,
-        error: null,
-        interrupted: false,
-        createdAt: Date.now(),
-        startedAt: null,
-        finishedAt: null,
-      };
-      loadJobs().unshift(job);
-      if (jobs.length > MAX_JOBS) jobs = jobs.slice(0, MAX_JOBS);
-      saveJobs();
+      const job = createJob({ filename, sizeBytes: bytes, category });
       log(ip, `[OCR] アップロード: ${filename} (${humanBytes(bytes)})`);
       return jobView(job);
     } catch (e) {
       cleanup();
       throw e;
     }
+  }
+
+  /**
+   * ジョブレコードの生成と登録 (アップロード / Drive取り込みの共通処理)。
+   * filename は uploadsDir 相対の保存済みパス ("<カテゴリ>/<名前>.pdf" 等)。
+   */
+  function createJob({ filename, sizeBytes, category = null, origin = 'upload', sourceLink = null, gdriveFileId = null, gdriveModifiedTime = null }) {
+    const baseName = path.basename(filename);
+    const title = baseName.replace(/\.(pdf|png|jpe?g|webp)$/i, '');
+    const job = {
+      jobId: `ocr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      filename,
+      category: category || null,
+      origin,
+      sourceLink: sourceLink || null,
+      gdriveFileId: gdriveFileId || null,
+      gdriveModifiedTime: gdriveModifiedTime || null,
+      title,
+      mdFilename: uniqueMdName(title, category),
+      sizeBytes,
+      status: 'pending',
+      phase: null,
+      totalPages: 0,
+      donePages: 0,
+      currentPage: 0,
+      failedPages: [],
+      charCount: 0,
+      ragDocId: null,
+      ragChunkCount: null,
+      ragError: null,
+      error: null,
+      interrupted: false,
+      createdAt: Date.now(),
+      startedAt: null,
+      finishedAt: null,
+    };
+    loadJobs().unshift(job);
+    if (jobs.length > MAX_JOBS) jobs = jobs.slice(0, MAX_JOBS);
+    saveJobs();
+    return job;
+  }
+
+  /**
+   * サーバー側で uploadsDir に保存済みのファイルをジョブとして登録する
+   * (Google Drive 取り込み用。アップロード経路は receiveUpload)。
+   * PDF (.pdf) と画像 (.png/.jpg/.jpeg/.webp) に対応。
+   *
+   * @param {object} o { filename, category, origin, sourceLink, ip }
+   * @returns ジョブの外向き表現 (jobView)
+   */
+  function registerFile({ filename, category = null, origin = 'upload', sourceLink = null, gdriveFileId = null, gdriveModifiedTime = null, ip = '-' }) {
+    ensureDirs();
+    if (!/\.pdf$/i.test(filename) && !isImageSource(filename)) {
+      const e = new Error('PDF または画像 (PNG/JPEG/WebP) のみ登録できます');
+      e.status = 400; throw e;
+    }
+    const abs = path.join(uploadsDir, filename);
+    if (!fs.existsSync(abs)) { const e = new Error(`ファイルが見つかりません: ${filename}`); e.status = 404; throw e; }
+    const job = createJob({ filename, sizeBytes: fs.statSync(abs).size, category, origin, sourceLink, gdriveFileId, gdriveModifiedTime });
+    log(ip, `[OCR] ジョブ登録 (${origin}): ${filename} (${humanBytes(job.sizeBytes)})`);
+    return jobView(job);
+  }
+
+  /**
+   * 既存ジョブのソースファイル差し替え後の記録更新 (Google Drive の更新再取り込み用)。
+   * 呼び出し側が job.filename と同じパスに新しいファイルを上書き保存してから呼ぶ。
+   * ページ数・進捗・失敗記録はソースが変わったので無効化する (次の startJob({redo:true})
+   * がキャッシュを捨て、processJob がページ数を取り直す)。
+   */
+  function refreshSourceMeta(jobId, { sizeBytes, gdriveModifiedTime = null, sourceLink = null } = {}) {
+    const job = findJob(jobId);
+    if (!job) { const e = new Error('ジョブが見つかりません'); e.status = 404; throw e; }
+    if (ACTIVE_STATUSES.includes(job.status)) {
+      const e = new Error('実行中のジョブは更新できません。先にキャンセルしてください'); e.status = 409; throw e;
+    }
+    if (Number.isFinite(sizeBytes)) job.sizeBytes = sizeBytes;
+    if (gdriveModifiedTime) job.gdriveModifiedTime = gdriveModifiedTime;
+    if (sourceLink) job.sourceLink = sourceLink;
+    // 旧ソースのページキャッシュを必ず捨てる。残っていると、redo を通らない
+    // 手動の「▶ 開始」で古いページがキャッシュヒット扱いになり、新旧の内容が混ざる
+    try { fs.rmSync(jobCacheDir(job.jobId), { recursive: true, force: true }); } catch {}
+    // ページ数・進捗も当てにならない (totalPages=0 で processJob が取り直す)
+    job.totalPages = 0;
+    job.donePages = 0;
+    job.currentPage = 0;
+    job.failedPages = [];
+    saveJobs();
+    emitEvent(job.jobId, { type: 'status', job: jobView(job) });
+    return jobView(job);
   }
 
   /** 生ボディをファイルに落とす (multipart 以外のアップロード経路) */
@@ -1118,9 +1221,12 @@ function createOcrManager({
     // ページ指定の検証は依存チェックより先に (打ち間違いは即座に返したい)
     const redoPages = redo ? parsePageSpec(pages, job.totalPages) : null;
 
-    // 依存と Vision LLM の生存確認は「開始時」に行う (アップロード自体は通しておく)
-    const deps = await checkDeps();
-    if (!deps.ok) { const e = new Error(deps.message); e.status = 503; throw e; }
+    // 依存と Vision LLM の生存確認は「開始時」に行う (アップロード自体は通しておく)。
+    // 画像1枚のジョブは pdftoppm を使わないので poppler が無くても通す
+    if (!isImageSource(job.filename)) {
+      const deps = await checkDeps();
+      if (!deps.ok) { const e = new Error(deps.message); e.status = 503; throw e; }
+    }
     const vlm = await checkVlm();
     if (!vlm.ok) { const e = new Error(vlm.message); e.status = 503; throw e; }
 
@@ -1321,6 +1427,8 @@ function createOcrManager({
     // 共用するために公開する。返り値の release() を必ず呼ぶこと
     acquireVlm,
     receiveUpload,
+    registerFile,
+    refreshSourceMeta,
     listJobs,
     getJob,
     startJob,
@@ -1335,6 +1443,8 @@ function createOcrManager({
 module.exports = {
   createOcrManager,
   sanitizePdfName,
+  sanitizeSourceName,
+  isImageSource,
   humanBytes,
   // html_rag.js が同じアップロード受信機構を使う (実装を二重に持たないため)
   receiveMultipartToFile,

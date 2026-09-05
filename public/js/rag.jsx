@@ -667,6 +667,9 @@ function App() {
               jobs={ocrJobs}
               uploading={ocrUploading}
               categories={categories}
+              uploadCategory={uploadCategory}
+              showToast={showToast}
+              onGdriveImported={() => { loadOcrJobs(); loadOcrStatus(); }}
               onFiles={handlePdfFiles}
               onStart={(job) => jobAction('/ocr', job.jobId, 'start')}
               onCancel={(job) => jobAction('/ocr', job.jobId, 'cancel')}
@@ -702,7 +705,7 @@ function App() {
 // 📄 PDF OCR登録 タブ (旧 /ocr.html の本体)
 // ════════════════════════════════════════════════════════════
 
-function OcrPanel({ status, appConfig, jobs, uploading, categories, onFiles, onStart, onCancel, onRedo, onDelete, onChangeCategory }) {
+function OcrPanel({ status, appConfig, jobs, uploading, categories, uploadCategory, showToast, onGdriveImported, onFiles, onStart, onCancel, onRedo, onDelete, onChangeCategory }) {
   return (
     <>
       <div className="info-box">
@@ -730,6 +733,15 @@ function OcrPanel({ status, appConfig, jobs, uploading, categories, onFiles, onS
         accept="application/pdf,.pdf"
         onFiles={onFiles}
       />
+
+      {appConfig.googleDrive?.enabled && (!status || status.enabled) && (
+        <GdriveImportSection
+          category={uploadCategory}
+          jobs={jobs}
+          showToast={showToast}
+          onImported={onGdriveImported}
+        />
+      )}
 
       {uploading.map(u => (
         <div className="ocr-uploading" key={u.uid}>
@@ -830,6 +842,9 @@ function OcrJobCard({ job, categories, onStart, onCancel, onRedo, onDelete, onCh
       <div className="ocr-job-head">
         <div className="ocr-job-name">{String(job.filename || '').split('/').pop()}</div>
         <CategoryBadge category={job.category} />
+        {job.origin === 'gdrive' && (
+          <div className="hrag-source url" title="Google Drive から取り込んだファイル">☁️ GDrive</div>
+        )}
         <div className="ocr-job-size">{formatBytes(job.sizeBytes)}</div>
         <div className={`ocr-status ${job.status}`}>{ocrStatusText(job)}</div>
       </div>
@@ -893,12 +908,418 @@ function OcrJobCard({ job, categories, onStart, onCancel, onRedo, onDelete, onCh
               ⬇ Markdown
             </a>
             <a className="btn small" href={ragFileUrl(job.filename)} target="_blank" rel="noreferrer">
-              📕 元PDF
+              {/\.pdf$/i.test(job.filename || '') ? '📕 元PDF' : '🖼️ 元画像'}
             </a>
           </>
         )}
+        {job.sourceLink && (
+          <a className="btn small" href={job.sourceLink} target="_blank" rel="noreferrer" title="Google Drive で元ファイルを開く">
+            ☁️ Drive で開く
+          </a>
+        )}
         <CategoryMoveSelect job={job} categories={categories} onChangeCategory={onChangeCategory} />
         <button className="btn danger small spacer" onClick={onDelete} disabled={isActive(job)}>🗑 削除</button>
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+// ☁️ Google Drive からの取り込み (OCRタブ内)
+// Drive のファイルを PDF としてダウンロードし、OCR (Vision LLM) パイプラインで
+// 永続RAGに登録する。Google ドキュメント/スライド/スプレッドシート/図形描画は
+// PDF に export されるので、テキスト export では失われる図・表・レイアウトを
+// Vision LLM が読み取れる (HTML取り込みの画像解析と同じ「VLM対応」の Drive 版)。
+// ════════════════════════════════════════════════════════════
+
+// ファイル種別の表示 (アイコンと日本語ラベル)。判定はサーバーの vlmImportable が正
+const GDRIVE_KIND = {
+  'application/vnd.google-apps.document':     { icon: '📝', label: 'Google ドキュメント' },
+  'application/vnd.google-apps.spreadsheet':  { icon: '📊', label: 'Google スプレッドシート' },
+  'application/vnd.google-apps.presentation': { icon: '📽️', label: 'Google スライド' },
+  'application/vnd.google-apps.drawing':      { icon: '🎨', label: 'Google 図形描画' },
+  'application/pdf': { icon: '📕', label: 'PDF' },
+  'image/png':  { icon: '🖼️', label: 'PNG' },
+  'image/jpeg': { icon: '🖼️', label: 'JPEG' },
+  'image/webp': { icon: '🖼️', label: 'WebP' },
+};
+
+function gdriveKind(f) {
+  const mime = f.shortcutTargetMimeType || f.mimeType;
+  return GDRIVE_KIND[mime] || { icon: '📄', label: (mime || '').split('/').pop() || '不明' };
+}
+
+function GdriveImportSection({ category, jobs, showToast, onImported }) {
+  const [st, setSt] = useState(null);          // /gdrive/status の結果
+  const [open, setOpen] = useState(false);     // ファイル選択モーダル
+  const [connectBusy, setConnectBusy] = useState(false);
+  const [checkBusy, setCheckBusy] = useState(false);   // 更新確認〜再取り込みの実行中
+
+  const loadStatus = useCallback(async () => {
+    try {
+      const r = await fetch('/gdrive/status');
+      if (r.ok) { const data = await r.json(); setSt(data); return data; }
+    } catch {}
+    setSt(null);
+    return null;
+  }, []);
+
+  useEffect(() => { loadStatus(); }, [loadStatus]);
+
+  // 認可完了は callback ページからの postMessage で受ける (チャット画面と同じ方式)
+  useEffect(() => {
+    const onMsg = async (e) => {
+      if (e.origin !== window.location.origin) return;
+      if (e.data?.type !== 'gdrive-auth') return;
+      const now = await loadStatus();
+      if (e.data.ok && now?.connected) showToast('Google Drive と接続しました', 'success');
+      else if (!e.data.ok) showToast(e.data.message || 'Google Drive の接続に失敗しました', 'error');
+    };
+    window.addEventListener('message', onMsg);
+    return () => window.removeEventListener('message', onMsg);
+  }, [loadStatus, showToast]);
+
+  // OAuth 認可フローを開始 (別ウィンドウで同意)。ポップアップを手動で
+  // 閉じられた場合に備えて closed のポーリングでも状態を取り直す
+  async function connect() {
+    setConnectBusy(true);
+    try {
+      const r = await fetch('/gdrive/auth/url');
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) { showToast(data.error || `HTTP ${r.status}`, 'error'); return; }
+      const win = window.open(data.url, 'gdrive-auth', 'width=520,height=680');
+      if (!win) { showToast('ポップアップがブロックされました。ブラウザの設定で許可してください', 'error'); return; }
+      const timer = setInterval(async () => {
+        if (win.closed) {
+          clearInterval(timer);
+          await loadStatus();
+        }
+      }, 800);
+    } catch (e) {
+      showToast(e.message, 'error');
+    } finally {
+      setConnectBusy(false);
+    }
+  }
+
+  // 取り込み済みジョブの Drive 側更新をまとめて確認し、更新があれば再取り込みする。
+  // 確認は modifiedTime の比較だけ (ダウンロードしない)。再取り込みは同じジョブの
+  // 上書き更新になる (サーバー側が gdriveFileId で既存ジョブを見つけて差し替える)
+  async function checkUpdates() {
+    setCheckBusy(true);
+    try {
+      const r = await fetch('/ocr/gdrive-check');
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      if (data.checked === 0) {
+        showToast('Google Drive から取り込んだジョブはまだありません', 'info');
+        return;
+      }
+      const upd = (data.results || []).filter(x => x.updated);
+      const missing = (data.results || []).filter(x => x.missing);
+      if (upd.length === 0) {
+        showToast(`✅ すべて最新です (${data.checked}件確認${missing.length ? `、${missing.length}件はDrive側で見つかりません` : ''})`, 'success');
+        return;
+      }
+      const names = upd.map(x => `・${x.name || x.filename}`).join('\n');
+      if (!confirm(
+        `${upd.length}件のドキュメントが Drive 側で更新されています:\n\n${names}\n\n` +
+        `再取り込みして RAG を更新しますか?\n(同じジョブが上書きされ、全ページOCRし直します)`
+      )) return;
+      let ok = 0;
+      for (const x of upd) {
+        try {
+          const r2 = await fetch('/ocr/gdrive-import', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ fileId: x.fileId }),
+          });
+          const d2 = await r2.json().catch(() => ({}));
+          if (!r2.ok && r2.status !== 202) throw new Error(d2.error || `HTTP ${r2.status}`);
+          if (d2.warning) showToast(`${x.name || x.filename}: 更新しましたが開始できません — ${d2.warning}`, 'error');
+          else ok++;
+          onImported();
+        } catch (e) {
+          showToast(`${x.name || x.filename}: ${e.message}`, 'error');
+        }
+      }
+      if (ok > 0) showToast(`${ok}件の更新再取り込みを開始しました`, 'success');
+    } catch (e) {
+      showToast(e.message, 'error');
+    } finally {
+      setCheckBusy(false);
+    }
+  }
+
+  // googleDrive.enabled は呼び出し側 (OcrPanel) が確認済み。status 取得前は出さない
+  if (!st || !st.enabled) return null;
+
+  const gdriveJobCount = (jobs || []).filter(j => j.origin === 'gdrive' && j.gdriveFileId).length;
+
+  return (
+    <>
+      <div className="gdrive-bar">
+        <span className="gdrive-bar-icon">☁️</span>
+        <div className="gdrive-bar-text">
+          <div className="gdrive-bar-title">Google Drive から取り込み</div>
+          <div className="gdrive-bar-desc">
+            Google ドキュメント/スライド/スプレッドシート/図形描画は <strong>PDF に変換</strong>して取り込み、
+            図・表・レイアウトも Vision LLM が読み取ります（PDF・画像はそのまま取り込み）。
+            取り込み済みのファイルは再選択で<strong>上書き更新</strong>になります（Drive側に更新が無ければスキップ）。
+          </div>
+        </div>
+        {st.connected ? (
+          <div className="gdrive-bar-actions">
+            {st.account && <span className="gdrive-bar-account" title="接続中のアカウント">{st.account}</span>}
+            {gdriveJobCount > 0 && (
+              <button
+                className="btn small"
+                onClick={checkUpdates}
+                disabled={checkBusy}
+                title="取り込み済みドキュメントの Drive 側更新日時を確認し、更新があれば再取り込みします"
+              >
+                {checkBusy ? '確認中...' : `🔄 更新を確認 (${gdriveJobCount})`}
+              </button>
+            )}
+            <button className="btn primary small" onClick={() => setOpen(true)}>📂 Drive を参照</button>
+          </div>
+        ) : (
+          <div className="gdrive-bar-actions">
+            <span className="gdrive-bar-account">{st.reason || '未接続'}</span>
+            {st.authMode !== 'serviceAccount' && st.hasClientId && st.hasClientSecret && (
+              <button className="btn small" onClick={connect} disabled={connectBusy}>
+                {connectBusy ? '接続中...' : '🔗 Drive と接続'}
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
+      {open && (
+        <GdriveBrowserModal
+          category={category}
+          jobs={jobs}
+          showToast={showToast}
+          onImported={onImported}
+          onClose={() => setOpen(false)}
+        />
+      )}
+    </>
+  );
+}
+
+/** Drive のファイルブラウザ (フォルダ移動・検索・複数選択 → 取り込み) */
+function GdriveBrowserModal({ category, jobs, showToast, onImported, onClose }) {
+  const [crumbs, setCrumbs] = useState([{ id: '', name: 'マイドライブ' }]);
+  const [files, setFiles] = useState([]);
+  const [query, setQuery] = useState('');
+  const [searched, setSearched] = useState(false);   // 検索結果を表示中か
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [selected, setSelected] = useState(new Map()); // id -> file
+  const [importing, setImporting] = useState(null);    // { done, total, name }
+
+  // 取り込み済みファイルの対応表 (fileId → ジョブ)。一覧にバッジを出し、
+  // Drive の modifiedTime と突き合わせて「更新あり」も判定する (追加API不要)
+  const importedBy = new Map((jobs || [])
+    .filter(j => j.origin === 'gdrive' && j.gdriveFileId)
+    .map(j => [j.gdriveFileId, j]));
+  function importState(f) {
+    const job = importedBy.get(f.id);
+    if (!job) return null;
+    const changed = !!(f.modifiedTime && job.gdriveModifiedTime
+      && new Date(f.modifiedTime).getTime() !== new Date(job.gdriveModifiedTime).getTime());
+    return changed ? 'updated' : 'imported';
+  }
+
+  const load = useCallback(async (folderId, q) => {
+    setLoading(true);
+    setError('');
+    try {
+      const url = q
+        ? `/gdrive/search?q=${encodeURIComponent(q)}`
+        : `/gdrive/files?folderId=${encodeURIComponent(folderId || '')}`;
+      const r = await fetch(url);
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) { setError(data.error || `HTTP ${r.status}`); setFiles([]); return; }
+      setFiles(data.files || []);
+      setSearched(!!q);
+    } catch (e) {
+      setError(e.message);
+      setFiles([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { load('', ''); }, [load]);
+
+  function openFolder(f) {
+    setCrumbs(prev => [...prev, { id: f.id, name: f.name }]);
+    setQuery('');
+    load(f.id, '');
+  }
+
+  function navigateTo(i) {
+    const c = crumbs[i];
+    if (!c) return;
+    setCrumbs(crumbs.slice(0, i + 1));
+    setQuery('');
+    load(c.id, '');
+  }
+
+  function search() {
+    const q = query.trim();
+    if (!q) { load(crumbs[crumbs.length - 1].id, ''); return; }
+    load('', q);
+  }
+
+  function toggle(f) {
+    setSelected(prev => {
+      const next = new Map(prev);
+      if (next.has(f.id)) next.delete(f.id);
+      else next.set(f.id, f);
+      return next;
+    });
+  }
+
+  // 選択したファイルを1件ずつ取り込む (サーバー側で PDF export → OCRジョブ登録 → 自動開始)。
+  // 取り込み済みのファイルはサーバーが gdriveFileId で見つけて上書き更新にする
+  // (Drive 側に更新が無ければ skipped が返り、二重登録も無駄な再OCRも起きない)
+  async function importSelected() {
+    const list = [...selected.values()];
+    if (list.length === 0 || importing) return;
+    let ok = 0;
+    let skipped = 0;
+    for (let i = 0; i < list.length; i++) {
+      const f = list[i];
+      setImporting({ done: i, total: list.length, name: f.name });
+      try {
+        const r = await fetch('/ocr/gdrive-import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fileId: f.id, category: category || undefined }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok && r.status !== 202) throw new Error(data.error || `HTTP ${r.status}`);
+        if (data.skipped) {
+          skipped++;
+          showToast(`${f.name}: Drive側に更新が無いためスキップしました (OCRからやり直す場合はジョブの「🔄 再OCR」)`, 'info');
+        } else if (data.warning) {
+          showToast(`${f.name}: 取り込みましたが開始できません — ${data.warning}`, 'error');
+        } else {
+          ok++;
+          if (data.updated) showToast(`${f.name}: 更新版で再取り込みします`, 'success');
+        }
+        onImported();   // ジョブ一覧を更新 (1件ごとに反映)
+      } catch (e) {
+        showToast(`${f.name}: ${e.message}`, 'error');
+      }
+    }
+    setImporting(null);
+    setSelected(new Map());
+    if (ok > 0) showToast(`${ok}件の取り込みを開始しました${skipped ? ` (${skipped}件は更新なしのためスキップ)` : ''}`, 'success');
+    onClose();
+  }
+
+  return (
+    <div className="gdrive-modal-overlay" onClick={() => { if (!importing) onClose(); }}>
+      <div className="gdrive-modal" onClick={e => e.stopPropagation()}>
+        <div className="gdrive-modal-head">
+          <div className="gdrive-modal-title">☁️ Google Drive から取り込み</div>
+          <button className="gdrive-modal-close" onClick={onClose} disabled={!!importing} title="閉じる">×</button>
+        </div>
+
+        <div className="gdrive-toolbar">
+          <input
+            className="gdrive-search"
+            placeholder="Drive 全体を検索 (ファイル名・本文)"
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') search(); }}
+          />
+          <button className="btn small" onClick={search}>🔍 検索</button>
+        </div>
+
+        <div className="gdrive-crumbs">
+          {searched ? (
+            <>
+              <button className="gdrive-crumb" onClick={() => { setQuery(''); load(crumbs[crumbs.length - 1].id, ''); }}>
+                ← フォルダ表示に戻る
+              </button>
+              <span className="gdrive-crumb-sep">/</span>
+              <span className="gdrive-crumb-current">検索結果</span>
+            </>
+          ) : crumbs.map((c, i) => (
+            <React.Fragment key={`${c.id}_${i}`}>
+              {i > 0 && <span className="gdrive-crumb-sep">›</span>}
+              {i === crumbs.length - 1
+                ? <span className="gdrive-crumb-current">{i === 0 ? '📁 ' : ''}{c.name}</span>
+                : <button className="gdrive-crumb" onClick={() => navigateTo(i)}>{i === 0 ? '📁 ' : ''}{c.name}</button>}
+            </React.Fragment>
+          ))}
+        </div>
+
+        <div className="gdrive-list">
+          {loading ? (
+            <div className="gdrive-list-empty">読み込み中...</div>
+          ) : error ? (
+            <div className="gdrive-list-empty error">{error}</div>
+          ) : files.length === 0 ? (
+            <div className="gdrive-list-empty">{searched ? '該当するファイルがありません' : 'このフォルダは空です'}</div>
+          ) : files.map(f => {
+            if (f.isFolder) {
+              return (
+                <button key={f.id} className="gdrive-item folder" onClick={() => openFolder(f)}>
+                  <span className="gdrive-item-icon">📁</span>
+                  <span className="gdrive-item-name">{f.name}</span>
+                  <span className="gdrive-item-meta">開く ›</span>
+                </button>
+              );
+            }
+            const kind = gdriveKind(f);
+            const state = importState(f);   // null | 'imported' | 'updated'
+            return (
+              <label
+                key={f.id}
+                className={`gdrive-item file ${f.vlmImportable ? '' : 'disabled'} ${selected.has(f.id) ? 'selected' : ''}`}
+                title={!f.vlmImportable ? `${f.name} — この形式は VLM 取り込みに対応していません`
+                  : state === 'updated' ? `${f.name} — Drive側が更新されています。選択して取り込むと同じジョブが上書き更新されます`
+                  : state === 'imported' ? `${f.name} — 取り込み済みです。Drive側に更新が無ければ選択してもスキップされます`
+                  : f.name}
+              >
+                <input
+                  type="checkbox"
+                  checked={selected.has(f.id)}
+                  disabled={!f.vlmImportable || !!importing}
+                  onChange={() => toggle(f)}
+                />
+                <span className="gdrive-item-icon">{kind.icon}</span>
+                <span className="gdrive-item-name">{f.name}</span>
+                {state === 'updated' && <span className="gdrive-item-badge updated">🔄 更新あり</span>}
+                {state === 'imported' && <span className="gdrive-item-badge">✔ 取り込み済み</span>}
+                <span className="gdrive-item-meta">
+                  {kind.label}{f.size ? ` · ${formatBytes(f.size)}` : ''}
+                </span>
+              </label>
+            );
+          })}
+        </div>
+
+        <div className="gdrive-foot">
+          <span className="gdrive-foot-note">
+            登録先: {category ? `📂 ${category}` : '未分類'}　/　Google形式は PDF に変換して Vision LLM で OCR します
+          </span>
+          {importing ? (
+            <span className="gdrive-foot-progress">
+              <span className="ocr-spinner" /> 取り込み中 {importing.done + 1}/{importing.total}: {importing.name}
+            </span>
+          ) : (
+            <button className="btn primary" onClick={importSelected} disabled={selected.size === 0}>
+              ⬇ 取り込む{selected.size > 0 ? ` (${selected.size}件)` : ''}
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );

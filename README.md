@@ -63,6 +63,7 @@ LLMが直接サーバーのファイルシステムに `.py` / `.xml` / `.json` 
 - `rootFolderId` を設定すると、**そのフォルダ配下だけ**にアクセスを限定（親を遡って範囲外を拒否）
 - `clientSecret` はブラウザに一切返しません。リフレッシュトークンは `config.json` ではなく `gdrive_token.json`（chmod 600・gitignore 済み）に保存
 - チャット入力欄の ☁️ ボタンでいつでも ON/OFF、右パネルの「☁️ GDrive」タブから接続・ファイル閲覧・取り込みができます
+- **図入りの資料を永続RAGに入れたい場合**は、`/rag.html` の OCR タブの「☁️ Google Drive から取り込み」を使うと、Google ドキュメント/スライド等を **PDF に変換して Vision LLM で OCR** します（テキスト export と違い図・表・レイアウトが残る。詳細は [📄 PDF OCR](#-pdf-ocrvision-llm--markdown--rag自動登録) の節）
 
 → セットアップ手順は [☁️ Google Drive 連携のセットアップ](#️-google-drive-連携のセットアップ) を参照
 
@@ -106,6 +107,35 @@ PDF アップロード → public/uploads/ragfiles/<名前>.pdf に保存
 - **終わったらVision LLMを片付ける**: `ocr.vlmPoolModel` を設定すると Vision LLM が LLMプールの管理下に入り、**OCR中だけロードされて、終わればアイドル時間の経過後に自動アンロード**されます。VRAMが足りなければチャットのモデルを一時的に降ろして枠を作り、次のチャットで戻します。ページを引き終わった時点で手放すので、RAG登録の間ずっと9GBを抱えたままにもなりません
 - **数式・表・図に対応したプロンプト**: 表は Markdown テーブル、数式は LaTeX (`$...$` / `$$...$$`)、図は `[図: 説明]` で出力させます（`ocr.prompt` で変更可）
 
+**☁️ Google Drive からの取り込み（図・表も VLM で読み取る）**
+
+Google Drive 連携（`googleDrive.enabled`）が有効なら、OCRタブの「☁️ Google Drive から取り込み」からドライブのファイルを直接永続RAGへ登録できます。`gdrive_read_file`（テキスト export）だと **Google ドキュメントの図・スライドのレイアウト・表の見た目が失われる**のに対し、この経路は **PDF に変換してから Vision LLM に読ませる**ので、図の内容も `[図: 説明]` として Markdown に残ります（HTML取り込みの画像解析と同じ「VLM対応」の Drive 版です）。
+
+| Drive 上の形式 | 取り込み方法 |
+|---|---|
+| Google ドキュメント / スライド / スプレッドシート / 図形描画 | **PDF に export** して OCR パイプラインへ |
+| PDF | そのままダウンロードして OCR パイプラインへ |
+| 画像 (PNG / JPEG / WebP) | そのまま 1枚=1ページ として Vision LLM へ（poppler 不要） |
+
+- 画面のモーダルでフォルダ移動・全文検索・複数選択ができ、対応形式以外はグレーアウトされます
+- 未接続でも同じ場所の「🔗 Drive と接続」から OAuth 接続できます（チャット画面と共通のトークン）
+- 登録先カテゴリは PDF アップロードと同じく画面上部のカテゴリバーの選択が使われます
+- 取り込んだジョブには「☁️ GDrive」バッジが付き、完了後は「☁️ Drive で開く」で元ファイルへ飛べます
+- ダウンロードのサイズ上限は `googleDrive.maxDownloadMB` ではなく `ocr.maxUploadMB`（既定300MB）に合わせます。Drive API の制約で、**巨大な Google ドキュメントは PDF export が 10MB 制限で失敗**することがあります（その場合はエラーがそのまま表示されます）
+
+**Drive 側の更新を検知して再取り込み（上書き更新）**
+
+取り込み時に Drive の **`modifiedTime`（更新日時）と fileId をジョブに記録**します。同じファイルをもう一度取り込んでも二重登録にはならず、次の動作になります。
+
+| Drive 側の状態 | 動作 |
+|---|---|
+| 更新なし（modifiedTime が記録と同じ） | **スキップ**（何もしない。OCRからやり直したい時はジョブの「🔄 再OCR」） |
+| 更新あり | **同じジョブを上書き更新**：新しい PDF/画像に差し替え → 全ページ再OCR → 同じファイル名 = 同じ docId で RAG が上書きされる（古いチャンクは残らない） |
+
+- 「☁️ Google Drive から取り込み」バーの「**🔄 更新を確認**」ボタンで、取り込み済み全ドキュメントの更新有無をまとめて確認できます（modifiedTime の比較だけなのでダウンロードは発生しません）。更新があるものを一覧で確認してから、ワンクリックでまとめて再取り込みできます
+- モーダルのファイル一覧にも「**✔ 取り込み済み**」「**🔄 更新あり**」バッジが出ます（一覧の modifiedTime とジョブの記録をその場で比較。追加のAPI呼び出しなし）
+- 自動監視・自動同期は**しません**。更新の確認と再取り込みは、ボタンを押した時だけ実行されます（VLM の再OCRはコストが高いので、意図しない自動実行を避ける設計です）
+
 **必要なもの**
 
 poppler-utils（`pdftoppm` / `pdfinfo`）。npm の依存追加はありません。
@@ -148,6 +178,8 @@ llama-server -m /models/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf \
 | Method | Path | 説明 |
 |---|---|---|
 | `POST` | `/ocr/upload` | PDF を受信 → ジョブ登録（既定でそのまま開始。`?autostart=0` で保留、`?category=名前` で登録先カテゴリ指定） |
+| `POST` | `/ocr/gdrive-import` | Google Drive のファイルを取り込んでジョブ登録（ボディ `{"fileId":"...", "category":"...", "autostart":true, "force":false}`。Google形式は PDF に export。取り込み済みなら更新の有無を見て上書き更新 or スキップ、`force:true` で更新なしでも取り直し） |
+| `GET` | `/ocr/gdrive-check` | Drive 由来ジョブ全件の更新有無を確認（modifiedTime 比較のみ、ダウンロードなし） |
 | `GET` | `/ocr/jobs` | 全ジョブの状態一覧 |
 | `GET` | `/ocr/jobs/:jobId` | 個別ジョブの詳細 |
 | `GET` | `/ocr/jobs/:jobId/stream` | SSE でリアルタイム進捗配信 |

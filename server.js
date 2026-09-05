@@ -10,8 +10,8 @@ const { WebSocketServer } = require('ws');
 const { startAgentServer } = require('./agent_proxy');
 const { createLlmPool } = require('./llm_pool');
 const { createOrchestrator, validateWorkflow } = require('./orchestrator');
-const { createGoogleDrive } = require('./google_drive');
-const { createOcrManager } = require('./ocr');
+const { createGoogleDrive, isVlmImportableMime } = require('./google_drive');
+const { createOcrManager, sanitizeSourceName, uniqueName: uniqueUploadName } = require('./ocr');
 const { createHtmlRagManager } = require('./html_rag');
 
 // systemd等で起動された際、カレントディレクトリをserver.jsと同じに固定する
@@ -10936,6 +10936,149 @@ app.post('/ocr/upload', requireAuth, requirePermission('ml:write'), requireOcr, 
     return res.json({ job, started: true });
   }
   res.json({ job, started: false });
+});
+
+// Google Drive のファイルを永続RAGへ VLM 取り込みする (図・表・レイアウト対応)。
+// Google ドキュメント/スライド/スプレッドシート/図形描画は PDF に export し、
+// PDF・画像 (PNG/JPEG/WebP) はそのまま取り込んで、既存の OCR パイプライン
+// (Vision LLM → Markdown → RAG登録) に流す。テキスト export と違って図が失われない。
+//
+// 同じ Drive ファイルを再度取り込むと二重登録にはならず、更新扱いになる:
+//   Drive 側の modifiedTime が取り込み時の記録と同じ → skipped (何もしない。force:true で強制)
+//   変わっている → 既存ジョブのソースを差し替えて再OCR (同じファイル名 = 同じ docId で RAG が上書きされる)
+// body: { fileId, category?, autostart? (既定true), force? }
+const GDRIVE_IMPORT_EXT = { 'application/pdf': 'pdf', 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' };
+app.post('/ocr/gdrive-import', requireAuth, requirePermission('ml:write'), requireOcr, jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  const fileId = String(req.body?.fileId || '').trim();
+  if (!fileId) return res.status(400).json({ error: 'fileId を指定してください' });
+
+  let job;
+  let updated = false;   // 既存ジョブの更新再取り込みか
+  try {
+    const st = gdrive.status();
+    if (!st.enabled) return res.status(503).json({ error: 'Google Drive 連携が無効です (config.json の googleDrive.enabled を true にしてください)' });
+    if (!st.connected) return res.status(503).json({ error: `Google Drive が未接続です${st.reason ? ` (${st.reason})` : ''}` });
+
+    // 対応形式かをメタデータで先に確認する (ダウンロードしてから断ると転送が無駄)
+    const meta = await gdrive.getFile(fileId);
+    const effMime = meta.shortcutTargetMimeType || meta.mimeType;
+    if (meta.isFolder) return res.status(400).json({ error: `「${meta.name}」はフォルダです。ファイルを指定してください` });
+    if (!isVlmImportableMime(effMime)) {
+      return res.status(400).json({
+        error: `「${meta.name}」の形式 (${effMime}) は VLM 取り込みに対応していません。`
+          + '対応形式: Google ドキュメント/スライド/スプレッドシート/図形描画、PDF、画像 (PNG/JPEG/WebP)',
+      });
+    }
+
+    // 取り込み済みなら更新の有無を見る (二重登録を作らない)
+    const existing = ocr.listJobs().find(j => j.origin === 'gdrive' && j.gdriveFileId === meta.id);
+    if (existing) {
+      if (['queued', 'running'].includes(existing.status)) {
+        return res.status(409).json({ error: `「${meta.name}」のジョブは実行中です。完了かキャンセルを待ってください` });
+      }
+      const changed = !existing.gdriveModifiedTime || !meta.modifiedTime
+        || new Date(meta.modifiedTime).getTime() !== new Date(existing.gdriveModifiedTime).getTime();
+      if (!changed && req.body?.force !== true) {
+        return res.json({ job: existing, skipped: true, upToDate: true });
+      }
+    }
+
+    // ダウンロード (Google ネイティブ形式は PDF に export)。
+    // サイズ上限は Drive の既定 (maxDownloadMB) ではなく OCR の上限に合わせる
+    const dl = await gdrive.downloadFile(meta.id, { preferPdf: true, maxMB: parseInt(appConfig.ocr?.maxUploadMB) || 300 });
+    const ext = GDRIVE_IMPORT_EXT[dl.mimeType] || 'pdf';
+    const sourceLink = dl.meta?.webViewLink || meta.webViewLink || null;
+
+    if (existing) {
+      // ─── 更新フロー: 既存ジョブのソースを同じファイル名に上書きして作り直す ───
+      // ファイル名を変えないことで mdFilename → docId も変わらず、RAG 登録が上書き更新になる
+      const curExt = path.extname(existing.filename).replace(/^\./, '').toLowerCase();
+      const same = ext === 'jpg' ? ['jpg', 'jpeg'].includes(curExt) : curExt === ext;
+      if (!same) {
+        return res.status(409).json({
+          error: `「${meta.name}」のファイル形式が変わっています (.${curExt} → .${ext})。`
+            + '既存のジョブを削除してから取り込み直してください',
+        });
+      }
+      fs.writeFileSync(path.join(RAGFILES_DIR, existing.filename), dl.buffer);
+      job = ocr.refreshSourceMeta(existing.jobId, {
+        sizeBytes: dl.buffer.length,
+        gdriveModifiedTime: meta.modifiedTime || null,
+        sourceLink,
+      });
+      updated = true;
+      log(ip, `[OCR] GDrive更新取り込み: ${meta.name} → uploads/ragfiles/${existing.filename} (Drive側 ${meta.modifiedTime || '不明'})`);
+    } else {
+      // ─── 新規フロー: 管理フォルダ (uploads/ragfiles/<カテゴリ>) に保存してジョブ登録 ───
+      const category = resolveRagCategory(req.body?.category);
+      const destDir = category ? path.join(RAGFILES_DIR, category) : RAGFILES_DIR;
+      fs.mkdirSync(destDir, { recursive: true });
+      const baseName = uniqueUploadName(destDir, sanitizeSourceName(meta.name, ext));
+      fs.writeFileSync(path.join(destDir, baseName), dl.buffer);
+
+      const filename = category ? `${category}/${baseName}` : baseName;
+      job = ocr.registerFile({
+        filename,
+        category,
+        origin: 'gdrive',
+        sourceLink,
+        gdriveFileId: meta.id,
+        gdriveModifiedTime: meta.modifiedTime || null,
+        ip,
+      });
+      log(ip, `[OCR] GDrive取り込み: ${meta.name} → uploads/ragfiles/${filename}${dl.exported ? ' (PDF export)' : ''}`);
+    }
+  } catch (e) {
+    return res.status(e.status || 500).json({ error: e.message || String(e) });
+  }
+
+  // 自動開始 (Vision LLM 停止中などで開始できない場合も、取り込み自体は成功として返す)
+  if (req.body?.autostart !== false) {
+    try {
+      // 更新フローは旧ソースのキャッシュを捨てて全ページ引き直す
+      job = await ocr.startJob(job.jobId, updated ? { redo: true } : {});
+    } catch (e) {
+      return res.status(202).json({ job, updated, started: false, warning: e.message });
+    }
+    return res.json({ job, updated, started: true });
+  }
+  res.json({ job, updated, started: false });
+});
+
+// Google Drive 由来のジョブについて、Drive 側の更新有無をまとめて確認する。
+// 取り込み時に記録した modifiedTime と現在の modifiedTime を比較するだけで、
+// ダウンロードや再OCRはしない (更新の実行は /ocr/gdrive-import に fileId を投げ直す)。
+app.get('/ocr/gdrive-check', requireAuth, requirePermission('ml:read'), requireOcr, async (req, res) => {
+  const ip = getIP(req);
+  const st = gdrive.status();
+  if (!st.enabled || !st.connected) {
+    return res.status(503).json({ error: `Google Drive が利用できません${st.reason ? ` (${st.reason})` : ''}` });
+  }
+  const targets = ocr.listJobs().filter(j => j.origin === 'gdrive' && j.gdriveFileId);
+  const results = [];
+  for (const j of targets) {
+    try {
+      const meta = await gdrive.getFile(j.gdriveFileId);
+      const updated = !!(meta.modifiedTime && j.gdriveModifiedTime
+        && new Date(meta.modifiedTime).getTime() !== new Date(j.gdriveModifiedTime).getTime());
+      results.push({
+        jobId: j.jobId, fileId: j.gdriveFileId, name: meta.name, filename: j.filename,
+        importedModifiedTime: j.gdriveModifiedTime, driveModifiedTime: meta.modifiedTime || null,
+        updated, missing: false,
+      });
+    } catch (e) {
+      // 404 = Drive 側で削除された/共有が外れた。確認全体は止めない
+      results.push({
+        jobId: j.jobId, fileId: j.gdriveFileId, name: null, filename: j.filename,
+        importedModifiedTime: j.gdriveModifiedTime, driveModifiedTime: null,
+        updated: false, missing: true, error: e.message,
+      });
+    }
+  }
+  const updates = results.filter(r => r.updated).length;
+  log(ip, `[OCR] GDrive更新確認: ${results.length}件中 更新${updates}件${results.some(r => r.missing) ? `、不明${results.filter(r => r.missing).length}件` : ''}`);
+  res.json({ checked: results.length, updates, results });
 });
 
 // ジョブ一覧

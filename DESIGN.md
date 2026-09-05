@@ -6489,6 +6489,54 @@ POST /ocr/upload (multipart or 生PDFボディ)
 status: completed / ragDocId 記録
 ```
 
+### ☁️ Google Drive からの VLM 取り込み (POST /ocr/gdrive-import)
+
+「Drive の資料 (図入りの Google ドキュメント/スライド等) を永続RAGに入れたい」という
+要求への回答。`gdrive_read_file` のテキスト export (Docs→text/plain, Sheets→CSV) では
+**図・表・レイアウトが失われる**ので、HTML取り込みの画像解析と同じく Vision LLM に
+読ませる経路を Drive にも用意した。
+
+| 判断 | 理由 |
+|:--|:--|
+| **PDF export → 既存OCRパイプライン** に流す | Drive API は Docs/Slides/Sheets/図形描画を `application/pdf` に export できる。PDF にすれば図・表・レイアウトがそのまま保たれ、`ocr.js` のジョブ管理・ページキャッシュ・SSE進捗・RAG自動登録・カテゴリ対応を**全部そのまま使える**。HTML export から画像を拾う案は、埋め込み画像の解決やレイアウト再現が複雑になるだけで得がない |
+| 画像 (PNG/JPEG/WebP) は **1枚=1ページの画像ジョブ** | 画像→PDF変換の依存を増やさないため、`ocr.js` に「画像ソース」対応を足した。`isImageSource()` が真なら `pdftoppm` を通さず元画像を直接 VLM へ渡す (totalPages=1、poppler 不要なので `startJob` の依存チェックもスキップ) |
+| 対応判定は `isVlmImportableMime()` に一元化 | Google native (PDF export可) / PDF / 画像の判定を `google_drive.js` に置き、`simplify()` の `vlmImportable` フラグ (UI のグレーアウト用) とサーバーの事前チェックで共用する。ショートカットは `shortcutDetails.targetMimeType` で実体を判定 (`downloadFile` が実体へ辿るため) |
+| サイズ上限は `ocr.maxUploadMB` に合わせる | Drive の既定 `maxDownloadMB` (20MB) は「LLMがチャット中に読む」用の上限で、スキャンPDF級の取り込みには小さすぎる。`downloadFile` に `maxMB` オーバーライドを足した。なお Drive API の制約で巨大な Docs の PDF export は 10MB 制限で失敗することがある (エラーはそのまま UI に出す) |
+| ジョブに `origin` / `sourceLink` を持たせる | どこから来たファイルか一覧で分かるように「☁️ GDrive」バッジを出し、完了後に webViewLink で元ファイルへ飛べるようにする。`receiveUpload` とジョブ生成を `createJob()` に共通化し、Drive 用の入口は `registerFile()` (保存済みファイルのジョブ登録) として公開した |
+| UI は OCR タブ内のセクション + モーダル | 取り込み先が OCR ジョブなので、進捗・再開・再OCR・削除の UI をそのまま流用できる場所に置く。モーダルは `/gdrive/files` / `/gdrive/search` (既存エンドポイント) でフォルダ移動・全文検索・複数選択。未接続時は同じ場所から OAuth 接続できる (callback ページの postMessage を受ける方式はチャット画面と同じ) |
+
+```
+POST /ocr/gdrive-import { fileId, category?, autostart?, force? }
+  ↓ gdrive.status() で接続確認
+  ↓ gdrive.getFile(fileId) → vlmImportable を事前チェック (ダウンロード前に断る)
+  ↓ 既存ジョブ検索 (origin='gdrive' かつ gdriveFileId が一致)
+  ↓   あり & modifiedTime 不変 & !force → { skipped: true } で終了
+  ↓     (比較は取得済みメタで行うので、ダウンロードせずに返る)
+  ↓ gdrive.downloadFile(id, { preferPdf: true, maxMB: ocr.maxUploadMB })
+  ↓   Google native → PDF export / PDF・画像 → そのまま
+  ↓ [新規]   uploads/ragfiles/<カテゴリ>/<sanitizeSourceName(名前, 実体拡張子)> に保存
+  ↓          ocr.registerFile({ origin:'gdrive', sourceLink, gdriveFileId, gdriveModifiedTime })
+  ↓ [更新]   既存ジョブの filename に上書き保存 → ocr.refreshSourceMeta()
+  ↓ 既定でそのまま startJob (更新時は {redo:true}) → 以降は通常のOCRジョブと同じ
+```
+
+### Drive 側更新の検知と上書き再取り込み
+
+「Drive のドキュメントが更新されたら RAG も更新したい。ただし全部を勝手に同期は
+しない」という要求への回答。取り込み時に Drive の `fileId` と `modifiedTime` を
+ジョブに記録し (`gdriveFileId` / `gdriveModifiedTime`)、突き合わせで更新を検知する。
+
+| 判断 | 理由 |
+|:--|:--|
+| 同じ fileId の再取り込みは **既存ジョブの上書き更新** | 素朴に毎回新規ジョブにすると、`uniqueName` が `_2` を付けた別ファイル = 別 docId になり、**古い内容と新しい内容が両方 RAG に残って検索を汚す**。ファイル名を変えずにソースを差し替えれば mdFilename → docId も変わらず、`ragIngestFile` が同 docId の既存エントリを消してから登録する既存挙動 (index の filter → push) がそのまま上書き更新になる |
+| 更新なしなら **スキップ** (force で強制) | modifiedTime が同じなら再OCRは丸ごと無駄 (VLM で全ページ引き直すのはコストが高い)。「それでも取り直したい」の受け皿は既存の「🔄 再OCR」があるので、取り込み口では黙って回避する |
+| 比較は **`!==`** (新しい方向だけでなく変化そのもの) | Drive のバージョン復元でも modifiedTime は進むのが普通だが、万一巻き戻る形の変化でも「変わったら取り直す」が意図に合う |
+| `refreshSourceMeta()` は **ページキャッシュを必ず捨てる** | totalPages/donePages のリセットだけだと、autostart=false → 手動「▶ 開始」(redo なし) の経路で旧ソースのキャッシュがヒットし、**新旧ページが混ざった Markdown** ができる。redo に頼らずここで消す |
+| 拡張子が変わる更新は **409 で拒否** | fileId は同じままアップロードし直しで実体形式が変わることがある (.pdf → .png 等)。ファイル名を挿げ替えると docId が変わって上書きにならないので、「削除して取り込み直して」と明示的に断る (レアケースに複雑さを足さない) |
+| 一括確認は **`GET /ocr/gdrive-check`** (比較のみ) | Drive 由来ジョブ全件について `files.get` でメタだけ取り、記録と比較して返す。ダウンロード・再OCRはしない。実行は UI が確認ダイアログを挟んでから1件ずつ `/ocr/gdrive-import` に投げ直す (自動同期にしない: 更新の実行は常にユーザーの明示操作) |
+| モーダルのバッジは **一覧の modifiedTime とその場で比較** | `/gdrive/files` の応答に modifiedTime が既に載っているので、「✔ 取り込み済み」「🔄 更新あり」は追加APIなしで出せる |
+| Drive 側で削除されたファイルは `missing` として報告 | 404 で確認全体を止めない。ジョブと RAG 登録はローカルに残っているので、消すかどうかはユーザーの判断 |
+
 ### ジョブ状態
 
 `ml/ocr/jobs.json` に永続化（最大100件）。プロセス内の `running` Map には

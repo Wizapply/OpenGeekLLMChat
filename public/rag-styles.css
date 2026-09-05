@@ -142,3 +142,227 @@
     padding: 2px 8px;
     white-space: nowrap;
   }
+
+  /* ─── Google Drive からの取り込み (OCRタブ) ───
+     Drive のファイルを PDF 化して Vision LLM で OCR → 永続RAG登録する入口。 */
+  .gdrive-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    margin: 12px 0 16px;
+    flex-wrap: wrap;
+  }
+  .gdrive-bar-icon { font-size: 22px; flex-shrink: 0; }
+  .gdrive-bar-text { flex: 1; min-width: 240px; }
+  .gdrive-bar-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 2px;
+  }
+  .gdrive-bar-desc {
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.5;
+  }
+  .gdrive-bar-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+  .gdrive-bar-account {
+    font-size: 11px;
+    color: var(--text-secondary);
+    max-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* ファイルブラウザモーダル */
+  .gdrive-modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    padding: 20px;
+  }
+  .gdrive-modal {
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    width: min(680px, 100%);
+    max-height: min(80vh, 640px);
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+  }
+  .gdrive-modal-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 16px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .gdrive-modal-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+  .gdrive-modal-close {
+    appearance: none;
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 2px 6px;
+  }
+  .gdrive-modal-close:hover { color: var(--text-primary); }
+  .gdrive-modal-close:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .gdrive-toolbar {
+    display: flex;
+    gap: 8px;
+    padding: 10px 16px 0;
+  }
+  .gdrive-search {
+    flex: 1;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 13px;
+    padding: 7px 10px;
+  }
+  .gdrive-search:focus { outline: none; border-color: var(--accent); }
+
+  .gdrive-crumbs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+    padding: 8px 16px;
+    font-size: 12px;
+  }
+  .gdrive-crumb {
+    appearance: none;
+    background: none;
+    border: none;
+    color: var(--accent);
+    font-family: inherit;
+    font-size: 12px;
+    padding: 2px 4px;
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    white-space: nowrap;
+  }
+  .gdrive-crumb:hover { background: var(--bg-hover); }
+  .gdrive-crumb-current { color: var(--text-primary); font-weight: 600; padding: 2px 4px; white-space: nowrap; }
+  .gdrive-crumb-sep { color: var(--text-muted); }
+
+  .gdrive-list {
+    flex: 1;
+    min-height: 180px;
+    overflow-y: auto;
+    border-top: 1px solid var(--border);
+    padding: 6px 8px;
+  }
+  .gdrive-list-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 160px;
+    color: var(--text-muted);
+    font-size: 13px;
+    text-align: center;
+    padding: 0 20px;
+  }
+  .gdrive-list-empty.error { color: var(--danger, #ef4444); }
+  .gdrive-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    appearance: none;
+    background: none;
+    border: none;
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 13px;
+    text-align: left;
+    padding: 8px 10px;
+    cursor: pointer;
+  }
+  .gdrive-item:hover { background: var(--bg-hover); }
+  .gdrive-item.selected { background: var(--accent-dim, rgba(52, 211, 153, 0.12)); }
+  .gdrive-item.disabled { opacity: 0.45; cursor: not-allowed; }
+  .gdrive-item input[type="checkbox"] { flex-shrink: 0; accent-color: var(--accent); }
+  .gdrive-item-icon { flex-shrink: 0; }
+  .gdrive-item-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .gdrive-item-meta {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+  /* 取り込み済み / Drive側更新あり のバッジ */
+  .gdrive-item-badge {
+    flex-shrink: 0;
+    font-size: 10px;
+    color: var(--accent);
+    background: var(--accent-dim, rgba(52, 211, 153, 0.12));
+    border-radius: 999px;
+    padding: 2px 8px;
+    white-space: nowrap;
+  }
+  .gdrive-item-badge.updated {
+    color: var(--orange, #f59e0b);
+    background: rgba(245, 158, 11, 0.12);
+  }
+
+  .gdrive-foot {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    justify-content: space-between;
+    padding: 10px 16px 14px;
+    border-top: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .gdrive-foot-note {
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.5;
+  }
+  .gdrive-foot-progress {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  @media (max-width: 768px) {
+    .gdrive-bar-actions { margin-left: 0; width: 100%; justify-content: flex-end; }
+    .gdrive-modal { max-height: 92vh; }
+    .gdrive-item-meta { display: none; }
+  }
