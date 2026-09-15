@@ -358,6 +358,18 @@ LLMが生成したThree.jsコードをチャット内でワンクリック実行
 ### 📊 生成CSVの学習登録
 チャットが生成した ` ```csv ` / ` ```tsv ` コードブロックの「📊 学習に登録」ボタンから、その場で **MLデータテーブル (DuckDB)** または **ファインチューニングの教師データ** (instruction/response 列) に登録。LLMツール (`ml_import_csv` / `tuning_import_samples`) でも「このCSVをMLに登録して」の一言で登録できる (エージェントハーネスの権限モードに従う書き込みツール)。
 
+### 🧠 会話を学習データに登録（人が直してから登録）
+回答の下の **「🧠 学習データに登録」** から、その往復をファインチューニングの教師データにできる。**そのまま登録せず、ダイアログで人が直してから登録する**のが前提（実際の会話は「さっきのやつを詳しく」のような指示語や出典キー【S1】が混ざっていて、そのままでは教師データとして使えないため）。
+
+- **3つの登録モード**:
+  - **✏️ この1往復**: User（質問）/ Assistant（回答）/ System をその場で編集して1件登録。前後のターンへも移動できる
+  - **🔁 マルチターン**: このターンから遡って N 往復ぶんを `messages` 形式で1サンプルに（会話の流れごと覚えさせたいとき）
+  - **☑️ 会話から選ぶ**: 会話中の往復を一覧表示し、チェックしたものを一括登録（✏️ で個別編集に切り替え）
+- **自動クリーンアップ**: `<think>` の残骸、画像・音声の埋め込みマーカー、出典キー【S1】（ON/OFF可）を落としてから編集欄に入る
+- **登録前の警告（止めはしない）**: 質問の指示語、回答が短すぎ/長すぎ、「資料によると」等のメタ表現、断り応答の混入を検出して表示。最終判断はユーザー
+- **RAG運用型(open)での登録**: 永続RAGを使った回答なら「参考資料を入力に含める」で、チャットの検索結果と同じ体裁（`── 資料 S1 ──` / 出典キー）で資料を添えた形にできる。体裁は `tuning.ragDataset` の設定を共用
+- 登録先は 🧠 ファインチューニングの「学習データ」タブ（`tuning/samples.jsonl`）。タグ `chat` が付くので後から絞り込める
+
 ### 🎤 音声入力 (Web Speech API)
 マイクボタンから日本語音声認識。リアルタイムで入力欄に反映。**3秒無音で自動送信**、送信後は録音自動停止。
 
@@ -485,6 +497,8 @@ config.json から HTTPサーバーや llama-server の細かな設定を調整�
 チャットUIから完全独立した管理画面（`/tuning.html`）で、ローカルLLMのファインチューニング（LoRA / QLoRA / Full）を実行できる。
 
 - **学習データ管理**: 手動追加・編集、CSV/JSONL インポート、JSONL エクスポート
+- **RAGから教師データ生成**: 登録済みの永続RAG資料からLLMにQ&Aを作らせて学習データにする（[🧬 RAGから教師データ生成](#-ragから教師データ生成永続rag--qa--学習データ)）
+- **チャットからの登録**: 実際の会話の往復を、編集・レビューしてから教師データにする（[🧠 会話を学習データに登録](#-会話を学習データに登録人が直してから登録)）
 - **TRL SFTTrainer + peft (LoRA)** ベース、AMD ROCm環境にも対応 (`HSA_OVERRIDE_GFX_VERSION` 等を自動設定)
 - **マルチターン（messages）+ シングルターン（instruction/output）両対応**
 - **学習開始**: ベースモデル選択（プリセット or HuggingFace ID 直接入力）、ハイパラ設定（epochs, LR, batch, accum, LoRA r/α, max_seq_length）
@@ -493,6 +507,26 @@ config.json から HTTPサーバーや llama-server の細かな設定を調整�
 - **後処理パイプライン**: 学習完了後にUIから「📦 マージ→GGUF→量子化」を1ボタン実行
 - **タブ間状態保持**: タブを行き来しても入力中の値が消えない (display 切替方式)
 - **チャット画面からワンクリック遷移**: モデル選択の下に「🧠 ファインチューニング」リンク
+
+### 🧬 RAGから教師データ生成（永続RAG → Q&A → 学習データ）
+`/tuning.html` の **「🧬 RAGから生成」** タブで、**登録済みの永続RAG資料からファインチューニング用の教師データ（Q&A）をLLMに作らせる**。PDFをOCR登録した直後の資料から、そのまま学習データが作れる。
+
+- **素材は永続RAGのチャンク**: 検索用チャンク（既定500文字）を `passageChunks` 個ずつ連結して「パッセージ」に束ね直す。Q&Aを作るには500文字では文脈が足りないため（定義と条件が別チャンクに割れる）
+- **3つのプロンプトで作る**: ① Q&A生成 ② 拒否サンプル（資料に無いことを聞く質問）③ 検証（資料に書かれているか／質問が自立しているか）。**プロンプトはUIのテキストエリアでそのまま編集でき**、恒久設定は `config.json` の `tuning.ragDataset`
+- **機械チェック → LLM検証の二段構え**: 指示語（「この資料の〜」）を含む質問、資料に無い数値を含む回答、資料との文字3-gram重なりが低い回答、既存質問との重複を機械的に落としてから、残ったものだけLLMに検証させる（検証はサンプル1件=LLM1回なので、安いチェックを先に通す）
+- **2つの取り込み形式**:
+  - **知識注入型 (closed)**: 資料を渡さず質問だけで答えさせる形。RAGなしで社内知識に答えられるようにしたいとき
+  - **RAG運用型 (open)**: チャットの検索結果と**同じ体裁**（`── 資料 S1 ──` / 出典キー）で資料を添えて答えさせる形。資料の読み方と出典の付け方、そして「資料に無ければ断る」型を教える
+  - **both**: 同じQ&Aから両方を作る
+- **拒否サンプル**: 「資料の話題には近いが答えが書かれていない」質問を作らせ、回答は `refusalAnswers` の定型文に差し替える。範囲外を聞かれたときの作文を抑える
+- **レビューしてから取り込み**: 採用/不採用をUIで1件ずつ切り替え、JSONLダウンロードも可能。「📥 学習データへ取り込む」で `tuning/samples.jsonl` に追加され、そのまま学習ジョブの対象になる
+- **ジョブ方式**: 進捗はSSEでリアルタイム表示、停止・**続きから再開**（処理済みパッセージは飛ばす）・やり直しに対応。サーバー再起動で中断されたジョブは待機中に戻る
+- **生成モデルはプール管理可**: `tuning.ragDataset.poolModel` に `chatModels` の名前を入れると、生成中だけロードされ終われば自動アンロード（空ならメインチャットの llama-server をそのまま使う）
+- **モデルの自動ロード**: `poolModel` 未設定でメインチャットの llama-server を使う構成では、モデルが載っていなければ**生成開始時に自動で起動**し、生成中はアイドルアンロードされないよう使用時刻を更新し続ける（長いジョブの途中でモデルが落とされて全滅するのを防ぐ）
+- **接続できないときは即停止**: llama-server に繋がらない場合は数回リトライしたうえでジョブを止め、理由（接続拒否 / ホスト名解決失敗 / VRAM不足による異常終了 等）を日本語で表示する。原因を直したら「▶ 続きから」で再開できる
+
+> **「生成失敗: fetch failed」と出たら**: 生成先の llama-server に接続できていません。① チャット画面でモデルを1つ読み込む ② `config.json` の `tuning.ragDataset.poolModel` に `chatModels` の名前を設定する（生成中だけ自動でロード/アンロード）③ `tuning.ragDataset.endpoint` を指定している場合はその URL とポートを確認する — のいずれかで解消します。現在のバージョンでは、この状況は開始時に具体的な理由付きで表示されます。
+
 
 ### ⚙️ ブラウザから config.json 編集
 `/editconfig.html` で config.json を直接編集可能。チャット画面左下の小さな歯車アイコンからもアクセスできる。
@@ -1199,6 +1233,7 @@ opengeek-llm-chat/
 ├── orchestrator.js             # マルチLLMオーケストレーション実行エンジン (ワークフローDAG実行)
 ├── ocr.js                      # PDF OCR パイプライン (pdftoppm + Vision LLM + ジョブキュー、依存なし)
 ├── html_rag.js                 # HTML / RAG登録パイプライン (HtmlRAGクリーニング + Markdown変換、依存なし)
+├── rag_tune.js                 # 永続RAG → 教師データ生成 (パッセージ化 + Q&A生成/検証 + ジョブキュー、依存なし)
 ├── public/
 │   ├── index.html              # React SPA（チャットUI）
 │   ├── styles.css              # メインスタイルシート (CSS変数, レイアウト, コンポーネント)
@@ -1253,8 +1288,11 @@ opengeek-llm-chat/
 │   │   ├── jobs.json           # OCRジョブの状態（再起動しても復元される）
 │   │   └── cache/<jobId>/      # ページ単位のMarkdownキャッシュ（中断ジョブの再開用）
 │   │       └── pXXXX.md        # 1ページぶんのOCR結果
-│   └── htmlrag/                # HTML / RAG登録の作業データ（自動生成）
-│       └── jobs.json           # 取り込みジョブの状態（再起動しても復元される）
+│   ├── htmlrag/                # HTML / RAG登録の作業データ（自動生成）
+│   │   └── jobs.json           # 取り込みジョブの状態（再起動しても復元される）
+│   └── ragtune/                # RAGからの教師データ生成（自動生成）
+│       ├── jobs.json           # 生成ジョブの状態（再起動しても復元される）
+│       └── out/<jobId>.jsonl   # 生成されたQ&A（採用/不採用と判定理由つき、取り込み前のレビュー用）
 ├── chats/                      # チャット履歴JSON（自動生成）
 ├── settings.json               # ユーザー設定（自動生成）
 ├── DESIGN.md                   # 設計ドキュメント
@@ -1455,6 +1493,17 @@ opengeek-llm-chat/
 | `tuning.modelPresets[].vramLora` | LoRA時VRAM目安（ホバー表示用） |
 | `tuning.modelPresets[].desc` | ホバー時の説明 |
 | `tuning.modelPresets[].epochs/lr/batch/accum/r/alpha/maxLen` | プリセット選択時に自動入力されるハイパラ |
+| `tuning.ragDataset.enabled` | RAGから教師データを作る機能 ON/OFF |
+| `tuning.ragDataset.poolModel` | 生成に使うモデル名（`chatModels` の名前）。生成中だけロードされ、終われば自動アンロード。空ならメインチャットの llama-server を使う |
+| `tuning.ragDataset.mode` | 取り込み形式の既定値（`closed` 知識注入型 / `open` RAG運用型 / `both`） |
+| `tuning.ragDataset.passageChunks` | 検索用チャンクを何個つないで1パッセージにするか（既定3） |
+| `tuning.ragDataset.questionsPerPassage` | 1パッセージあたり作らせるQ&A数（既定3） |
+| `tuning.ragDataset.refusalPerPassage` / `refusalEveryNth` | 拒否サンプルの件数と間隔（既定 1件を3パッセージに1回） |
+| `tuning.ragDataset.verify` | 生成したQ&Aを別プロンプトでLLMに検証させる（既定 true） |
+| `tuning.ragDataset.minCoverage` / `checkNumbers` / `dedupeThreshold` | 機械チェックのしきい値（資料との重なり / 数値の裏取り / 質問の重複判定） |
+| `tuning.ragDataset.generatePrompt` / `refusalPrompt` / `verifyPrompt` | 生成・拒否例・検証の3プロンプト（UIからも編集可） |
+| `tuning.ragDataset.contextTemplate` | open形式の入力テンプレート（チャットの検索結果と同じ体裁に合わせること） |
+| `tuning.ragDataset.closedSystemPrompt` / `openSystemPrompt` | 学習サンプルに付ける system |
 | `webSearch` | DuckDuckGo検索 ON/OFF（UIトグル初期値） |
 | `fileAccess` | サーバーファイル読み書き ON/OFF |
 | `googleDrive.enabled` | Google Drive 連携 ON/OFF |

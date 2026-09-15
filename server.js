@@ -13,6 +13,7 @@ const { createOrchestrator, validateWorkflow } = require('./orchestrator');
 const { createGoogleDrive, isVlmImportableMime } = require('./google_drive');
 const { createOcrManager, sanitizeSourceName, uniqueName: uniqueUploadName } = require('./ocr');
 const { createHtmlRagManager } = require('./html_rag');
+const { createRagTuneManager } = require('./rag_tune');
 
 // systemd等で起動された際、カレントディレクトリをserver.jsと同じに固定する
 // これにより相対パスでアクセスされるリソース(モデルキャッシュ等)も安定動作する
@@ -11329,6 +11330,342 @@ app.delete('/htmlrag/jobs/:jobId', requireAuth, requirePermission('ml:write'), (
     const r = htmlRag.deleteJob(req.params.jobId, { keepFiles: req.query.keepFiles === '1' });
     log(ip, `[HTML-RAG] ジョブ削除: ${req.params.jobId}`);
     res.json(r);
+  } catch (e) { ocrError(res, e); }
+});
+
+// ════════════════════════════════════════════════
+// 永続RAG → ファインチューニング教師データ生成 (rag_tune.js)
+// ════════════════════════════════════════════════
+// 登録済みRAGドキュメントのチャンクを LLM に読ませ、
+// 「その資料だけで答えられる Q&A」を作らせて学習サンプルにする。
+// OCR/HTML取り込みと同じジョブ方式 (SSEで進捗、再起動で待機中に戻る)。
+
+// 生成用LLMの確保。OCR の Vision LLM と同じ考え方で、
+// tuning.ragDataset.poolModel に chatModels の名前を入れるとプール管理になり、
+// 生成中だけロード → 終われば orchestration.idleUnloadMs でアンロードされる。
+// 空ならメインチャットの llama-server (既に載っているモデル) をそのまま使う。
+function ragTuneCfg() {
+  return (appConfig.tuning && appConfig.tuning.ragDataset) || {};
+}
+
+function ragTunePoolModelName() {
+  return String(ragTuneCfg().poolModel || '').trim();
+}
+
+function ragTuneEndpoint() {
+  const c = ragTuneCfg();
+  if (c.endpoint) return String(c.endpoint);
+  const ls = appConfig.llamaServer || {};
+  return `http://${ls.chatHost || '127.0.0.1'}:${ls.chatPort || 8080}/v1/chat/completions`;
+}
+
+// 既定エンドポイント (メインチャットの llama-server) を使うときの準備。
+// チャットは「リクエストが来たら起動」方式なので、生成側が何もしないと
+// 未ロードのポートを叩いて ECONNREFUSED になる (画面には「fetch failed」としか出ない)。
+// ここでロード完了まで待ってから生成を始める。
+async function ragTuneEnsureMainChat() {
+  const ls = appConfig.llamaServer || {};
+  if (chatProc && !chatProcStarting) { chatLastUsed = Date.now(); return; }
+  if (chatProcStarting) {
+    // 他のリクエストが起動中: 準備できるまで待つ
+    const ready = await waitForReady(ls.chatHost, ls.chatPort, ls.readyTimeoutMs || 120000);
+    if (!ready) throw new Error('チャットモデルの起動を待ちましたが応答がありません');
+    chatLastUsed = Date.now();
+    return;
+  }
+  // 未ロード: アイドルアンロードされたモデル → defaultModel → 先頭のモデル の順で起動する
+  const model = chatProcAutoUnloaded || appConfig.defaultModel
+    || (appConfig.chatModels && appConfig.chatModels[0] && appConfig.chatModels[0].name);
+  if (!model) {
+    throw new Error('起動できるチャットモデルがありません。config.json の chatModels / defaultModel を確認するか、'
+      + 'tuning.ragDataset.poolModel に生成用モデルを指定してください');
+  }
+  log('-', `[RAG教師データ] 生成用にチャットモデル「${model}」を起動します`);
+  await startChatModel(model);   // waitForReady 内蔵。完了まで待つ
+  chatLastUsed = Date.now();
+}
+
+// 生成用LLMが使えるか。プール管理なら定義の検証だけ (プロセスはジョブ開始時に起動する)、
+// 外部エンドポイントなら生存確認
+async function ragTuneCheckLlm() {
+  const name = ragTunePoolModelName();
+  if (name) {
+    const m = findModelByName(name);
+    if (!m) {
+      return { ok: false, managed: true, modelName: name,
+        message: `tuning.ragDataset.poolModel「${name}」が config.json の chatModels に見つかりません` };
+    }
+    if (!fs.existsSync(m.path)) {
+      return { ok: false, managed: true, modelName: name, message: `モデルファイルが存在しません: ${m.path}` };
+    }
+    return { ok: true, managed: true, modelName: name, endpoint: `LLMプール管理 (${name})` };
+  }
+  const endpoint = ragTuneEndpoint();
+  let origin;
+  try { origin = new URL(endpoint).origin; }
+  catch { return { ok: false, managed: false, message: `tuning.ragDataset.endpoint が不正なURLです: ${endpoint}` }; }
+  for (const p of ['/health', '/v1/models']) {
+    try {
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), 4000);
+      const r = await fetch(origin + p, { signal: ctl.signal });
+      clearTimeout(t);
+      if (r.ok) return { ok: true, managed: false, endpoint, modelName: chatProcModel || null };
+    } catch {}
+  }
+  // 既定エンドポイント (メインチャット) なら、未ロードでもジョブ開始時に
+  // 自動で起動するので「使えない」ではない。何が起動するかを添えて ok を返す
+  if (!ragTuneCfg().endpoint) {
+    const willLoad = chatProcAutoUnloaded || appConfig.defaultModel
+      || (appConfig.chatModels && appConfig.chatModels[0] && appConfig.chatModels[0].name);
+    // 自動起動できると言い切る前に、実体があるかだけ確かめる
+    // (ファイルが無ければ開始直後に必ず失敗するので、先に伝えた方が早い)
+    const willLoadDef = willLoad ? findModelByName(willLoad) : null;
+    if (willLoad && (!willLoadDef || !fs.existsSync(willLoadDef.path))) {
+      return {
+        ok: false, managed: false, endpoint,
+        message: willLoadDef
+          ? `自動起動するモデル「${willLoad}」のファイルがありません: ${willLoadDef.path}`
+          : `自動起動するモデル「${willLoad}」が config.json の chatModels に見つかりません`,
+      };
+    }
+    if (willLoad) {
+      return {
+        ok: true, managed: false, endpoint, modelName: willLoad,
+        note: `モデルは未ロードです。生成開始時に「${willLoad}」を自動で起動します`
+          + `（チャットと同じ llama-server を使うため、生成中はチャットの応答が待たされます。`
+          + `別々に動かすなら tuning.ragDataset.poolModel を設定してください）`,
+      };
+    }
+  }
+  return {
+    ok: false, managed: false, endpoint,
+    message: `生成用LLMに接続できません (${endpoint})。チャット画面でモデルを1つ読み込むか、`
+      + `tuning.ragDataset.poolModel に chatModels の名前を設定してください`
+      + `(設定すると生成中だけ自動でロード/アンロードされます)`,
+  };
+}
+
+async function ragTuneAcquireLlm() {
+  const c = ragTuneCfg();
+  const name = ragTunePoolModelName();
+  if (!name) {
+    // メインチャットの llama-server をそのまま使う。model は llama.cpp 側では
+    // 無視されるので、載っているモデルが何であれ動く。
+    // 自前のエンドポイント指定が無い = アプリが管理する llama-server なので、
+    // 未ロードならここで起動を待つ (待たないと最初のパッセージで接続を拒否される)
+    if (!c.endpoint) await ragTuneEnsureMainChat();
+    return {
+      endpoint: ragTuneEndpoint(),
+      model: c.model || chatProcModel || 'local',
+      modelName: chatProcModel || null,
+      release: () => {},
+      // 生成のたびに最終使用時刻を更新する。チャット経由でしか更新されないと、
+      // 長いジョブの途中で idleUnloadMs のアイドル判定に引っかかってモデルが
+      // アンロードされ、以降の全パッセージが接続エラーになる
+      keepAlive: () => { chatLastUsed = Date.now(); },
+    };
+  }
+  // 単一GPUだとチャットモデルと同居できないことがある。載らないなら
+  // swap (メインチャットを一時アンロード) で確保する
+  const plan = llmPool.planMode([name]);
+  log('-', `[RAG教師データ] 生成LLM「${name}」を${plan.mode === 'swap' ? '逐次スワップ' : '常駐'}で確保します: ${plan.reason}`);
+  const handle = await llmPool.acquire(name, { mode: plan.mode });
+  return {
+    endpoint: `http://${handle.host}:${handle.port}/v1/chat/completions`,
+    model: name, modelName: name,
+    release: () => handle.release(),
+    // プールは refCount で保持するのでアイドルアンロードされないが、
+    // reuseMainChat でメインチャットのプロセスを借りる構成もあるので更新しておく
+    keepAlive: () => { chatLastUsed = Date.now(); },
+  };
+}
+
+const ragTune = createRagTuneManager({
+  getConfig: () => ragTuneCfg(),
+  baseDir: __dirname,
+  log: (ip, msg) => log(ip, msg),
+  listDocs: () => loadRagIndex().documents,
+  // RAGドキュメント本体 (chunks / pages / overlap) を読む。
+  // embeddings も入っているが生成には使わないのでそのまま捨てる
+  loadDoc: (docId) => {
+    if (!/^[a-f0-9]{16}$/.test(String(docId || ''))) return null;
+    const p = path.join(RAG_DIR, `${docId}.json`);
+    if (!fs.existsSync(p)) return null;
+    try { return JSON.parse(fs.readFileSync(p, 'utf-8')); }
+    catch (e) { log('-', `[RAG教師データ] ドキュメント読み込み失敗 (${docId}): ${e.message}`); return null; }
+  },
+  llm: { check: () => ragTuneCheckLlm(), acquire: () => ragTuneAcquireLlm() },
+  // 学習サンプルDB (tuning/samples.jsonl) への追記。tuning.html の
+  // 「学習データ」タブにそのまま並び、次の学習ジョブの train.jsonl に入る
+  addSamples: (rows) => {
+    const samples = loadAllSamples();
+    for (const r of rows) {
+      samples.push({
+        id: generateSampleId(),
+        instruction: String(r.instruction || ''),
+        response: String(r.response || ''),
+        system: r.system ? String(r.system) : '',
+        tags: Array.isArray(r.tags) ? r.tags : [],
+        createdAt: Date.now(),
+      });
+    }
+    saveAllSamples(samples);
+    return { added: rows.length, total: samples.length };
+  },
+});
+
+// 起動時: 実行中のまま落ちたジョブを「待機中」に戻す (出力JSONLは残るので続きから再開できる)
+ragTune.restoreOnBoot();
+
+function requireRagTune(req, res, next) {
+  if (!ragTune.isEnabled()) {
+    return res.status(503).json({ error: 'RAG教師データ生成が無効です (config.json の tuning.ragDataset.enabled を true にしてください)' });
+  }
+  next();
+}
+
+function validRagTuneJobId(id) {
+  return typeof id === 'string' && /^rtune_[a-z0-9]+$/.test(id);
+}
+
+// 機能の状態 (LLMの用意・登録ドキュメント数・既定パラメータとプロンプト)。
+// UIはこの defaults をフォームの初期値に使う
+app.get('/tuning/rag/status', requireAuth, requirePermission('ml:read'), async (req, res) => {
+  try { res.json(await ragTune.health()); }
+  catch (e) { ocrError(res, e); }
+});
+
+// ジョブ一覧
+app.get('/tuning/rag/jobs', requireAuth, requirePermission('ml:read'), (req, res) => {
+  res.json({ jobs: ragTune.listJobs() });
+});
+
+// ジョブ作成 (既定でそのまま実行開始。{start:false} で待機のまま作る)
+// body: { docIds?: [...], category?: "名前", title?, start?, params?: {...} }
+//   params はプロンプト・件数・フィルタ閾値など。省略時は config.json の
+//   tuning.ragDataset を使う (UIは status の defaults を編集して投げてくる)
+app.post('/tuning/rag/jobs', requireAuth, requirePermission('ml:write'), requireRagTune, jsonParser, (req, res) => {
+  const ip = getIP(req);
+  const body = req.body || {};
+  try {
+    const job = ragTune.createJob({
+      docIds: Array.isArray(body.docIds) ? body.docIds : null,
+      category: body.category,
+      params: body.params || {},
+      title: body.title || '',
+    });
+    log(ip, `[RAG教師データ] ジョブ登録: ${job.title}`);
+    if (body.start === false) return res.json({ job });
+    res.json({ job: ragTune.startJob(job.jobId) });
+  } catch (e) { ocrError(res, e); }
+});
+
+// 個別ジョブ
+app.get('/tuning/rag/jobs/:jobId', requireAuth, requirePermission('ml:read'), (req, res) => {
+  if (!validRagTuneJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const job = ragTune.getJob(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'ジョブが見つかりません' });
+  res.json({ job });
+});
+
+// 進捗のリアルタイム配信 (SSE)。パッセージが1つ進むごとに status イベントが飛ぶ
+app.get('/tuning/rag/jobs/:jobId/stream', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const jobId = req.params.jobId;
+  if (!validRagTuneJobId(jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const job = ragTune.getJob(jobId);
+  if (!job) return res.status(404).json({ error: 'ジョブが見つかりません' });
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  const send = (event) => { if (!res.writableEnded) res.write(`data: ${JSON.stringify(event)}\n\n`); };
+  send({ type: 'status', job });
+
+  const unsubscribe = ragTune.subscribe(jobId, send);
+  const ping = setInterval(() => { if (!res.writableEnded) res.write(': ping\n\n'); }, 15000);
+  req.on('close', () => { clearInterval(ping); unsubscribe(); });
+});
+
+// ジョブ開始 / 再開 (中断・失敗したジョブは続きから。{redo:true} で最初から作り直す)
+app.post('/tuning/rag/jobs/:jobId/start', requireAuth, requirePermission('ml:write'), requireRagTune, jsonParser, (req, res) => {
+  if (!validRagTuneJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  try { res.json({ job: ragTune.startJob(req.params.jobId, { redo: (req.body || {}).redo === true }) }); }
+  catch (e) { ocrError(res, e); }
+});
+
+// 実行中ジョブの中断 (生成中のリクエストを打ち切る。それまでの出力は残る)
+app.post('/tuning/rag/jobs/:jobId/cancel', requireAuth, requirePermission('ml:write'), (req, res) => {
+  if (!validRagTuneJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const ip = getIP(req);
+  try {
+    const job = ragTune.cancelJob(req.params.jobId);
+    log(ip, `[RAG教師データ] キャンセル要求: ${job.title}`);
+    res.json({ job });
+  } catch (e) { ocrError(res, e); }
+});
+
+// ジョブ削除 (生成結果のJSONLごと削除。?keepFile=1 で結果は残す)
+// 学習サンプルDBへ取り込み済みのものは消えない (別ファイルなので影響しない)
+app.delete('/tuning/rag/jobs/:jobId', requireAuth, requirePermission('ml:write'), (req, res) => {
+  if (!validRagTuneJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const ip = getIP(req);
+  try {
+    const r = ragTune.deleteJob(req.params.jobId, { keepFile: req.query.keepFile === '1' });
+    log(ip, `[RAG教師データ] ジョブ削除: ${req.params.jobId}`);
+    res.json(r);
+  } catch (e) { ocrError(res, e); }
+});
+
+// 生成結果の閲覧 (レビュー用)。?status=accepted|rejected|all&offset=&limit=&context=1
+app.get('/tuning/rag/jobs/:jobId/samples', requireAuth, requirePermission('ml:read'), (req, res) => {
+  if (!validRagTuneJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  try {
+    res.json(ragTune.listSamples(req.params.jobId, {
+      status: req.query.status || 'all',
+      offset: req.query.offset,
+      limit: req.query.limit,
+      withContext: req.query.context === '1',
+    }));
+  } catch (e) { ocrError(res, e); }
+});
+
+// 採用 / 除外の手動切り替え body: { ids?: [...], status: 'accepted'|'rejected' }
+app.post('/tuning/rag/jobs/:jobId/samples/status', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  if (!validRagTuneJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const body = req.body || {};
+  try { res.json(ragTune.setSampleStatus(req.params.jobId, { ids: body.ids, status: body.status })); }
+  catch (e) { ocrError(res, e); }
+});
+
+// 学習サンプルDB (tuning/samples.jsonl) へ取り込み
+// body: { ids?: [...], mode?: 'closed'|'open'|'both' }
+//   closed … 資料を渡さず質問だけで答えさせる形 (知識をモデルに埋め込む)
+//   open   … 検索結果と同じ体裁で資料を添えて答えさせる形 (RAG運用の型を教える)
+//   both   … 同じQ&Aから両方を作る
+app.post('/tuning/rag/jobs/:jobId/import', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  if (!validRagTuneJobId(req.params.jobId)) return res.status(400).json({ error: '無効なjobId' });
+  const ip = getIP(req);
+  const body = req.body || {};
+  try {
+    const r = ragTune.importSamples(req.params.jobId, { ids: body.ids, mode: body.mode });
+    log(ip, `[RAG教師データ] 学習サンプルへ取り込み: ${r.added} 件 (mode=${r.mode})`);
+    res.json(r);
+  } catch (e) { ocrError(res, e); }
+});
+
+// 生成結果を学習サンプル形式の JSONL でダウンロード (?mode=&status=)
+app.get('/tuning/rag/jobs/:jobId/export', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const jobId = req.params.jobId;
+  if (!validRagTuneJobId(jobId)) return res.status(400).json({ error: '無効なjobId' });
+  try {
+    const jsonl = ragTune.exportJsonl(jobId, { mode: req.query.mode, status: req.query.status || 'accepted' });
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    res.setHeader('Content-Disposition', `attachment; filename="${jobId}.jsonl"`);
+    res.send(jsonl);
   } catch (e) { ocrError(res, e); }
 });
 

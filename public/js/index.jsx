@@ -1539,6 +1539,420 @@ function findLastCsvFence(messageLists) {
   return null;
 }
 
+// ─── チャットの会話 → ファインチューニング教師データ登録 ───
+// 回答の「🧠 学習データに登録」から開く。
+//
+// なぜダイアログ (ワンクリック登録ではない) か
+//   実際の会話をそのまま教師データにすると、たいてい使い物にならない:
+//     ・質問が「さっきのやつをもう少し詳しく」のような指示語で、単体では意味を成さない
+//     ・回答に出典キー【S1】や画像マーカー、思考の残骸が混ざっている
+//     ・そのターンだけ脱線している / 回答が間違っている
+//   これらは人が見れば一目で分かるが、機械には判別できない。
+//   そこで「取り込む前に人が直す」前提のUIにして、警告だけ機械が出す。
+//
+// 登録先は既存の学習サンプルDB (tuning/samples.jsonl)。APIも tuning.html と同じ
+//   単一ターン  → POST /tuning/samples
+//   複数/会話   → POST /tuning/samples/import (format: jsonl)
+
+// 単体で意味が通らない質問によく出る語。学習時は質問文しか残らないので、
+// 指す先が会話の中にある質問はそのままでは教師データにできない
+const CHAT_DEICTIC_RE = /(さっき|先ほど|先程|前の(回答|質問|やつ)|上記|さきほど|これ(を|は|の)|それ(を|は|の)|その(件|話|コード)|あの|続き)/;
+// 回答に残ると「RAGを使っていない場面でも資料の話をする」癖になる表現
+const CHAT_META_RE = /(資料|文書|本文|検索結果|コンテキスト)(に|には|では|によ)/;
+// 永続RAGの出典キー (【S1】)。closed形式で学習するなら消す。
+// test() 用は非グローバルにする (/g の test は lastIndex が進み、呼ぶたび結果が変わる)
+const CHAT_CITATION_RE = /【[A-Za-z]\d+】/g;
+const CHAT_CITATION_TEST_RE = /【[A-Za-z]\d+】/;
+
+/** 教師データに入れたくない装飾を落とす (元の会話は触らない) */
+function cleanSampleText(text, { citations = true, markers = true } = {}) {
+  let s = String(text || '');
+  s = s.replace(/<think>[\s\S]*?<\/think>/gi, '');     // 思考タグ (表示上は別欄だが念のため)
+  if (markers) {
+    // 画像/音声の埋め込みマーカーは画面描画用。学習データに入れても意味がない
+    s = s.replace(/\[\[gen_image:[^\]]*\]\]/g, '').replace(/\[\[gen_audio:[^\]]*\]\]/g, '');
+  }
+  if (citations) s = s.replace(CHAT_CITATION_RE, '');
+  return s.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/**
+ * 会話から user → assistant の組を拾う。
+ * 画像だけのターンやエラー表示だけの応答は教師データにならないので落とす。
+ */
+function buildTurnPairs(messages) {
+  const pairs = [];
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m.role !== 'assistant' || !String(m.content || '').trim()) continue;
+    // 直前の user 発言を探す (間に system 注入が入ることがある)
+    let q = null;
+    for (let j = i - 1; j >= 0; j--) {
+      if (messages[j].role === 'user') { q = messages[j]; break; }
+      if (messages[j].role === 'assistant') break;   // 連続assistantなら対応する質問なし
+    }
+    if (!q || !String(q.content || '').trim()) continue;
+    pairs.push({
+      index: i,
+      question: String(q.content),
+      answer: String(m.content),
+      hasImages: !!(q.images && q.images.length),
+      ragSources: m.ragSources || null,
+    });
+  }
+  return pairs;
+}
+
+/** 登録前の注意書き。止めはしない (最終判断はユーザー) */
+function checkSampleQuality(instruction, response, { open = false } = {}) {
+  const warns = [];
+  const q = String(instruction || '');
+  const a = String(response || '');
+  if (!q.trim()) warns.push('質問が空です');
+  if (!a.trim()) warns.push('回答が空です');
+  if (!open && CHAT_DEICTIC_RE.test(q)) {
+    warns.push('質問に指示語があります（「さっきの」「これ」等）。学習時は質問文しか残らないので、単体で意味が通る形に書き直してください');
+  }
+  if (q.length > 400) warns.push(`質問が長め（${q.length}文字）。回答の条件が質問に埋もれていないか確認してください`);
+  if (a.length < 10) warns.push('回答が短すぎます');
+  if (a.length > 2000) warns.push(`回答が長め（${a.length}文字）。1問1答に切り分けた方が学習は安定します`);
+  if (!open && CHAT_CITATION_TEST_RE.test(a)) {
+    warns.push('回答に出典キー【S1】が残っています。資料を渡さない形（知識注入型）で学習するなら消してください');
+  }
+  if (!open && CHAT_META_RE.test(a)) {
+    warns.push('回答に「資料によると」等のメタ表現があります。RAGを使わない場面でも言い出す癖になります');
+  }
+  if (/申し訳|できません|分かりません/.test(a) && a.length < 120) {
+    warns.push('断り・失敗の応答のようです。意図的な拒否例でなければ登録しないでください');
+  }
+  return warns;
+}
+
+/**
+ * RAG運用型 (open) の入力を組み立てる。
+ * チャットが検索結果をLLMへ渡す体裁 (── 資料 S1 ── / 出典キー) に合わせる。
+ * 体裁が推論時とズレると、学習した「資料を読んで答える型」が本番で発火しない。
+ * 1資料のときは config の contextTemplate をそのまま使い、複数資料はここで組む。
+ */
+function renderRagContext(ragSources, question, cfg = {}) {
+  const sources = (ragSources || []).filter(s => s && String(s.text || '').trim());
+  if (sources.length === 0) return null;
+  const label = (s) => `${s.label || s.filename}${s.pageText ? ' p.' + s.pageText : ''}`;
+  if (sources.length === 1 && cfg.contextTemplate && cfg.contextTemplate.includes('{context}')) {
+    const s = sources[0];
+    return String(cfg.contextTemplate).replace(/\{(\w+)\}/g, (all, k) => ({
+      key: s.key || cfg.citationKey || 'S1',
+      context: s.text,
+      question,
+      source: label(s),
+    })[k] ?? all);
+  }
+  const blocks = sources.map(s => {
+    const k = s.key || 'S1';
+    return `── 資料 ${k} ──\n出典キー: ${k}   (${label(s)})\n${s.text}\n── ここまでが ${k} の内容 ──`;
+  }).join('\n\n');
+  const keys = sources.map(s => `【${s.key || 'S1'}】`).join(' / ');
+  return `${blocks}\n\n上記の資料だけを根拠に、次の質問へ答えてください。`
+    + `使った記述の末尾には出典キー (${keys}) を書いてください。\n\n【質問】\n${question}`;
+}
+
+function ChatSampleDialog({ data, onClose }) {
+  // data: { messages, index, chatTitle, chatRole, ragDataset }
+  const rag = data.ragDataset || {};
+  const pairs = buildTurnPairs(data.messages);
+  const targetPos = Math.max(0, pairs.findIndex(p => p.index === data.index));
+
+  const [mode, setMode] = useState('single');          // 'single' | 'multi' | 'batch'
+  const [cur, setCur] = useState(targetPos < 0 ? 0 : targetPos);
+  const [stripCitations, setStripCitations] = useState(true);
+  const [openMode, setOpenMode] = useState(false);      // 参考資料を入力に含める (RAG運用型)
+  const [system, setSystem] = useState('');
+  // 初期値はマウント前に決める (useEffect 任せだと一瞬空欄が見える)
+  const first = pairs[targetPos] || null;
+  const [instruction, setInstruction] = useState(() => (first ? cleanSampleText(first.question, { citations: false, markers: true }) : ''));
+  const [response, setResponse] = useState(() => (first ? cleanSampleText(first.answer, { citations: true, markers: true }) : ''));
+  const [turnCount, setTurnCount] = useState(2);        // マルチターンで残す往復数
+  const [picked, setPicked] = useState(() => {          // 一括モードの選択状態
+    const init = {};
+    pairs.forEach((p, i) => { init[i] = (i === targetPos); });
+    return init;
+  });
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState('');
+  const [error, setError] = useState('');
+
+  const pair = pairs[cur] || null;
+  const canOpen = !!(pair && pair.ragSources && pair.ragSources.length);
+
+  // 対象ターンが変わったら編集欄を作り直す (ユーザーの編集は破棄される: 切替時に確認する)
+  useEffect(() => {
+    if (!pair) return;
+    setInstruction(cleanSampleText(pair.question, { citations: false, markers: true }));
+    setResponse(cleanSampleText(pair.answer, { citations: stripCitations && !openMode, markers: true }));
+  }, [cur, stripCitations, openMode]);
+
+  // openMode は資料がある回答でだけ有効
+  useEffect(() => { if (!canOpen && openMode) setOpenMode(false); }, [canOpen, openMode]);
+
+  const finalSystem = (() => {
+    if (system.trim()) return system.trim();
+    if (openMode) return String(rag.openSystemPrompt || '');
+    return '';
+  })();
+
+  const finalInstruction = openMode && pair
+    ? (renderRagContext(pair.ragSources, instruction, rag) || instruction)
+    : instruction;
+
+  const warnings = mode === 'single' ? checkSampleQuality(instruction, response, { open: openMode }) : [];
+
+  function switchPair(i) {
+    if (i === cur) return;
+    // 編集済みのまま切り替えると黙って消える。直した内容は戻せないので確認する
+    if (pair) {
+      const pristineQ = cleanSampleText(pair.question, { citations: false, markers: true });
+      const pristineA = cleanSampleText(pair.answer, { citations: stripCitations && !openMode, markers: true });
+      if ((instruction !== pristineQ || response !== pristineA)
+          && !confirm('編集内容は保存されません。別のターンへ移動しますか?')) return;
+    }
+    setCur(i);
+    setError(''); setDone('');
+  }
+
+  /** マルチターン登録用の messages を組む (末尾は必ず assistant) */
+  function buildMultiMessages() {
+    if (!pair) return [];
+    const upto = pair.index;
+    const picks = [];
+    for (let i = upto; i >= 0 && picks.length < turnCount * 2; i--) {
+      const m = data.messages[i];
+      if (!m || (m.role !== 'user' && m.role !== 'assistant')) continue;
+      const content = cleanSampleText(m.content, { citations: stripCitations, markers: true });
+      if (!content) continue;
+      picks.unshift({ role: m.role, content });
+    }
+    while (picks.length && picks[0].role !== 'user') picks.shift();      // user 始まりに揃える
+    while (picks.length && picks[picks.length - 1].role !== 'assistant') picks.pop();
+    const msgs = [];
+    if (finalSystem) msgs.push({ role: 'system', content: finalSystem });
+    return msgs.concat(picks);
+  }
+
+  const multiMessages = mode === 'multi' ? buildMultiMessages() : [];
+  const pickedCount = Object.values(picked).filter(Boolean).length;
+
+  async function submit() {
+    setBusy(true); setError(''); setDone('');
+    const tags = ['chat'];
+    if (openMode) tags.push('open'); else if (mode !== 'multi') tags.push('closed');
+    try {
+      if (mode === 'single') {
+        if (!finalInstruction.trim() || !response.trim()) throw new Error('質問と回答は必須です');
+        const r = await fetch('/tuning/samples', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ instruction: finalInstruction, response, system: finalSystem, tags }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+        setDone(`1 件を登録しました (合計 ${d.total} 件)`);
+      } else if (mode === 'multi') {
+        if (multiMessages.filter(m => m.role !== 'system').length < 2) throw new Error('登録できる往復がありません');
+        const line = JSON.stringify({ messages: multiMessages, tags: tags.concat('multiturn') });
+        const r = await fetch('/tuning/samples/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ format: 'jsonl', content: line }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+        if (!d.added) throw new Error('登録されませんでした (末尾が assistant の応答になっているか確認してください)');
+        setDone(`マルチターン 1 件を登録しました (合計 ${d.total} 件)`);
+      } else {
+        const lines = pairs.map((p, i) => {
+          if (!picked[i]) return null;
+          const q = cleanSampleText(p.question, { citations: false, markers: true });
+          const a = cleanSampleText(p.answer, { citations: stripCitations, markers: true });
+          if (!q.trim() || !a.trim()) return null;
+          return JSON.stringify({ instruction: q, response: a, system: finalSystem || undefined, tags });
+        }).filter(Boolean);
+        if (lines.length === 0) throw new Error('登録するターンを選んでください');
+        const r = await fetch('/tuning/samples/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ format: 'jsonl', content: lines.join('\n') }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+        setDone(`${d.added} 件を登録しました (合計 ${d.total} 件)`);
+      }
+    } catch (e) {
+      setError(e.message);
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <div className="role-modal-overlay" onClick={onClose}>
+      <div className="role-modal chatsample-modal" onClick={e => e.stopPropagation()}>
+        <div className="role-modal-header">
+          <span>🧠 会話を学習データに登録</span>
+          <button className="role-modal-close" onClick={onClose}>×</button>
+        </div>
+
+        <div className="chatsample-tabs">
+          {[
+            { v: 'single', label: '✏️ この1往復（編集して登録）' },
+            { v: 'multi', label: '🔁 マルチターン' },
+            { v: 'batch', label: `☑️ 会話から選ぶ (${pickedCount})` },
+          ].map(t => (
+            <button key={t.v} className={`chatsample-tab ${mode === t.v ? 'active' : ''}`}
+              onClick={() => { setMode(t.v); setError(''); setDone(''); }}>{t.label}</button>
+          ))}
+        </div>
+
+        {pairs.length === 0 ? (
+          <div className="chatsample-empty">登録できる往復がありません（質問と回答が揃ったターンが必要です）</div>
+        ) : (
+          <>
+            {/* ── 対象ターンの切り替え ── */}
+            {mode !== 'batch' && (
+              <div className="chatsample-nav">
+                <button className="chatsample-navbtn" disabled={cur <= 0} onClick={() => switchPair(cur - 1)}>← 前のターン</button>
+                <span className="chatsample-navpos">{cur + 1} / {pairs.length} 往復目</span>
+                <button className="chatsample-navbtn" disabled={cur >= pairs.length - 1} onClick={() => switchPair(cur + 1)}>次のターン →</button>
+              </div>
+            )}
+
+            {/* ── 単一ターン: 編集して登録 ── */}
+            {mode === 'single' && (
+              <div className="chatsample-form">
+                <div className="chatsample-field">
+                  <label>System（任意・全サンプル共通の役割）</label>
+                  <textarea rows="2" value={system} onChange={e => setSystem(e.target.value)}
+                    placeholder={openMode ? (rag.openSystemPrompt || '') : '例: あなたは社内システムに詳しいサポート担当です。'} />
+                </div>
+                <div className="chatsample-field">
+                  <label>
+                    User（質問）
+                    <span className="chatsample-hint-inline">単体で意味が通る形に直す（指示語を具体名へ）</span>
+                  </label>
+                  <textarea rows="3" value={instruction} onChange={e => setInstruction(e.target.value)} />
+                </div>
+                <div className="chatsample-field">
+                  <label>
+                    Assistant（回答）
+                    <span className="chatsample-hint-inline">間違い・余計な前置き・言い訳はここで削る</span>
+                  </label>
+                  <textarea rows="8" value={response} onChange={e => setResponse(e.target.value)} />
+                </div>
+                {openMode && (
+                  <div className="chatsample-preview">
+                    <div className="chatsample-preview-title">実際に登録される入力（RAG運用型）</div>
+                    <pre>{finalInstruction}</pre>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ── マルチターン ── */}
+            {mode === 'multi' && (
+              <div className="chatsample-form">
+                <div className="chatsample-field chatsample-row">
+                  <label>残す往復数</label>
+                  <input type="number" min="1" max="10" value={turnCount}
+                    onChange={e => setTurnCount(Math.max(1, Math.min(10, Number(e.target.value) || 1)))} />
+                  <span className="chatsample-hint-inline">このターンから遡って何往復ぶんを1サンプルにするか</span>
+                </div>
+                <div className="chatsample-preview">
+                  <div className="chatsample-preview-title">登録内容（messages 形式）</div>
+                  {multiMessages.map((m, i) => (
+                    <div key={i} className="chatsample-turn">
+                      <span className={`chatsample-role ${m.role}`}>{m.role}</span>
+                      <span className="chatsample-turn-text">{m.content.slice(0, 300)}{m.content.length > 300 ? ' …' : ''}</span>
+                    </div>
+                  ))}
+                </div>
+                <div className="chatsample-note">
+                  会話の流れごと覚えさせたいとき用。文面の手直しが要るなら「この1往復」で1件ずつ登録してください
+                </div>
+              </div>
+            )}
+
+            {/* ── 一括選択 ── */}
+            {mode === 'batch' && (
+              <div className="chatsample-list">
+                <div className="chatsample-listhead">
+                  <button className="chatsample-navbtn" onClick={() => {
+                    const all = {}; pairs.forEach((_, i) => { all[i] = true; }); setPicked(all);
+                  }}>全選択</button>
+                  <button className="chatsample-navbtn" onClick={() => setPicked({})}>全解除</button>
+                  <span className="chatsample-hint-inline">チェックしたターンをそのまま登録します（文面を直すなら ✏️）</span>
+                </div>
+                {pairs.map((p, i) => {
+                  const w = checkSampleQuality(p.question, p.answer, { open: false });
+                  return (
+                    <label key={i} className={`chatsample-item ${picked[i] ? 'selected' : ''}`}>
+                      <input type="checkbox" checked={!!picked[i]}
+                        onChange={() => setPicked(prev => ({ ...prev, [i]: !prev[i] }))} />
+                      <div className="chatsample-item-body">
+                        <div className="chatsample-item-q">Q: {p.question.slice(0, 90)}{p.question.length > 90 ? '…' : ''}</div>
+                        <div className="chatsample-item-a">A: {p.answer.slice(0, 120)}{p.answer.length > 120 ? '…' : ''}</div>
+                        {w.length > 0 && <div className="chatsample-item-warn">⚠️ {w[0]}</div>}
+                      </div>
+                      <button className="chatsample-navbtn" title="編集して1件だけ登録"
+                        onClick={(e) => { e.preventDefault(); setCur(i); setMode('single'); }}>✏️</button>
+                    </label>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* ── 共通オプション ── */}
+            <div className="chatsample-opts">
+              <label className="chatsample-check">
+                <input type="checkbox" checked={stripCitations} disabled={openMode}
+                  onChange={e => setStripCitations(e.target.checked)} />
+                出典キー【S1】を取り除く
+              </label>
+              <label className={`chatsample-check ${canOpen ? '' : 'disabled'}`} title={canOpen ? '' : 'このターンは永続RAGの資料を使っていません'}>
+                <input type="checkbox" checked={openMode} disabled={!canOpen || mode !== 'single'}
+                  onChange={e => setOpenMode(e.target.checked)} />
+                参考資料を入力に含める（RAG運用型 / open）
+              </label>
+            </div>
+
+            {mode === 'single' && warnings.length > 0 && (
+              <div className="chatsample-warns">
+                {warnings.map((w, i) => <div key={i}>⚠️ {w}</div>)}
+              </div>
+            )}
+          </>
+        )}
+
+        {error && <div className="csvreg-error">❌ {error}</div>}
+        {done && (
+          <div className="csvreg-done">
+            ✅ {done}{' '}
+            <a href="/tuning.html" target="_blank" rel="noreferrer noopener">🧠 ファインチューニングページで確認 →</a>
+          </div>
+        )}
+
+        <div className="role-editor-actions">
+          <button className="role-btn-cancel" onClick={onClose}>{done ? '閉じる' : 'キャンセル'}</button>
+          <button className="role-btn-save" onClick={submit}
+            disabled={busy || pairs.length === 0 || (mode === 'batch' && pickedCount === 0)}>
+            {busy ? '登録中...' : mode === 'batch' ? `選択した ${pickedCount} 件を登録` : '登録'}
+          </button>
+        </div>
+        <div className="role-editor-hint">
+          💡 登録先は 🧠 ファインチューニングの「学習データ」タブ（tuning/samples.jsonl）。
+          同じ事実でも聞き方を変えて何度か登録すると、学習後に効きやすくなります
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function CsvRegisterDialog({ data, onClose }) {
   // data: { content, lang: 'csv'|'tsv' }
   const delim = data.lang === 'tsv' ? '\t' : ',';
@@ -1827,6 +2241,8 @@ function App() {
   // 生成CSVの学習登録ダイアログ ({content, lang} / null)。コードブロックの
   // 「📊 学習に登録」ボタン (グローバル関数) から CustomEvent 経由で開く
   const [csvRegisterData, setCsvRegisterData] = useState(null);
+  // チャットの往復を学習データにするダイアログ { messages, index } (null で閉じる)
+  const [sampleDialog, setSampleDialog] = useState(null);
   useEffect(() => {
     const handler = (e) => setCsvRegisterData(e.detail);
     window.addEventListener('ogc:register-csv', handler);
@@ -8465,6 +8881,10 @@ function App() {
                           <button className="msg-action-btn" onClick={() => addResponseToDocuments(msg.content, i)}>
                             📄 ドキュメントに追加
                           </button>
+                          <button className="msg-action-btn" title="この往復を編集してファインチューニングの教師データに登録します"
+                            onClick={() => setSampleDialog({ messages, index: i })}>
+                            🧠 学習データに登録
+                          </button>
                           {(typeof window !== 'undefined' && window.speechSynthesis) && (
                             <button className="msg-action-btn" onClick={() => toggleSpeak(msg.content, i)}>
                               {speakingIndex === i ? '⏹️ 停止' : '🔊 読み上げ'}
@@ -9398,6 +9818,18 @@ function App() {
 
       {csvRegisterData && (
         <CsvRegisterDialog data={csvRegisterData} onClose={() => setCsvRegisterData(null)} />
+      )}
+      {sampleDialog && (
+        <ChatSampleDialog
+          data={{
+            messages: sampleDialog.messages,
+            index: sampleDialog.index,
+            chatTitle,
+            chatRole,
+            // open (RAG運用型) の体裁は RAG教師データ生成と同じ設定を共用する
+            ragDataset: appConfig.tuning?.ragDataset || {},
+          }}
+          onClose={() => setSampleDialog(null)} />
       )}
       {loadingMessage && <div className="loading-toast">{loadingMessage}</div>}
       {error && <div className="error-toast">{error}</div>}

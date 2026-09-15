@@ -123,6 +123,9 @@ function App() {
             📚 学習データ
             {samples.length > 0 && <span className="tab-badge">{samples.length}</span>}
           </button>
+          <button className={`tab ${tab === 'raggen' ? 'active' : ''}`} onClick={() => setTab('raggen')}>
+            🧬 RAGから生成
+          </button>
           <button className={`tab ${tab === 'training' ? 'active' : ''}`} onClick={() => setTab('training')}>
             🚀 学習開始
           </button>
@@ -139,6 +142,9 @@ function App() {
           */}
           <div style={{ display: tab === 'samples' ? 'block' : 'none' }}>
             <SamplesView samples={samples} reload={loadSamples} showToast={showToast} />
+          </div>
+          <div style={{ display: tab === 'raggen' ? 'block' : 'none' }}>
+            <RagGenView showToast={showToast} reloadSamples={loadSamples} />
           </div>
           <div style={{ display: tab === 'training' ? 'block' : 'none' }}>
             <TrainingView samples={samples} currentJobId={currentJobId}
@@ -907,6 +913,539 @@ function PostProcessDialog({ job, onClose, onStarted }) {
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════
+// 永続RAG → 教師データ生成タブ
+// ════════════════════════════════════════════════
+// 登録済みRAG資料を選び、LLMにQ&Aを作らせて、レビューしてから
+// 「学習データ」タブ (tuning/samples.jsonl) へ取り込む。
+// プロンプトはここで編集して試せる (config.json の tuning.ragDataset が初期値)。
+function RagGenView({ showToast, reloadSamples }) {
+  const [status, setStatus] = useState(null);      // /tuning/rag/status
+  const [docs, setDocs] = useState([]);
+  const [categories, setCategories] = useState([]);
+  const [catFilter, setCatFilter] = useState('all');
+  const [selected, setSelected] = useState({});    // docId → true
+  const [params, setParams] = useState(null);      // 既定値はサーバーの defaults
+  const [showPrompts, setShowPrompts] = useState(false);
+  const [jobs, setJobs] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [openJobId, setOpenJobId] = useState(null);
+  const [samples, setSamples] = useState(null);    // { samples, counts, total }
+  const [sampleFilter, setSampleFilter] = useState('accepted');
+  const [importMode, setImportMode] = useState('');
+
+  const loadStatus = async () => {
+    try {
+      const r = await fetch('/tuning/rag/status');
+      if (!r.ok) return;
+      const data = await r.json();
+      setStatus(data);
+      // 既定パラメータ (プロンプト本文込み) をフォームの初期値にする。
+      // 一度触った後は上書きしない (入力中の値が消えないように)
+      setParams(prev => prev || data.defaults || null);
+    } catch {}
+  };
+
+  const loadDocs = async () => {
+    try {
+      const [rd, rc] = await Promise.all([fetch('/rag/documents'), fetch('/rag/categories')]);
+      if (rd.ok) setDocs((await rd.json()).documents || []);
+      if (rc.ok) setCategories((await rc.json()).categories || []);
+    } catch {}
+  };
+
+  const loadJobs = async () => {
+    try {
+      const r = await fetch('/tuning/rag/jobs');
+      if (r.ok) setJobs((await r.json()).jobs || []);
+    } catch {}
+  };
+
+  useEffect(() => {
+    loadStatus(); loadDocs(); loadJobs();
+    const t = setInterval(loadJobs, 15000);   // 取りこぼし対策 (進捗の主役はSSE)
+    return () => clearInterval(t);
+  }, []);
+
+  // 実行中ジョブの進捗はSSEで受ける (OCR/HTML登録画面と同じ方式)
+  const streamIds = jobs.filter(j => j.status === 'running' || j.status === 'pending')
+    .map(j => j.jobId).join(',');
+  useEffect(() => {
+    if (!streamIds) return;
+    const sources = streamIds.split(',').map(id => {
+      const es = new EventSource(`/tuning/rag/jobs/${id}/stream`);
+      es.onmessage = (ev) => {
+        let data;
+        try { data = JSON.parse(ev.data); } catch { return; }
+        if (data.job) setJobs(prev => prev.map(j => (j.jobId === data.job.jobId ? data.job : j)));
+        if (data.type === 'deleted') loadJobs();
+      };
+      es.onerror = () => { /* ブラウザが自動再接続する。落ちてもポーリングで追従できる */ };
+      return es;
+    });
+    return () => sources.forEach(es => es.close());
+  }, [streamIds]);
+
+  const visibleDocs = docs.filter(d => catFilter === 'all' || (d.category || '') === catFilter);
+  const selectedIds = Object.keys(selected).filter(id => selected[id] && docs.find(d => d.docId === id));
+
+  function toggleDoc(docId) {
+    setSelected(p => ({ ...p, [docId]: !p[docId] }));
+  }
+  function selectAllVisible(on) {
+    setSelected(p => {
+      const next = { ...p };
+      for (const d of visibleDocs) next[d.docId] = on;
+      return next;
+    });
+  }
+  function setParam(key, value) {
+    setParams(p => ({ ...(p || {}), [key]: value }));
+  }
+
+  // 生成にかかるLLM呼び出し回数のざっくり見積り。
+  // 「何十分かかるのか分からないまま数百パッセージ回し始める」のを防ぐ
+  const estimate = (() => {
+    if (!params) return null;
+    const chunkTotal = docs.filter(d => selectedIds.includes(d.docId))
+      .reduce((n, d) => n + (d.chunkCount || 0), 0);
+    if (!chunkTotal) return null;
+    let passages = Math.ceil(chunkTotal / Math.max(1, Number(params.passageChunks) || 3));
+    if (Number(params.maxPassages) > 0) passages = Math.min(passages, Number(params.maxPassages));
+    const perPassage = 1
+      + (params.verify ? Number(params.questionsPerPassage) || 0 : 0)
+      + (Number(params.refusalPerPassage) > 0 ? 1 / Math.max(1, Number(params.refusalEveryNth) || 3) : 0);
+    return {
+      passages,
+      calls: Math.round(passages * perPassage),
+      samples: passages * (Number(params.questionsPerPassage) || 0),
+    };
+  })();
+
+  async function handleStart() {
+    if (selectedIds.length === 0) { alert('資料を1つ以上選んでください'); return; }
+    if (estimate && !confirm(
+      `教師データ生成を開始します。\n\n対象資料: ${selectedIds.length} 件\n`
+      + `パッセージ: 約 ${estimate.passages} 個\nLLM呼び出し: 約 ${estimate.calls} 回\n`
+      + `生成見込み: 最大 ${estimate.samples} 件\n\n`
+      + `GPUを占有します。続行しますか?`)) return;
+    setBusy(true);
+    try {
+      const r = await fetch('/tuning/rag/jobs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ docIds: selectedIds, params }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || '起動失敗');
+      showToast('生成ジョブを開始しました', 'success');
+      loadJobs();
+    } catch (e) {
+      showToast(`起動失敗: ${e.message}`, 'error');
+    } finally { setBusy(false); }
+  }
+
+  async function jobAction(jobId, action) {
+    try {
+      let r;
+      if (action === 'cancel') r = await fetch(`/tuning/rag/jobs/${jobId}/cancel`, { method: 'POST' });
+      else if (action === 'resume') r = await fetch(`/tuning/rag/jobs/${jobId}/start`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      else if (action === 'redo') r = await fetch(`/tuning/rag/jobs/${jobId}/start`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ redo: true }) });
+      else if (action === 'delete') r = await fetch(`/tuning/rag/jobs/${jobId}`, { method: 'DELETE' });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      if (action === 'delete' && openJobId === jobId) { setOpenJobId(null); setSamples(null); }
+      loadJobs();
+    } catch (e) {
+      showToast(e.message, 'error');
+    }
+  }
+
+  async function openSamples(jobId, filter = sampleFilter) {
+    if (openJobId === jobId && filter === sampleFilter && samples) { setOpenJobId(null); setSamples(null); return; }
+    setOpenJobId(jobId); setSampleFilter(filter); setSamples(null);
+    try {
+      const r = await fetch(`/tuning/rag/jobs/${jobId}/samples?status=${filter}&limit=100`);
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      setSamples(data);
+    } catch (e) {
+      showToast(e.message, 'error');
+      setSamples({ samples: [], counts: {}, total: 0 });
+    }
+  }
+
+  async function toggleSampleStatus(jobId, id, current) {
+    try {
+      const r = await fetch(`/tuning/rag/jobs/${jobId}/samples/status`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: [id], status: current === 'accepted' ? 'rejected' : 'accepted' }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      setJobs(prev => prev.map(j => (j.jobId === jobId ? data.job : j)));
+      openSamples(jobId, sampleFilter);
+    } catch (e) { showToast(e.message, 'error'); }
+  }
+
+  async function handleImport(job) {
+    const mode = importMode || job.params?.mode || 'closed';
+    const modeLabel = mode === 'closed' ? '知識注入型 (資料を渡さない)'
+      : mode === 'open' ? 'RAG運用型 (資料を添える)' : '両方';
+    if (!confirm(`採用済み ${job.accepted} 件を「学習データ」へ取り込みます。\n形式: ${modeLabel}\n\nよろしいですか?`)) return;
+    try {
+      const r = await fetch(`/tuning/rag/jobs/${job.jobId}/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      showToast(`${data.added} 件を学習データに追加しました`, 'success');
+      loadJobs();
+      if (reloadSamples) reloadSamples();
+    } catch (e) { showToast(e.message, 'error'); }
+  }
+
+  if (!params) {
+    return <div className="empty-state"><div className="empty-desc">読み込み中...</div></div>;
+  }
+
+  const llmNg = status && status.llm && !status.llm.ok;
+
+  return (
+    <div>
+      <div className="info-box">
+        🧬 <strong>RAGから教師データを作る</strong>: 登録済みの資料をパッセージに束ね、LLMに「その資料だけで答えられるQ&amp;A」を作らせます。
+        機械チェック（指示語・数値の裏取り・資料との重なり・重複）とLLM検証を通ったものだけが「採用」になります。<br />
+        📌 <strong>取り込み形式</strong>: <strong>知識注入型(closed)</strong> は資料を渡さず質問だけで答えさせる形（社内知識をモデルに埋め込む）。
+        <strong>RAG運用型(open)</strong> は検索結果と同じ体裁で資料を添える形（資料を読んで答える型と、無い時に断る型を教える）。
+        RAGを運用しながら精度を上げたいなら open、RAGなしで答えさせたいなら closed です。
+      </div>
+
+      {status && !status.enabled && (
+        <div className="info-box" style={{ borderColor: 'var(--red)' }}>
+          ⚠️ この機能は無効です。<code>config.json</code> の <code>tuning.ragDataset.enabled</code> を true にしてください。
+        </div>
+      )}
+      {llmNg && (
+        <div className="info-box" style={{ borderColor: 'var(--orange)' }}>
+          ⚠️ 生成用LLMが使えません: {status.llm.message}
+        </div>
+      )}
+      {/* 未ロードでも開始時に自動起動する構成では、何が起きるかを先に知らせる
+          (「生成失敗: fetch failed」で止まるより、待たされる理由が分かる方がよい) */}
+      {status && status.llm && status.llm.ok && status.llm.note && (
+        <div className="info-box">ℹ️ {status.llm.note}</div>
+      )}
+      {status && status.llm && status.llm.ok && !status.llm.note && status.llm.modelName && (
+        <div className="field-hint" style={{ marginBottom: 12 }}>
+          生成に使うモデル: <code>{status.llm.modelName}</code>
+          {status.llm.managed ? '（LLMプール管理: 生成中だけロードされます）' : ''}
+        </div>
+      )}
+
+      {/* ── 対象資料の選択 ── */}
+      <div className="field">
+        <label className="field-label">
+          対象資料 ({selectedIds.length} / {docs.length} 件選択)
+        </label>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginBottom: 6 }}>
+          <select className="select" value={catFilter} onChange={e => setCatFilter(e.target.value)} style={{ maxWidth: 240 }}>
+            <option value="all">すべてのカテゴリ</option>
+            <option value="">未分類</option>
+            {categories.map(c => <option key={c.name} value={c.name}>{c.name} ({c.docCount})</option>)}
+          </select>
+          <button className="btn small" onClick={() => selectAllVisible(true)}>表示中を全選択</button>
+          <button className="btn small" onClick={() => selectAllVisible(false)}>選択解除</button>
+          <button className="btn small" onClick={loadDocs}>🔄 更新</button>
+        </div>
+        {visibleDocs.length === 0 ? (
+          <div className="field-hint">
+            登録資料がありません。<a href="/rag.html" style={{ color: 'var(--accent)' }}>📚 永続RAG</a> でPDFやWebページを登録してください。
+          </div>
+        ) : (
+          <div className="ragdoc-list">
+            {visibleDocs.map(d => (
+              <label key={d.docId} className={`ragdoc-item ${selected[d.docId] ? 'selected' : ''}`}>
+                <input type="checkbox" checked={!!selected[d.docId]} onChange={() => toggleDoc(d.docId)} />
+                <span className="ragdoc-name">{d.filename}</span>
+                {d.category && <span className="ragdoc-cat">{d.category}</span>}
+                <span className="ragdoc-chunks">{d.chunkCount} チャンク</span>
+              </label>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* ── 生成パラメータ ── */}
+      <div className="field">
+        <label className="field-label">取り込み形式 (mode)</label>
+        <div className="quant-pills">
+          {[
+            { v: 'closed', label: '知識注入型 (closed)', desc: '資料を渡さず質問だけで答えさせる。RAGなしで答えられるようにする' },
+            { v: 'open', label: 'RAG運用型 (open)', desc: '検索結果と同じ体裁で資料を添える。読んで答える型・断る型を教える' },
+            { v: 'both', label: '両方 (both)', desc: '同じQ&Aから2本作る。件数は倍になる' },
+          ].map(o => (
+            <div key={o.v} className={`quant-pill ${params.mode === o.v ? 'active' : ''}`}
+              onClick={() => setParam('mode', o.v)} title={o.desc}>{o.label}</div>
+          ))}
+        </div>
+      </div>
+
+      <div className="rt-grid">
+        <div className="field">
+          <label className="field-label">1パッセージのチャンク数</label>
+          <input className="input" type="number" min="1" max="20" value={params.passageChunks}
+            onChange={e => setParam('passageChunks', Number(e.target.value))} />
+          <span className="field-hint">検索用チャンク(既定500文字)を何個つなぐか。少ないと文脈不足、多いと質問が散る</span>
+        </div>
+        <div className="field">
+          <label className="field-label">1パッセージあたりのQ&amp;A数</label>
+          <input className="input" type="number" min="1" max="20" value={params.questionsPerPassage}
+            onChange={e => setParam('questionsPerPassage', Number(e.target.value))} />
+          <span className="field-hint">欲張ると内容の薄い質問が増える。3前後が無難</span>
+        </div>
+        <div className="field">
+          <label className="field-label">拒否サンプル数 / 回</label>
+          <input className="input" type="number" min="0" max="5" value={params.refusalPerPassage}
+            onChange={e => setParam('refusalPerPassage', Number(e.target.value))} />
+          <span className="field-hint">「資料に無いこと」を聞く質問。0で無効。範囲外の作文を抑える効果がある</span>
+        </div>
+        <div className="field">
+          <label className="field-label">拒否サンプルの間隔</label>
+          <input className="input" type="number" min="1" max="100" value={params.refusalEveryNth}
+            onChange={e => setParam('refusalEveryNth', Number(e.target.value))} />
+          <span className="field-hint">何パッセージに1回作るか。全体の1割程度が目安</span>
+        </div>
+        <div className="field">
+          <label className="field-label">temperature</label>
+          <input className="input" type="number" step="0.05" min="0" max="2" value={params.temperature}
+            onChange={e => setParam('temperature', Number(e.target.value))} />
+          <span className="field-hint">低すぎると同じ聞き方ばかりになる。0.3〜0.6 推奨</span>
+        </div>
+        <div className="field">
+          <label className="field-label">パッセージ数の上限 (0で無制限)</label>
+          <input className="input" type="number" min="0" value={params.maxPassages}
+            onChange={e => setParam('maxPassages', Number(e.target.value))} />
+          <span className="field-hint">まず 5〜10 で試運転し、出来を見てから全件回すと失敗が安い</span>
+        </div>
+        <div className="field">
+          <label className="field-label">回答の文字数 (最小 / 最大)</label>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <input className="input" type="number" min="1" value={params.minAnswerChars}
+              onChange={e => setParam('minAnswerChars', Number(e.target.value))} />
+            <input className="input" type="number" min="20" value={params.maxAnswerChars}
+              onChange={e => setParam('maxAnswerChars', Number(e.target.value))} />
+          </div>
+          <span className="field-hint">範囲外は不採用。長すぎる回答は資料の丸写しになりやすい</span>
+        </div>
+        <div className="field">
+          <label className="field-label">資料との重なり下限 (0〜1)</label>
+          <input className="input" type="number" step="0.05" min="0" max="1" value={params.minCoverage}
+            onChange={e => setParam('minCoverage', Number(e.target.value))} />
+          <span className="field-hint">回答の文字3-gramが資料にどれだけ含まれるか。一般論で埋めた回答を落とす</span>
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 12 }}>
+        <label className="rt-check">
+          <input type="checkbox" checked={params.verify !== false}
+            onChange={e => setParam('verify', e.target.checked)} />
+          LLMで検証する (資料に書かれているか・質問が自立しているか)
+        </label>
+        <label className="rt-check">
+          <input type="checkbox" checked={params.checkNumbers !== false}
+            onChange={e => setParam('checkNumbers', e.target.checked)} />
+          数値の裏取りをする (資料に無い数値を含む回答を落とす)
+        </label>
+      </div>
+
+      {/* ── プロンプト編集 ── */}
+      <div className="field">
+        <button className="btn small" onClick={() => setShowPrompts(v => !v)}>
+          {showPrompts ? '▼' : '▶'} プロンプトを編集する ({showPrompts ? '閉じる' : '生成 / 拒否例 / 検証 / 取り込み形式'})
+        </button>
+      </div>
+      {showPrompts && (
+        <div className="rt-prompts">
+          <div className="field-hint" style={{ marginBottom: 10 }}>
+            初期値は <code>config.json</code> の <code>tuning.ragDataset</code>。ここでの編集はこのジョブにだけ効きます
+            (恒久的に変えるなら <a href="/editconfig.html" style={{ color: 'var(--accent)' }}>⚙️ 設定</a> で編集)。
+          </div>
+          <div className="field">
+            <label className="field-label">① Q&amp;A生成プロンプト <span className="rt-vars">{'{passage} {source} {n} {styles} {minChars} {maxChars}'}</span></label>
+            <textarea className="textarea" rows="14" value={params.generatePrompt}
+              onChange={e => setParam('generatePrompt', e.target.value)} />
+          </div>
+          <div className="field">
+            <label className="field-label">② 拒否サンプルの質問生成プロンプト <span className="rt-vars">{'{passage} {source} {n}'}</span></label>
+            <textarea className="textarea" rows="8" value={params.refusalPrompt}
+              onChange={e => setParam('refusalPrompt', e.target.value)} />
+          </div>
+          <div className="field">
+            <label className="field-label">③ 検証プロンプト <span className="rt-vars">{'{passage} {question} {answer}'}</span></label>
+            <textarea className="textarea" rows="10" value={params.verifyPrompt}
+              onChange={e => setParam('verifyPrompt', e.target.value)} />
+          </div>
+          <div className="field">
+            <label className="field-label">学習サンプルの system (closed / 知識注入型)</label>
+            <textarea className="textarea" rows="3" value={params.closedSystemPrompt}
+              onChange={e => setParam('closedSystemPrompt', e.target.value)} />
+          </div>
+          <div className="field">
+            <label className="field-label">学習サンプルの system (open / RAG運用型)</label>
+            <textarea className="textarea" rows="3" value={params.openSystemPrompt}
+              onChange={e => setParam('openSystemPrompt', e.target.value)} />
+          </div>
+          <div className="field">
+            <label className="field-label">open形式の入力テンプレート <span className="rt-vars">{'{key} {source} {context} {question}'}</span></label>
+            <textarea className="textarea" rows="8" value={params.contextTemplate}
+              onChange={e => setParam('contextTemplate', e.target.value)} />
+            <span className="field-hint">
+              チャットが検索結果をLLMへ渡す体裁 (── 資料 S1 ── / 出典キー) に合わせてあります。
+              学習時と推論時で入力の形が違うと、覚えた型が本番で発火しません
+            </span>
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginBottom: 20 }}>
+        <button className="btn primary" onClick={handleStart}
+          disabled={busy || selectedIds.length === 0 || (status && !status.enabled)}>
+          {busy ? '開始中...' : '🧬 教師データを生成'}
+        </button>
+        {estimate && (
+          <span className="field-hint">
+            約 {estimate.passages} パッセージ / LLM呼び出し 約 {estimate.calls} 回 / 生成見込み 最大 {estimate.samples} 件
+          </span>
+        )}
+      </div>
+
+      {/* ── ジョブ一覧 ── */}
+      {jobs.length === 0 ? (
+        <div className="empty-state">
+          <div className="empty-icon">🧬</div>
+          <div className="empty-title">生成ジョブはありません</div>
+          <div className="empty-desc">資料を選んで「教師データを生成」を押してください</div>
+        </div>
+      ) : jobs.map(j => {
+        const pct = j.passagesTotal ? Math.round((j.passagesDone / j.passagesTotal) * 100) : 0;
+        return (
+          <div key={j.jobId} className="job-item">
+            <div className="job-header">
+              <span className={`job-status ${j.status}`}>
+                {j.status === 'running' && '⚙️ 生成中'}
+                {j.status === 'pending' && '⏳ 待機中'}
+                {j.status === 'completed' && '✓ 完了'}
+                {j.status === 'failed' && '✗ 失敗'}
+                {j.status === 'cancelled' && '○ 中止'}
+              </span>
+              <span className="job-id">{j.title}</span>
+              <div className="job-actions">
+                <button className="btn small" onClick={() => openSamples(j.jobId)}>
+                  {openJobId === j.jobId ? '閉じる' : '🔍 結果を見る'}
+                </button>
+                {j.status === 'running' && (
+                  <button className="btn small danger" onClick={() => jobAction(j.jobId, 'cancel')}>停止</button>
+                )}
+                {['pending', 'cancelled', 'failed'].includes(j.status) && (
+                  <button className="btn small primary" onClick={() => jobAction(j.jobId, 'resume')}>▶ 続きから</button>
+                )}
+                {j.status !== 'running' && (
+                  <>
+                    <button className="btn small" onClick={() => jobAction(j.jobId, 'redo')} title="出力を捨てて最初から作り直す">⟳ やり直す</button>
+                    <button className="btn small danger" onClick={() => { if (confirm('このジョブと生成結果を削除しますか? (取り込み済みの学習データは残ります)')) jobAction(j.jobId, 'delete'); }}>削除</button>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {(j.status === 'running' || j.passagesDone > 0) && (
+              <>
+                <div className="rt-progress"><div className="rt-progress-fill" style={{ width: `${pct}%` }} /></div>
+                <div className="field-hint" style={{ marginBottom: 6 }}>
+                  {j.phase || `${j.passagesDone} / ${j.passagesTotal} パッセージ`} ({pct}%)
+                </div>
+              </>
+            )}
+
+            <div className="job-meta">
+              <div className="job-meta-row"><span className="job-meta-key">資料:</span><span className="job-meta-val">{j.docs.length} 件</span></div>
+              <div className="job-meta-row"><span className="job-meta-key">形式:</span><span className="job-meta-val">{j.params?.mode}</span></div>
+              <div className="job-meta-row"><span className="job-meta-key">採用:</span><span className="job-meta-val" style={{ color: 'var(--accent)' }}>{j.accepted}</span></div>
+              <div className="job-meta-row"><span className="job-meta-key">不採用:</span><span className="job-meta-val">{j.rejected}</span></div>
+              <div className="job-meta-row"><span className="job-meta-key">拒否例:</span><span className="job-meta-val">{j.refusals}</span></div>
+              <div className="job-meta-row"><span className="job-meta-key">LLM呼出:</span><span className="job-meta-val">{j.llmCalls}</span></div>
+              {j.imported > 0 && (
+                <div className="job-meta-row"><span className="job-meta-key">取込済:</span><span className="job-meta-val">{j.imported}</span></div>
+              )}
+            </div>
+            {j.error && <div className="field-hint" style={{ color: 'var(--red)' }}>エラー: {j.error}</div>}
+
+            {j.accepted > 0 && (
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginTop: 8 }}>
+                <select className="select" value={importMode} onChange={e => setImportMode(e.target.value)} style={{ maxWidth: 220 }}>
+                  <option value="">形式: ジョブ設定のまま ({j.params?.mode})</option>
+                  <option value="closed">知識注入型 (closed)</option>
+                  <option value="open">RAG運用型 (open)</option>
+                  <option value="both">両方 (both)</option>
+                </select>
+                <button className="btn small primary" onClick={() => handleImport(j)}>
+                  📥 学習データへ取り込む ({j.accepted} 件)
+                </button>
+                <a className="btn small" href={`/tuning/rag/jobs/${j.jobId}/export?mode=${importMode || (j.params?.mode || 'closed')}`}
+                  target="_blank" rel="noopener" download>📤 JSONL</a>
+              </div>
+            )}
+
+            {openJobId === j.jobId && (
+              <div className="rt-samples">
+                <div style={{ display: 'flex', gap: 6, marginBottom: 8, flexWrap: 'wrap' }}>
+                  {['accepted', 'rejected', 'all'].map(f => (
+                    <button key={f} className={`btn small ${sampleFilter === f ? 'primary' : ''}`}
+                      onClick={() => openSamples(j.jobId, f)}>
+                      {f === 'accepted' ? '採用' : f === 'rejected' ? '不採用' : 'すべて'}
+                      {samples && samples.counts && ` (${samples.counts[f === 'all' ? 'all' : f] ?? 0})`}
+                    </button>
+                  ))}
+                </div>
+                {!samples ? <div className="field-hint">読み込み中...</div>
+                  : samples.samples.length === 0 ? <div className="field-hint">該当するサンプルはありません</div>
+                    : samples.samples.map(s => (
+                      <div key={s.id} className={`rt-sample ${s.status}`}>
+                        <div className="rt-sample-head">
+                          <span className={`rt-badge ${s.status}`}>{s.status === 'accepted' ? '採用' : '不採用'}</span>
+                          {s.kind === 'refusal' && <span className="rt-badge refusal">拒否例</span>}
+                          <span className="rt-sample-src">{s.source?.label}</span>
+                          {s.checks && s.checks.coverage !== undefined && (
+                            <span className="rt-sample-src">重なり {s.checks.coverage}</span>
+                          )}
+                          {s.reason && <span className="rt-sample-reason">{s.reason}</span>}
+                          {s.kind !== 'error' && (
+                            <button className="btn small" style={{ marginLeft: 'auto' }}
+                              onClick={() => toggleSampleStatus(j.jobId, s.id, s.status)}>
+                              {s.status === 'accepted' ? '除外する' : '採用する'}
+                            </button>
+                          )}
+                        </div>
+                        {s.question && <div className="sample-row"><div className="sample-label user">Q</div><div className="sample-text">{s.question}</div></div>}
+                        {s.answer && <div className="sample-row"><div className="sample-label assistant">A</div><div className="sample-text">{s.answer}</div></div>}
+                      </div>
+                    ))}
+                {samples && samples.total > samples.samples.length && (
+                  <div className="field-hint">先頭 {samples.samples.length} 件を表示 (全 {samples.total} 件)。全件は JSONL でダウンロードできます</div>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
