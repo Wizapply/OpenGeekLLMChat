@@ -306,7 +306,10 @@ function coverage(answer, passage) {
 
 /** 数値トークンを拾う (全角→半角、桁区切りのカンマは除去) */
 function numbersIn(s) {
-  const t = String(s || '').replace(/[０-９．，]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+  let t = String(s || '').replace(/[０-９．，]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+  // OCRは「1 200」「1. 2」のように数字の間へ空白を入れることがある。
+  // そのままだと資料側と一致せず、正しい回答まで「資料に無い数値」で落ちる
+  t = t.replace(/(\d)[ \u3000]+(?=[\d.,])/g, '$1');
   return (t.match(/\d+(?:[.,]\d+)*/g) || []).map(n => n.replace(/,/g, ''));
 }
 
@@ -445,6 +448,11 @@ function createRagTuneManager({
       generated: job.generated || 0,     // LLMが出した件数 (機械フィルタ前)
       accepted: job.accepted || 0,
       rejected: job.rejected || 0,
+      // 不採用の内訳 (deictic/meta/numbers/coverage/duplicate/length/verify)。
+      // 「300ページなのに64件しか採れない」の原因がどこかを、これで切り分ける
+      rejectReasons: job.rejectReasons || {},
+      truncated: job.truncated || 0,     // max_tokens で切られた応答の数
+      topUpCalls: job.topUpCalls || 0,   // 不足分の追い生成を呼んだ回数
       refusals: job.refusals || 0,       // accepted のうち拒否サンプル
       imported: job.imported || 0,       // 学習サンプルDBへ取り込んだ件数
       llmCalls: job.llmCalls || 0,
@@ -480,8 +488,16 @@ function createRagTuneManager({
     const mode = ['closed', 'open', 'both'].includes(String(pick('mode', 'closed'))) ? String(pick('mode', 'closed')) : 'closed';
     const styles = Array.isArray(pick('styles', null)) ? pick('styles', null) : DEFAULT_STYLES;
     const refusalAnswers = Array.isArray(pick('refusalAnswers', null)) ? pick('refusalAnswers', null) : DEFAULT_REFUSAL_ANSWERS;
+    const passageMode = ['auto', 'page', 'chunks'].includes(String(pick('passageMode', 'auto')))
+      ? String(pick('passageMode', 'auto')) : 'auto';
     return {
       mode,
+      // パッセージの作り方:
+      //   auto   … ページ情報 (OCR登録) があればページ単位、無ければチャンク単位
+      //   page   … 1パッセージ = pagesPerPassage ページぶん (「1ページにつきn問」にできる)
+      //   chunks … 1パッセージ = passageChunks チャンクぶん (従来)
+      passageMode,
+      pagesPerPassage: clampInt(pick('pagesPerPassage', 1), 1, 20, 1),
       passageChunks: clampInt(pick('passageChunks', 3), 1, 20, 3),
       maxPassageChars: clampInt(pick('maxPassageChars', 4000), 300, 20000, 4000),
       minPassageChars: clampInt(pick('minPassageChars', 200), 0, 5000, 200),
@@ -494,12 +510,17 @@ function createRagTuneManager({
       maxTokens: clampInt(pick('maxTokens', 2048), 256, 32768, 2048),
       timeoutSec: clampInt(pick('timeoutSec', 300), 30, 3600, 300),
       verify: pick('verify', true) !== false,
-      minAnswerChars: clampInt(pick('minAnswerChars', 10), 1, 2000, 10),
+      // 指定数に足りなかったとき、既出の質問を見せて不足分だけ作り直す
+      topUp: pick('topUp', true) !== false,
+      topUpRounds: clampInt(pick('topUpRounds', 1), 0, 3, 1),
+      minAnswerChars: clampInt(pick('minAnswerChars', 6), 1, 2000, 6),
       maxAnswerChars: clampInt(pick('maxAnswerChars', 600), 20, 8000, 600),
       minQuestionChars: clampInt(pick('minQuestionChars', 6), 1, 200, 6),
       minCoverage: clampNum(pick('minCoverage', 0.35), 0, 1, 0.35),
       checkNumbers: pick('checkNumbers', true) !== false,
-      dedupeThreshold: clampNum(pick('dedupeThreshold', 0.85), 0, 1, 0.85),
+      // 0.85 だと「OG-100の設定方法は？」と「OG-200の設定方法は？」のような
+      // 1語違いの質問まで重複として落ちる。資料が大きいほど効いてくるので既定は高め
+      dedupeThreshold: clampNum(pick('dedupeThreshold', 0.92), 0, 1, 0.92),
       styles,
       refusalAnswers,
       generatePrompt: String(pick('generatePrompt', DEFAULT_GENERATE_PROMPT)),
@@ -530,35 +551,66 @@ function createRagTuneManager({
 
   /**
    * 検索用チャンクを教師データ生成用のパッセージに束ね直す。
+   *
    * 検索は 500文字チャンクで十分だが、Q&A を作るには文脈が足りない
-   * (定義と条件が別チャンクに割れている)。ここで passageChunks 個ずつ
-   * 連結し直す。連結時は overlap ぶんを削る (ragSearch の連結と同じ理屈で、
+   * (定義と条件が別チャンクに割れている)。ここで束ね直す。
+   * 連結時は overlap ぶんを削る (ragSearch の連結と同じ理屈で、
    * 削らないと同じ文が二重に入り、モデルが繰り返しを学習してしまう)。
+   *
+   * 束ね方は2通り:
+   *   page   … 同じページのチャンクを1パッセージに (「1ページにつきn問」が作れる)
+   *   chunks … passageChunks 個ずつ機械的に (ページ情報の無い資料向け)
+   * auto はページ情報があれば page、無ければ chunks。
+   * OCR登録した資料は各チャンクの由来ページ (doc.pages) を持っているので、
+   * 300ページのPDFなら 300パッセージ = ページ単位の設問数がそのまま効く。
    */
   function buildPassages(doc, p) {
     const chunks = Array.isArray(doc.chunks) ? doc.chunks : [];
+    if (chunks.length === 0) return [];
+    const hasPages = Array.isArray(doc.pages) && doc.pages.some(v => Number.isFinite(v));
+    const usePage = p.passageMode === 'page' || (p.passageMode === 'auto' && hasPages);
+
+    // まず [from, to] の範囲を決める
+    const ranges = [];
+    if (usePage && hasPages) {
+      // 同じページ番号が続く区間をまとめる (チャンクは開始位置のページに属する)
+      const groups = [];
+      for (let i = 0; i < chunks.length; i++) {
+        const pg = pageOf(doc, i);
+        const last = groups[groups.length - 1];
+        if (last && last.page === pg) last.to = i;
+        else groups.push({ page: pg, from: i, to: i });
+      }
+      for (let i = 0; i < groups.length; i += p.pagesPerPassage) {
+        const slice = groups.slice(i, i + p.pagesPerPassage);
+        ranges.push({ from: slice[0].from, to: slice[slice.length - 1].to });
+      }
+    } else {
+      for (let i = 0; i < chunks.length; i += p.passageChunks) {
+        ranges.push({ from: i, to: Math.min(chunks.length - 1, i + p.passageChunks - 1) });
+      }
+    }
+
     const ov = Number.isFinite(doc.overlap) ? doc.overlap : 100;
     const out = [];
-    for (let i = 0; i < chunks.length; i += p.passageChunks) {
-      const from = i;
-      const to = Math.min(chunks.length - 1, i + p.passageChunks - 1);
-      let text = String(chunks[from] || '');
-      for (let j = from + 1; j <= to; j++) {
+    for (const r of ranges) {
+      let text = String(chunks[r.from] || '');
+      for (let j = r.from + 1; j <= r.to; j++) {
         const c = String(chunks[j] || '');
         text += ov > 0 && c.length > ov ? c.slice(ov) : c;
       }
       text = text.trim();
       if (text.length > p.maxPassageChars) text = text.slice(0, p.maxPassageChars);
       // 短すぎる断片 (目次の残り・空ページ) からは、まず良い設問が出ない
-      if (text.replace(/[\s　]/g, '').length < p.minPassageChars) continue;
+      if (text.replace(/[\s\u3000]/g, '').length < p.minPassageChars) continue;
       out.push({
-        key: `${doc.docId}:${from}-${to}`,
+        key: `${doc.docId}:${r.from}-${r.to}`,
         docId: doc.docId,
         filename: doc.filename,
         category: doc.category || null,
-        chunkRange: [from, to],
-        page: pageOf(doc, from),
-        pageTo: pageOf(doc, to),
+        chunkRange: [r.from, r.to],
+        page: pageOf(doc, r.from),
+        pageTo: pageOf(doc, r.to),
         text,
       });
     }
@@ -660,7 +712,10 @@ function createRagTuneManager({
         content = content.map(x => (typeof x === 'string' ? x : (x?.text || ''))).join('');
       }
       if (typeof content !== 'string') throw new Error('生成LLMのレスポンス形式が不正です');
-      return content;
+      // finish_reason: 'length' は max_tokens で切られた合図。JSONが途中で終わるので
+      // 拾える件数が減る (「3問頼んだのに1問しか出ない」の主因)
+      const finishReason = data?.choices?.[0]?.finish_reason || null;
+      return { content, truncated: finishReason === 'length', finishReason };
     } catch (e) {
       if (e.name === 'AbortError') {
         const err = new Error(ctl && ctl.cancelled ? 'キャンセルされました' : `生成タイムアウト (${timeoutSec}秒)`);
@@ -715,28 +770,29 @@ function createRagTuneManager({
     const q = qa.q;
     const a = qa.a;
     const checks = {};
-    if (q.length < p.minQuestionChars) return { ok: false, reason: '質問が短すぎます', checks };
-    if (q.length > 300) return { ok: false, reason: '質問が長すぎます', checks };
-    if (DEICTIC_RE.test(q)) return { ok: false, reason: '質問に指示語（この資料 等）が含まれます', checks };
-    if (a.length < p.minAnswerChars) return { ok: false, reason: '回答が短すぎます', checks };
-    if (a.length > p.maxAnswerChars) return { ok: false, reason: `回答が長すぎます (${a.length}文字)`, checks };
-    if (META_RE.test(a)) return { ok: false, reason: '回答にメタ表現（資料によると 等）が含まれます', checks };
+    const ng = (code, reason) => ({ ok: false, code, reason, checks });
+    if (q.length < p.minQuestionChars) return ng('length', '質問が短すぎます');
+    if (q.length > 300) return ng('length', '質問が長すぎます');
+    if (DEICTIC_RE.test(q)) return ng('deictic', '質問に指示語（この資料 等）が含まれます');
+    if (a.length < p.minAnswerChars) return ng('length', `回答が短すぎます (${a.length}文字)`);
+    if (a.length > p.maxAnswerChars) return ng('length', `回答が長すぎます (${a.length}文字)`);
+    if (META_RE.test(a)) return ng('meta', '回答にメタ表現（資料によると 等）が含まれます');
 
     // 数値の裏取り: 回答に出てくる数値がパッセージに無ければ、まず捏造か換算
     if (p.checkNumbers) {
       const src = numbersIn(passage);
       const bad = numbersIn(a).filter(n => !src.includes(n));
       checks.numbersMissing = bad;
-      if (bad.length > 0) return { ok: false, reason: `資料に無い数値: ${bad.slice(0, 3).join(', ')}`, checks };
+      if (bad.length > 0) return ng('numbers', `資料に無い数値: ${bad.slice(0, 3).join(', ')}`);
     }
 
     // 文字3-gramの被覆率: 一般論で埋めた回答はここで大きく下がる
     const cov = coverage(a, passage);
     checks.coverage = Math.round(cov * 100) / 100;
     if (cov < p.minCoverage) {
-      return { ok: false, reason: `資料との重なりが低い (${checks.coverage})`, checks };
+      return ng('coverage', `資料との重なりが低い (${checks.coverage})`);
     }
-    return { ok: true, reason: '', checks };
+    return { ok: true, code: null, reason: '', checks };
   }
 
   // ─── 生成本体 ────────────────────────────────────────────
@@ -796,6 +852,10 @@ function createRagTuneManager({
 
     job.passagesTotal = passages.length;
     job.passagesDone = passages.filter(ps => donePassages.has(ps.key)).length;
+    if (!job.rejectReasons) job.rejectReasons = {};   // 旧バージョンのジョブを再開したとき用
+    const pagesInfo = passages.filter(ps => ps.page !== null).length;
+    log('-', `[RAG教師データ] パッセージ ${passages.length} 個 `
+      + `(${pagesInfo > 0 ? 'ページ単位' : 'チャンク単位'}、1パッセージ ${p.questionsPerPassage} 問の予定)`);
     touch(job);
 
     let handle = null;
@@ -830,12 +890,17 @@ function createRagTuneManager({
         });
         let qaList = [];
         try {
-          const raw = await callLlm(handle, {
+          const res = await callLlm(handle, {
             system: '', user: genUser,
             temperature: p.temperature, maxTokens: p.maxTokens, timeoutSec: p.timeoutSec,
           }, ctl);
           job.llmCalls = (job.llmCalls || 0) + 1;
-          qaList = parseQaList(raw).filter(x => x.a);
+          if (res.truncated) {
+            job.truncated = (job.truncated || 0) + 1;
+            log('-', `[RAG教師データ] 応答が max_tokens (${p.maxTokens}) で切れました (${label})。`
+              + `件数が減る原因になります。maxTokens を上げるか questionsPerPassage を下げてください`);
+          }
+          qaList = parseQaList(res.content).filter(x => x.a);
         } catch (e) {
           if (ctl.cancelled) throw e;
           // 接続できないまま回し続けても全パッセージが同じ理由で失敗するだけなので、
@@ -856,11 +921,11 @@ function createRagTuneManager({
           continue;
         }
 
-        qaList = qaList.slice(0, p.questionsPerPassage);
-        job.generated = (job.generated || 0) + qaList.length;
+        // 1パッセージぶんのQ&Aを処理する。採用数が足りなければ「追い生成」で埋める
+        const passageQuestions = [];   // 追い生成で「既出」として見せる質問
+        let passageAccepted = 0;
 
-        for (const qa of qaList) {
-          if (ctl.cancelled) throw new Error('キャンセルされました');
+        const handleQa = async (qa) => {
           const rec = {
             id: uid('rs'),
             kind: 'qa',
@@ -873,23 +938,27 @@ function createRagTuneManager({
             checks: {},
             createdAt: Date.now(),
           };
+          passageQuestions.push(qa.q);
 
           // 機械フィルタ
           const mech = mechanicalCheck(qa, ps.text, p);
           rec.checks = mech.checks;
+          let code = null;
           if (!mech.ok) {
             rec.status = 'rejected';
             rec.reason = mech.reason;
+            code = mech.code;
           }
 
           // 重複チェック (同じ事実の言い換えは残したいので、閾値は高め)
           if (rec.status === 'accepted') {
             const norm = normalizeQuestion(qa.q);
             const grams = ngrams(qa.q, 3);
-            const dup = seenQuestions.find(s => s.norm === norm || jaccard(s.grams, grams) >= p.dedupeThreshold);
+            const dup = seenQuestions.find(s2 => s2.norm === norm || jaccard(s2.grams, grams) >= p.dedupeThreshold);
             if (dup) {
               rec.status = 'rejected';
               rec.reason = '既存の質問と重複';
+              code = 'duplicate';
             } else {
               seenQuestions.push({ norm, grams });
             }
@@ -901,18 +970,19 @@ function createRagTuneManager({
               const vUser = renderTemplate(p.verifyPrompt, {
                 passage: ps.text, question: qa.q, answer: qa.a, source: label,
               });
-              const raw = await callLlm(handle, {
+              const vres = await callLlm(handle, {
                 system: '', user: vUser,
                 temperature: p.verifyTemperature, maxTokens: 256, timeoutSec: p.timeoutSec,
               }, ctl);
               job.llmCalls = (job.llmCalls || 0) + 1;
-              const verdict = parseVerdict(raw);
+              const verdict = parseVerdict(vres.content);
               // 判定不能 (JSONを返せないモデル) は通す。ここで落とすと
               // 小型モデルでは全滅するため、機械フィルタ側を信頼する
               rec.checks.verified = verdict ? verdict.ok : null;
               if (verdict && !verdict.ok) {
                 rec.status = 'rejected';
                 rec.reason = `検証NG: ${verdict.reason || '資料と一致しません'}`;
+                code = 'verify';
               }
             } catch (e) {
               if (ctl.cancelled) throw e;
@@ -925,8 +995,58 @@ function createRagTuneManager({
           }
 
           appendSample(job.jobId, rec);
-          if (rec.status === 'accepted') job.accepted = (job.accepted || 0) + 1;
-          else job.rejected = (job.rejected || 0) + 1;
+          if (rec.status === 'accepted') {
+            job.accepted = (job.accepted || 0) + 1;
+            passageAccepted++;
+          } else {
+            job.rejected = (job.rejected || 0) + 1;
+            if (code) job.rejectReasons[code] = (job.rejectReasons[code] || 0) + 1;
+          }
+        };
+
+        qaList = qaList.slice(0, p.questionsPerPassage);
+        job.generated = (job.generated || 0) + qaList.length;
+        for (const qa of qaList) {
+          if (ctl.cancelled) throw new Error('キャンセルされました');
+          await handleQa(qa);
+        }
+
+        // 追い生成: 指定数に届かないぶんだけ、既出を見せて作り直させる。
+        // 小さいモデルは「3件作れ」と言っても1〜2件しか返さないことが多く、
+        // これが無いと 300ページの資料から数十件しか採れない
+        for (let round = 0; p.topUp && round < p.topUpRounds && passageAccepted < p.questionsPerPassage; round++) {
+          if (ctl.cancelled) throw new Error('キャンセルされました');
+          const need = p.questionsPerPassage - passageAccepted;
+          const already = passageQuestions.slice(-10).map(q => `- ${q}`).join('\n');
+          const topUpUser = renderTemplate(p.generatePrompt, {
+            n: need,
+            minChars: p.minAnswerChars,
+            maxChars: p.maxAnswerChars,
+            styles: p.styles.join(' / '),
+            source: label,
+            passage: ps.text,
+            filename: path.basename(String(ps.filename || '')),
+            category: ps.category || '未分類',
+          }) + `\n\n# 追加指示\n既に次の質問を作りました。これらと重複しない質問を ${need} 件だけ作ってください。`
+            + `\n${already}\n資料の別の箇所・別の観点 (数値 / 条件 / 手順 / 用語) から拾ってください。`;
+          try {
+            const res2 = await callLlm(handle, {
+              system: '', user: topUpUser,
+              temperature: Math.min(2, p.temperature + 0.15),   // 少しだけ散らす
+              maxTokens: p.maxTokens, timeoutSec: p.timeoutSec,
+            }, ctl);
+            job.llmCalls = (job.llmCalls || 0) + 1;
+            job.topUpCalls = (job.topUpCalls || 0) + 1;
+            if (res2.truncated) job.truncated = (job.truncated || 0) + 1;
+            const extra = parseQaList(res2.content).filter(x => x.a).slice(0, need);
+            if (extra.length === 0) break;      // 出てこないなら粘らない
+            job.generated = (job.generated || 0) + extra.length;
+            for (const qa of extra) await handleQa(qa);
+          } catch (e) {
+            if (ctl.cancelled || e.kind === 'connection') throw e;
+            log('-', `[RAG教師データ] 追い生成に失敗 (${label}): ${e.message}`);
+            break;
+          }
         }
 
         // ② 拒否例 (範囲外の質問 → 「記載がありません」)。
@@ -939,12 +1059,12 @@ function createRagTuneManager({
               filename: path.basename(String(ps.filename || '')),
               category: ps.category || '未分類',
             });
-            const raw = await callLlm(handle, {
+            const rres = await callLlm(handle, {
               system: '', user: rUser,
               temperature: Math.max(p.temperature, 0.5), maxTokens: Math.min(p.maxTokens, 1024), timeoutSec: p.timeoutSec,
             }, ctl);
             job.llmCalls = (job.llmCalls || 0) + 1;
-            const qs = parseQaList(raw).map(x => x.q).slice(0, p.refusalPerPassage);
+            const qs = parseQaList(rres.content).map(x => x.q).slice(0, p.refusalPerPassage);
             for (const q of qs) {
               if (DEICTIC_RE.test(q) || q.length < p.minQuestionChars) continue;
               const norm = normalizeQuestion(q);
@@ -1034,6 +1154,7 @@ function createRagTuneManager({
       phase: null,
       passagesTotal: 0, passagesDone: 0,
       generated: 0, accepted: 0, rejected: 0, refusals: 0, imported: 0, llmCalls: 0,
+      rejectReasons: {}, truncated: 0, topUpCalls: 0,
       createdAt: Date.now(),
     };
     loadJobs().unshift(job);
@@ -1058,6 +1179,7 @@ function createRagTuneManager({
     if (redo) {
       try { fs.rmSync(outPath(jobId), { force: true }); } catch {}
       job.generated = 0; job.accepted = 0; job.rejected = 0; job.refusals = 0; job.llmCalls = 0; job.imported = 0;
+      job.rejectReasons = {}; job.truncated = 0; job.topUpCalls = 0;
       job.passagesDone = 0;
     }
     const ctl = { cancelled: false, abort: null };
@@ -1072,7 +1194,9 @@ function createRagTuneManager({
       try {
         await processJob(job, ctl);
         setStatus(job, 'completed', { phase: null, finishedAt: Date.now() });
-        log('-', `[RAG教師データ] 完了: ${job.title} (採用 ${job.accepted} / 不採用 ${job.rejected})`);
+        const br = Object.entries(job.rejectReasons || {}).map(([k, v]) => `${k}:${v}`).join(' ');
+        log('-', `[RAG教師データ] 完了: ${job.title} (採用 ${job.accepted} / 不採用 ${job.rejected}`
+          + `${br ? ` [${br}]` : ''}${job.truncated ? ` / 応答切れ ${job.truncated}` : ''})`);
       } catch (e) {
         const cancelled = ctl.cancelled;
         setStatus(job, cancelled ? 'cancelled' : 'failed', {

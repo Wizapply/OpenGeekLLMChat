@@ -7,6 +7,8 @@ function App() {
   const [samples, setSamples] = useState([]);
   const [jobs, setJobs] = useState([]);
   const [currentJobId, setCurrentJobId] = useState(null);
+  // 実行中の後処理 (マージ→GGUF→量子化) { jobId, step }
+  const [postprocess, setPostprocess] = useState(null);
   const [toast, setToast] = useState(null);
   // サイドバー開閉（モバイル/狭画面でドロワー表示用）
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -55,6 +57,7 @@ function App() {
         const data = await r.json();
         setJobs(data.jobs || []);
         setCurrentJobId(data.current);
+        setPostprocess(data.postprocess || null);
       }
     } catch {}
   }
@@ -97,10 +100,12 @@ function App() {
             <div className="stats-card-label">ジョブ履歴</div>
             <div className="stats-card-value">{jobs.length}</div>
           </div>
-          {currentJobId && (
+          {(currentJobId || postprocess) && (
             <div className="stats-card">
               <div className="stats-card-label">実行中</div>
-              <div className="stats-card-value orange">⚙️ 学習中</div>
+              <div className="stats-card-value orange">
+                {currentJobId ? '⚙️ 学習中' : '📦 マージ中'}
+              </div>
             </div>
           )}
         </div>
@@ -152,7 +157,8 @@ function App() {
               showToast={showToast} />
           </div>
           <div style={{ display: tab === 'jobs' ? 'block' : 'none' }}>
-            <JobsView jobs={jobs} currentJobId={currentJobId} reload={loadJobs} showToast={showToast} />
+            <JobsView jobs={jobs} currentJobId={currentJobId} postprocess={postprocess}
+              reload={loadJobs} showToast={showToast} />
           </div>
         </div>
       </main>
@@ -648,11 +654,29 @@ function TrainingView({ samples, currentJobId, onStarted, showToast }) {
 }
 
 // ─── ジョブタブ ───
-function JobsView({ jobs, currentJobId, reload, showToast }) {
+// 後処理の経過時間表示 (3分12秒 / 1時間5分)
+function fmtElapsed(ms) {
+  const sec = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s2 = sec % 60;
+  if (h > 0) return `${h}時間${m}分`;
+  if (m > 0) return `${m}分${s2}秒`;
+  return `${s2}秒`;
+}
+
+function JobsView({ jobs, currentJobId, postprocess, reload, showToast }) {
   const [expandedJobs, setExpandedJobs] = useState({});
   const [jobLogs, setJobLogs] = useState({});
+  const [postLogs, setPostLogs] = useState({});
   const [postProcessing, setPostProcessing] = useState(null);
   const [artifacts, setArtifacts] = useState({});
+
+  // このジョブの後処理が動いているか。
+  // サーバーの実行中情報 (postprocess) を優先し、ジョブ記録は保険として見る
+  // (jobs.json への書き込みは各ステップの切れ目でしか起きないため)
+  const ppRunning = (j) =>
+    (postprocess && postprocess.jobId === j.id) || j.postprocessStatus === 'running';
+  const ppStep = (j) =>
+    (postprocess && postprocess.jobId === j.id && postprocess.step) || j.postprocessStep || null;
 
   async function toggleLog(jobId) {
     const isOpen = expandedJobs[jobId];
@@ -675,6 +699,12 @@ function JobsView({ jobs, currentJobId, reload, showToast }) {
     } catch (e) {
       setJobLogs(p => ({ ...p, [jobId]: `ログ取得エラー: ${e.message}` }));
     }
+    // 後処理ログ (無ければ 404。まだ実行していないだけなので無視する)
+    try {
+      const r = await fetch(`/tuning/jobs/${jobId}/postprocess-log`);
+      const text = r.ok ? await r.text() : '';
+      setPostLogs(p => ({ ...p, [jobId]: text }));
+    } catch {}
     // アーティファクトも取得
     try {
       const r = await fetch(`/tuning/jobs/${jobId}/artifacts`);
@@ -700,6 +730,33 @@ function JobsView({ jobs, currentJobId, reload, showToast }) {
     }, 3000);
     return () => clearInterval(t);
   }, [currentJobId, expandedJobs]);
+
+  // 後処理中はログを追いかける。マージは数分無言なので、
+  // 進んでいるのかどうかが分かるようにしておく
+  useEffect(() => {
+    const target = postprocess && postprocess.jobId;
+    if (!target || !expandedJobs[target]) return;
+    const t = setInterval(async () => {
+      try {
+        const r = await fetch(`/tuning/jobs/${target}/postprocess-log`);
+        if (!r.ok) return;
+        const text = await r.text();
+        setPostLogs(p => ({ ...p, [target]: text }));
+      } catch {}
+    }, 3000);
+    return () => clearInterval(t);
+  }, [postprocess, expandedJobs]);
+
+  async function handlePostStop(id) {
+    if (!confirm('後処理 (マージ/GGUF化) を停止しますか?')) return;
+    try {
+      const r = await fetch(`/tuning/jobs/${id}/postprocess/stop`, { method: 'POST' });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      showToast('停止しました', 'success');
+      reload();
+    } catch (e) { showToast(e.message, 'error'); }
+  }
 
   async function handleStop(id) {
     if (!confirm('このジョブを停止しますか?')) return;
@@ -734,17 +791,37 @@ function JobsView({ jobs, currentJobId, reload, showToast }) {
               {j.status === 'failed' && '✗ 失敗'}
               {j.status === 'cancelled' && '○ 中止'}
             </span>
-            {j.postprocessStatus === 'completed' && (
+            {/* 後処理 (マージ→GGUF→量子化) の状態。マージは数分〜十数分かかるうえ
+                無言なので、実行中とステップをここに出す */}
+            {ppRunning(j) ? (
+              <span className="post-status running">
+                📦 マージ実行中{ppStep(j) ? `（${ppStep(j)}）` : ''}
+                {j.postprocessStartedAt ? ` ${fmtElapsed(Date.now() - j.postprocessStartedAt)}` : ''}
+              </span>
+            ) : j.postprocessStatus === 'completed' ? (
               <span className="post-status">📦 後処理完了</span>
-            )}
+            ) : j.postprocessStatus === 'failed' ? (
+              <span className="post-status failed">📦 後処理失敗</span>
+            ) : j.postprocessStatus === 'cancelled' ? (
+              <span className="post-status">📦 後処理中断</span>
+            ) : j.postprocessStatus === 'interrupted' ? (
+              <span className="post-status failed">📦 後処理が中断されました (サーバー再起動)</span>
+            ) : null}
             <span className="job-id">{j.id}</span>
             <div className="job-actions">
               <button className="btn small" onClick={() => toggleLog(j.id)}>
                 {expandedJobs[j.id] ? '閉じる' : 'ログを見る'}
               </button>
-              {j.status === 'completed' && (
-                <button className="btn small primary" onClick={() => setPostProcessing(j)}>
-                  📦 マージ/GGUF化
+              {j.status === 'completed' && !ppRunning(j) && (
+                <button className="btn small primary" onClick={() => setPostProcessing(j)}
+                  disabled={!!postprocess}
+                  title={postprocess ? '別のジョブの後処理が実行中です' : ''}>
+                  📦 {j.postprocessStatus === 'completed' ? 'マージ/GGUF化 (再実行)' : 'マージ/GGUF化'}
+                </button>
+              )}
+              {ppRunning(j) && (
+                <button className="btn small danger" onClick={() => handlePostStop(j.id)}>
+                  後処理を停止
                 </button>
               )}
               {j.status === 'running' && (
@@ -763,6 +840,18 @@ function JobsView({ jobs, currentJobId, reload, showToast }) {
             <div className="job-meta-row"><span className="job-meta-key">サンプル数:</span><span className="job-meta-val">{j.sampleCount}</span></div>
             <div className="job-meta-row"><span className="job-meta-key">開始:</span><span className="job-meta-val">{new Date(j.startedAt).toLocaleString('ja-JP')}</span></div>
           </div>
+          {ppRunning(j) && (
+            <div className="post-progress">
+              <div className="post-progress-bar"><div className="post-progress-fill" /></div>
+              <div className="post-progress-text">
+                {ppStep(j) || 'マージ'} を実行中です。7Bモデルでマージに5〜15分、GGUF変換に数分かかります
+                {expandedJobs[j.id] ? '（下の後処理ログが3秒ごとに更新されます）' : '（「ログを見る」で進行状況を確認できます）'}
+              </div>
+            </div>
+          )}
+          {j.postprocessStatus === 'failed' && j.postprocessError && (
+            <div className="field-hint" style={{ color: 'var(--red)' }}>後処理エラー: {j.postprocessError}</div>
+          )}
           {j.postprocessStatus === 'completed' && j.ggufPath && (
             <GgufPathDisplay path={j.ggufPath} size={j.ggufSize} />
           )}
@@ -773,6 +862,14 @@ function JobsView({ jobs, currentJobId, reload, showToast }) {
                   ? 'ログ読み込み中...'
                   : (jobLogs[j.id] || '(ログはまだ空です。学習の出力が始まるまでお待ちください)')
               }</div>
+              {postLogs[j.id] ? (
+                <>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', margin: '8px 0 4px' }}>
+                    後処理ログ (マージ / GGUF変換 / 量子化)
+                  </div>
+                  <div className="job-log">{postLogs[j.id]}</div>
+                </>
+              ) : null}
               {artifacts[j.id] && artifacts[j.id].length > 0 && (
                 <div className="artifact-list">
                   <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>出力ファイル:</div>
@@ -923,6 +1020,17 @@ function PostProcessDialog({ job, onClose, onStarted }) {
 // 登録済みRAG資料を選び、LLMにQ&Aを作らせて、レビューしてから
 // 「学習データ」タブ (tuning/samples.jsonl) へ取り込む。
 // プロンプトはここで編集して試せる (config.json の tuning.ragDataset が初期値)。
+// 不採用理由コード → 画面表示
+const RT_REASON_LABEL = {
+  deictic: '質問が指示語',
+  meta: '回答がメタ表現',
+  numbers: '資料に無い数値',
+  coverage: '資料との重なり不足',
+  duplicate: '質問の重複',
+  length: '長さ超過/不足',
+  verify: '検証NG',
+};
+
 function RagGenView({ showToast, reloadSamples }) {
   const [status, setStatus] = useState(null);      // /tuning/rag/status
   const [docs, setDocs] = useState([]);
@@ -1014,7 +1122,12 @@ function RagGenView({ showToast, reloadSamples }) {
     const chunkTotal = docs.filter(d => selectedIds.includes(d.docId))
       .reduce((n, d) => n + (d.chunkCount || 0), 0);
     if (!chunkTotal) return null;
-    let passages = Math.ceil(chunkTotal / Math.max(1, Number(params.passageChunks) || 3));
+    // ページ単位ではパッセージ数 = ページ数だが、ページ数は登録情報に無いので
+    // チャンク数からの概算にする (1ページ ≒ 2チャンク)。実数は開始後に出る
+    const chunksPerPassage = (params.passageMode === 'chunks')
+      ? Math.max(1, Number(params.passageChunks) || 3)
+      : Math.max(1, 2 * (Number(params.pagesPerPassage) || 1));
+    let passages = Math.ceil(chunkTotal / chunksPerPassage);
     if (Number(params.maxPassages) > 0) passages = Math.min(passages, Number(params.maxPassages));
     const perPassage = 1
       + (params.verify ? Number(params.questionsPerPassage) || 0 : 0)
@@ -1200,10 +1313,31 @@ function RagGenView({ showToast, reloadSamples }) {
 
       <div className="rt-grid">
         <div className="field">
+          <label className="field-label">パッセージの作り方</label>
+          <select className="select" value={params.passageMode || 'auto'}
+            onChange={e => setParam('passageMode', e.target.value)}>
+            <option value="auto">自動（ページ情報があればページ単位）</option>
+            <option value="page">ページ単位（1ページ = 1パッセージ）</option>
+            <option value="chunks">チャンク単位（従来）</option>
+          </select>
+          <span className="field-hint">
+            PDF OCR で登録した資料はページ番号を持っています。ページ単位にすると
+            「1ページにつき{params.questionsPerPassage}問」になり、300ページなら最大 {300 * (Number(params.questionsPerPassage) || 0)} 問
+          </span>
+        </div>
+        <div className="field">
+          <label className="field-label">1パッセージのページ数</label>
+          <input className="input" type="number" min="1" max="20" value={params.pagesPerPassage ?? 1}
+            onChange={e => setParam('pagesPerPassage', Number(e.target.value))}
+            disabled={params.passageMode === 'chunks'} />
+          <span className="field-hint">ページ単位のときだけ有効。1ページが薄い資料は2〜3にまとめると設問が作りやすい</span>
+        </div>
+        <div className="field">
           <label className="field-label">1パッセージのチャンク数</label>
           <input className="input" type="number" min="1" max="20" value={params.passageChunks}
-            onChange={e => setParam('passageChunks', Number(e.target.value))} />
-          <span className="field-hint">検索用チャンク(既定500文字)を何個つなぐか。少ないと文脈不足、多いと質問が散る</span>
+            onChange={e => setParam('passageChunks', Number(e.target.value))}
+            disabled={params.passageMode === 'page'} />
+          <span className="field-hint">チャンク単位のときだけ有効。検索用チャンク(既定500文字)を何個つなぐか</span>
         </div>
         <div className="field">
           <label className="field-label">1パッセージあたりのQ&amp;A数</label>
@@ -1243,7 +1377,9 @@ function RagGenView({ showToast, reloadSamples }) {
             <input className="input" type="number" min="20" value={params.maxAnswerChars}
               onChange={e => setParam('maxAnswerChars', Number(e.target.value))} />
           </div>
-          <span className="field-hint">範囲外は不採用。長すぎる回答は資料の丸写しになりやすい</span>
+          <span className="field-hint">
+            範囲外は不採用。日本語の事実回答は「DC12Vです。」のように短いので、最小を大きくすると正答まで落ちます（既定6）
+          </span>
         </div>
         <div className="field">
           <label className="field-label">資料との重なり下限 (0〜1)</label>
@@ -1263,6 +1399,11 @@ function RagGenView({ showToast, reloadSamples }) {
           <input type="checkbox" checked={params.checkNumbers !== false}
             onChange={e => setParam('checkNumbers', e.target.checked)} />
           数値の裏取りをする (資料に無い数値を含む回答を落とす)
+        </label>
+        <label className="rt-check">
+          <input type="checkbox" checked={params.topUp !== false}
+            onChange={e => setParam('topUp', e.target.checked)} />
+          不足分を追い生成する (指定数に届かなければ既出を見せて作り直させる)
         </label>
       </div>
 
@@ -1322,7 +1463,8 @@ function RagGenView({ showToast, reloadSamples }) {
         </button>
         {estimate && (
           <span className="field-hint">
-            約 {estimate.passages} パッセージ / LLM呼び出し 約 {estimate.calls} 回 / 生成見込み 最大 {estimate.samples} 件
+            約 {estimate.passages} パッセージ{params.passageMode !== 'chunks' ? '（ページ単位なら実際のページ数）' : ''}
+            {' / '}LLM呼び出し 約 {estimate.calls} 回 / 生成見込み 最大 {estimate.samples} 件
           </span>
         )}
       </div>
@@ -1381,11 +1523,23 @@ function RagGenView({ showToast, reloadSamples }) {
               <div className="job-meta-row"><span className="job-meta-key">採用:</span><span className="job-meta-val" style={{ color: 'var(--accent)' }}>{j.accepted}</span></div>
               <div className="job-meta-row"><span className="job-meta-key">不採用:</span><span className="job-meta-val">{j.rejected}</span></div>
               <div className="job-meta-row"><span className="job-meta-key">拒否例:</span><span className="job-meta-val">{j.refusals}</span></div>
-              <div className="job-meta-row"><span className="job-meta-key">LLM呼出:</span><span className="job-meta-val">{j.llmCalls}</span></div>
+              <div className="job-meta-row"><span className="job-meta-key">LLM呼出:</span><span className="job-meta-val">{j.llmCalls}{j.topUpCalls ? ` (追い ${j.topUpCalls})` : ''}</span></div>
+              {j.passagesDone > 0 && (
+                <div className="job-meta-row"><span className="job-meta-key">1パッセージ:</span>
+                  <span className="job-meta-val">{(j.accepted / j.passagesDone).toFixed(1)} 件</span></div>
+              )}
               {j.imported > 0 && (
                 <div className="job-meta-row"><span className="job-meta-key">取込済:</span><span className="job-meta-val">{j.imported}</span></div>
               )}
             </div>
+            {/* 「思ったより採れない」ときに何が落としているかを見せる。
+                これが無いと、プロンプトが悪いのか閾値が厳しいのか切り分けられない */}
+            {j.rejected > 0 && j.rejectReasons && Object.keys(j.rejectReasons).length > 0 && (
+              <div className="field-hint" style={{ marginTop: 4 }}>
+                不採用の内訳: {Object.entries(j.rejectReasons).map(([k, v]) => `${RT_REASON_LABEL[k] || k} ${v}`).join(' / ')}
+                {j.truncated > 0 && ` ／ 応答が max_tokens で切れた回数 ${j.truncated}（maxTokens を上げるか1パッセージの設問数を減らすと増えます）`}
+              </div>
+            )}
             {j.error && <div className="field-hint" style={{ color: 'var(--red)' }}>エラー: {j.error}</div>}
 
             {j.accepted > 0 && (

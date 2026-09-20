@@ -1267,7 +1267,10 @@ function checkTtsIdle() {
 }
 setInterval(checkTtsIdle, 30000);
 
-async function startChatModel(modelName) {
+// opts.readyTimeoutMs: 起動完了待ちの上書き (既定は llamaServer.readyTimeoutMs)。
+// 20GB級のモデルは初回ロードが既定の120秒に収まらないことがあり、
+// 呼び出し側 (RAG教師データ生成の自動ロード等) が長めに待てるようにする
+async function startChatModel(modelName, opts = {}) {
   if (chatProcStarting) throw new Error('既にモデル起動処理中です');
   const model = findModelByName(modelName);
   if (!model) throw new Error(`モデルが見つかりません: ${modelName}`);
@@ -1331,10 +1334,11 @@ async function startChatModel(modelName) {
       } catch {}
     });
 
-    const ready = await waitForReady(ls.chatHost, ls.chatPort, ls.readyTimeoutMs);
+    const readyTimeoutMs = Number(opts.readyTimeoutMs) > 0 ? Number(opts.readyTimeoutMs) : ls.readyTimeoutMs;
+    const ready = await waitForReady(ls.chatHost, ls.chatPort, readyTimeoutMs);
     if (!ready) {
       await stopChatModel();
-      throw new Error(`チャットモデル起動タイムアウト: ${model.name}`);
+      throw new Error(`チャットモデル起動タイムアウト: ${model.name} (${Math.round(readyTimeoutMs / 1000)}秒待機)`);
     }
     // 実際に確保されたコンテキストサイズを /props から読み取る。
     // llama-server は -np で n_ctx をスロット数で分割するほか、モデル側の上限で
@@ -3193,6 +3197,14 @@ function reconcileStaleJobs() {
         j.endedAt = j.endedAt || Date.now();
         changed = true;
       }
+      // 後処理 (マージ/GGUF化) も同様。実プロセスは死んでいるので
+      // 「📦 マージ実行中」の表示が永遠に残らないようにする
+      if (j.postprocessStatus === 'running') {
+        j.postprocessStatus = 'interrupted';
+        j.postprocessStep = null;
+        j.postprocessEndedAt = j.postprocessEndedAt || Date.now();
+        changed = true;
+      }
     }
     if (changed) { saveJobs(jobs); log('-', '[起動] 中断されたファインチューニングジョブを補正しました'); }
   } catch {}
@@ -3207,7 +3219,13 @@ function generateJobId() {
 // ジョブ一覧
 app.get('/tuning/jobs', requireAuth, (req, res) => {
   const jobs = loadJobs();
-  res.json({ jobs, current: currentTuningJob ? currentTuningJob.id : null });
+  res.json({
+    jobs,
+    current: currentTuningJob ? currentTuningJob.id : null,
+    // 実行中の後処理 (マージ→GGUF→量子化)。jobs.json への書き込みより
+    // こちらが確実なので、UI はまずこれを見る
+    postprocess: currentPostprocess ? { jobId: currentPostprocess.jobId, step: currentPostprocess.step } : null,
+  });
 });
 
 // ジョブ開始
@@ -3437,7 +3455,18 @@ app.delete('/tuning/jobs/:id', requireAuth, (req, res) => {
 //   2. python convert_hf_to_gguf.py merged --outfile <out>.gguf --outtype f16
 //   3. llama-quantize <out>.gguf <out>-Q4_K_M.gguf Q4_K_M  (任意)
 
-let currentPostprocess = null;  // { jobId, proc, step }
+let currentPostprocess = null;  // { jobId, proc, step, cancelled }
+
+// 後処理の進捗をジョブ記録に反映する。
+// 以前は finalize でしか書いていなかったため、UI からは
+// 「マージ中なのか、失敗して止まったのか」が区別できなかった
+function setPostprocessState(jobId, patch) {
+  const jobs = loadJobs();
+  const j = jobs.find(x => x.id === jobId);
+  if (!j) return;
+  Object.assign(j, patch);
+  saveJobs(jobs);
+}
 
 app.post('/tuning/jobs/:id/postprocess', requireAuth, jsonParser, (req, res) => {
   const ip = getIP(req);
@@ -3489,7 +3518,9 @@ app.post('/tuning/jobs/:id/postprocess', requireAuth, jsonParser, (req, res) => 
       XDG_CACHE_HOME: TUNING_HF_CACHE_DIR,
     };
     const p = spawn(cmd, args, { cwd, env: postEnv });
-    currentPostprocess = { jobId, proc: p, step: label };
+    currentPostprocess = { jobId, proc: p, step: label, cancelled: currentPostprocess?.cancelled || false };
+    // 画面の「📦 後処理中」に出す現在のステップ
+    setPostprocessState(jobId, { postprocessStep: label });
     let errored = false;
     p.on('error', (err) => {
       // 実行ファイルが無い等。捕捉しないとサーバーがクラッシュする
@@ -3506,15 +3537,28 @@ app.post('/tuning/jobs/:id/postprocess', requireAuth, jsonParser, (req, res) => 
     });
   }
 
+  // 失敗 (または停止) の記録。停止要求で殺したときは「中断」として残す
+  function postprocessFailed(id, message) {
+    const cancelled = !!(currentPostprocess && currentPostprocess.cancelled);
+    setPostprocessState(id, {
+      postprocessStatus: cancelled ? 'cancelled' : 'failed',
+      postprocessError: cancelled ? null : String(message || '').slice(0, 300),
+      postprocessEndedAt: Date.now(),
+      postprocessStep: null,
+    });
+    log('-', `[tuning ${id}] 後処理${cancelled ? '中断' : '失敗'}${cancelled ? '' : `: ${message}`}`);
+    currentPostprocess = null;
+  }
+
   function step1Merge() {
     const mergeScript = path.join(__dirname, 'merge_adapter.py');
     if (!fs.existsSync(mergeScript)) {
       postLog.end(`ERROR: merge_adapter.py が見つかりません: ${mergeScript}\n`);
-      currentPostprocess = null;
+      postprocessFailed(jobId, `merge_adapter.py が見つかりません`);
       return;
     }
     runStep('Step 1: マージ', pythonPath, [mergeScript, jobDir], __dirname, (code) => {
-      if (code !== 0) { postLog.end(`マージ失敗 code=${code}\n`); currentPostprocess = null; return; }
+      if (code !== 0) { postLog.end(`マージ失敗 code=${code}\n`); postprocessFailed(jobId, `マージ失敗 (exit ${code})`); return; }
       step2Gguf();
     });
   }
@@ -3523,13 +3567,13 @@ app.post('/tuning/jobs/:id/postprocess', requireAuth, jsonParser, (req, res) => 
     const mergedDir = path.join(jobDir, 'merged');
     if (!fs.existsSync(mergedDir)) {
       postLog.end(`ERROR: マージ済みモデルがありません: ${mergedDir}\n`);
-      currentPostprocess = null;
+      postprocessFailed(jobId, `マージ済みモデルがありません`);
       return;
     }
     const convertScript = path.join(llamaDir, 'convert_hf_to_gguf.py');
     if (!fs.existsSync(convertScript)) {
       postLog.end(`ERROR: convert_hf_to_gguf.py が見つかりません: ${convertScript}\n`);
-      currentPostprocess = null;
+      postprocessFailed(jobId, `convert_hf_to_gguf.py が見つかりません (tuning.llamaCppDir を確認してください)`);
       return;
     }
     const ggufFile = path.join(jobDir, `${outputName}.gguf`);
@@ -3537,7 +3581,7 @@ app.post('/tuning/jobs/:id/postprocess', requireAuth, jsonParser, (req, res) => 
       pythonPath, [convertScript, mergedDir, '--outfile', ggufFile, '--outtype', 'f16'],
       llamaDir,
       (code) => {
-        if (code !== 0) { postLog.end(`GGUF変換失敗 code=${code}\n`); currentPostprocess = null; return; }
+        if (code !== 0) { postLog.end(`GGUF変換失敗 code=${code}\n`); postprocessFailed(jobId, `GGUF変換失敗 (exit ${code})`); return; }
         if (quantize && quantize !== 'f16' && quantize !== 'bf16') step3Quantize(ggufFile);
         else finalize(ggufFile);
       });
@@ -3547,7 +3591,7 @@ app.post('/tuning/jobs/:id/postprocess', requireAuth, jsonParser, (req, res) => 
     const quantBin = path.join(llamaDir, 'build', 'bin', 'llama-quantize');
     if (!fs.existsSync(quantBin)) {
       postLog.end(`ERROR: llama-quantize が見つかりません: ${quantBin}\n`);
-      currentPostprocess = null;
+      postprocessFailed(jobId, `llama-quantize が見つかりません (llama.cpp をビルドしてください)`);
       return;
     }
     const quantFile = path.join(jobDir, `${outputName}-${quantize}.gguf`);
@@ -3555,7 +3599,7 @@ app.post('/tuning/jobs/:id/postprocess', requireAuth, jsonParser, (req, res) => 
       quantBin, [ggufFile, quantFile, quantize],
       llamaDir,
       (code) => {
-        if (code !== 0) { postLog.end(`量子化失敗 code=${code}\n`); currentPostprocess = null; return; }
+        if (code !== 0) { postLog.end(`量子化失敗 code=${code}\n`); postprocessFailed(jobId, `量子化失敗 (exit ${code})`); return; }
         finalize(quantFile);
       });
   }
@@ -3592,6 +3636,8 @@ app.post('/tuning/jobs/:id/postprocess', requireAuth, jsonParser, (req, res) => 
     if (j) {
       j.postprocessStatus = 'completed';
       j.postprocessEndedAt = Date.now();
+      j.postprocessStep = null;
+      j.postprocessError = null;
       if (finalGgufFile) {
         j.ggufPath = finalGgufFile;
         try {
@@ -3605,6 +3651,14 @@ app.post('/tuning/jobs/:id/postprocess', requireAuth, jsonParser, (req, res) => 
   }
 
   log(ip, `TUNING POSTPROCESS START: ${jobId} quantize=${quantize}`);
+  setPostprocessState(jobId, {
+    postprocessStatus: 'running',
+    postprocessStep: 'Step 1: マージ',
+    postprocessStartedAt: Date.now(),
+    postprocessEndedAt: null,
+    postprocessError: null,
+    postprocessQuantize: quantize || 'f16',
+  });
   step1Merge();
   res.json({ ok: true, message: '後処理を開始しました。/tuning/jobs/:id/postprocess-log でログを確認できます' });
 });
@@ -3623,6 +3677,7 @@ app.post('/tuning/jobs/:id/postprocess/stop', requireAuth, (req, res) => {
   if (!currentPostprocess || currentPostprocess.jobId !== req.params.id) {
     return res.status(404).json({ error: '後処理は実行中ではありません' });
   }
+  currentPostprocess.cancelled = true;   // 失敗ではなく中断として記録するための印
   try { currentPostprocess.proc.kill('SIGTERM'); } catch {}
   res.json({ ok: true });
 });
@@ -11365,11 +11420,19 @@ function ragTuneEndpoint() {
 // ここでロード完了まで待ってから生成を始める。
 async function ragTuneEnsureMainChat() {
   const ls = appConfig.llamaServer || {};
+  // チャット用の readyTimeoutMs (既定120秒) は対話の応答性に合わせた値で、
+  // 20GB級のモデルの初回ロードには足りない。生成ジョブは待てるので長めに取る
+  const loadTimeoutMs = Math.max(
+    parseInt(ls.readyTimeoutMs) || 0,
+    ragTuneClampInt(ragTuneCfg().modelLoadTimeoutSec, 30, 7200, 900) * 1000,
+  );
   if (chatProc && !chatProcStarting) { chatLastUsed = Date.now(); return; }
   if (chatProcStarting) {
     // 他のリクエストが起動中: 準備できるまで待つ
-    const ready = await waitForReady(ls.chatHost, ls.chatPort, ls.readyTimeoutMs || 120000);
-    if (!ready) throw new Error('チャットモデルの起動を待ちましたが応答がありません');
+    const ready = await waitForReady(ls.chatHost, ls.chatPort, loadTimeoutMs);
+    if (!ready) {
+      throw new Error(`チャットモデルの起動を ${Math.round(loadTimeoutMs / 1000)}秒待ちましたが応答がありません`);
+    }
     chatLastUsed = Date.now();
     return;
   }
@@ -11380,9 +11443,26 @@ async function ragTuneEnsureMainChat() {
     throw new Error('起動できるチャットモデルがありません。config.json の chatModels / defaultModel を確認するか、'
       + 'tuning.ragDataset.poolModel に生成用モデルを指定してください');
   }
-  log('-', `[RAG教師データ] 生成用にチャットモデル「${model}」を起動します`);
-  await startChatModel(model);   // waitForReady 内蔵。完了まで待つ
+  log('-', `[RAG教師データ] 生成用にチャットモデル「${model}」を起動します`
+    + ` (最大 ${Math.round(loadTimeoutMs / 1000)}秒待機)`);
+  try {
+    await startChatModel(model, { readyTimeoutMs: loadTimeoutMs });   // waitForReady 内蔵
+  } catch (e) {
+    if (/タイムアウト/.test(e.message || '')) {
+      throw new Error(`${e.message}。大きいモデルは初回ロードに時間がかかります。`
+        + `tuning.ragDataset.modelLoadTimeoutSec を増やすか、先にチャット画面でモデルを読み込んでから生成を開始してください`
+        + `(軽いモデルで生成するなら tuning.ragDataset.poolModel に chatModels の名前を指定できます)`);
+    }
+    throw e;
+  }
   chatLastUsed = Date.now();
+}
+
+// config の値を安全な範囲に収める (ML系の関数内にある clampInt とは引数順が違うので別名)
+function ragTuneClampInt(v, min, max, dflt) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.min(Math.max(n, min), max);
 }
 
 // 生成用LLMが使えるか。プール管理なら定義の検証だけ (プロセスはジョブ開始時に起動する)、

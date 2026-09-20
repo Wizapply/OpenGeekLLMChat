@@ -651,6 +651,31 @@
     color: var(--accent);
   }
 
+  /* ── 後処理 (マージ→GGUF→量子化) の進行表示 ── */
+  .post-status.running { background: var(--orange-dim); color: var(--orange); }
+  .post-status.failed { background: var(--red-dim); color: var(--red); }
+  .post-progress { margin: 6px 0 8px; }
+  .post-progress-bar {
+    height: 4px;
+    background: var(--bg-tertiary);
+    border-radius: 2px;
+    overflow: hidden;
+    margin-bottom: 4px;
+  }
+  /* 進捗率が取れない処理なので、動いていることだけを示す不定バー */
+  .post-progress-fill {
+    height: 100%;
+    width: 35%;
+    background: var(--orange);
+    border-radius: 2px;
+    animation: post-indeterminate 1.6s ease-in-out infinite;
+  }
+  @keyframes post-indeterminate {
+    0%   { margin-left: -35%; }
+    100% { margin-left: 100%; }
+  }
+  .post-progress-text { font-size: 11px; color: var(--text-muted); line-height: 1.5; }
+
   /* ── RAGから教師データ生成タブ ── */
   .ragdoc-list {
     display: flex;
