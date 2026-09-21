@@ -2156,6 +2156,58 @@
     color: var(--bg-primary);
   }
 
+  /* 外部LLMに聞き直すボタン。ローカルの限界の印がある時 (.suggest) は強調 */
+  .msg-action-btn.cloud-btn:hover {
+    border-color: var(--orange);
+    color: var(--orange);
+    background: rgba(251, 146, 60, 0.12);
+  }
+  .msg-action-btn.cloud-btn.suggest {
+    background: rgba(251, 146, 60, 0.12);
+    border-color: var(--orange);
+    color: var(--orange);
+    font-weight: 600;
+  }
+  .msg-action-btn.cloud-btn.suggest:hover {
+    background: var(--orange);
+    color: var(--bg-primary);
+  }
+
+  /* 外部LLMの回答であることを示すバッジ (吹き出しの上) */
+  .cloud-llm-badge {
+    margin: 0 0 6px 0;
+    padding: 6px 10px;
+    border: 1px solid rgba(251, 146, 60, 0.45);
+    border-left: 3px solid var(--orange);
+    border-radius: var(--radius-sm);
+    background: rgba(251, 146, 60, 0.08);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .cloud-llm-badge.pending { opacity: 0.75; }
+  .cloud-llm-badge.error {
+    border-color: rgba(248, 113, 113, 0.5);
+    border-left-color: var(--red);
+    background: rgba(248, 113, 113, 0.08);
+  }
+  .cloud-llm-badge-main { color: var(--orange); font-weight: 600; }
+  .cloud-llm-badge.error .cloud-llm-badge-main { color: var(--red); }
+  .cloud-llm-badge-model { font-weight: 500; font-family: var(--font-mono); font-size: 11px; opacity: 0.9; }
+  .cloud-llm-badge-sub { color: var(--text-muted); font-size: 11px; margin-top: 2px; }
+  .cloud-llm-local { margin-top: 6px; }
+  .cloud-llm-local summary { cursor: pointer; color: var(--text-muted); font-size: 11px; }
+  .cloud-llm-local-body {
+    margin-top: 4px;
+    padding: 6px 8px;
+    max-height: 240px;
+    overflow: auto;
+    white-space: pre-wrap;
+    font-size: 12px;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    border-radius: var(--radius-sm);
+  }
+
   .msg-bubble strong { font-weight: 600; }
   .msg-bubble em { font-style: italic; }
 
@@ -3034,6 +3086,20 @@
   }
   .toolbar-btn.gdrive-toggle:hover { opacity: 0.8; }
   .toolbar-btn.gdrive-toggle.active:hover { opacity: 1; }
+
+  /* 外部LLM (有料API) トグル。課金・外部送信を伴うので accent ではなく orange で目立たせる */
+  .toolbar-btn.cloud-llm-toggle {
+    opacity: 0.4;
+    position: relative;
+  }
+  .toolbar-btn.cloud-llm-toggle.active {
+    opacity: 1;
+    background: rgba(251, 146, 60, 0.14);
+    color: var(--orange);
+    border-color: var(--orange);
+  }
+  .toolbar-btn.cloud-llm-toggle:hover { opacity: 0.8; }
+  .toolbar-btn.cloud-llm-toggle.active:hover { opacity: 1; }
 
   /* 登録資料(永続RAG)トグル: Web検索トグルと同じ挙動。既定はOFF */
   .toolbar-btn.rag-toggle {

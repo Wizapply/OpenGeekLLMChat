@@ -25,6 +25,19 @@ function formatBytes(bytes) {
 // 日本語 (ひらがな/カタカナ/漢字) を含むか
 const HAS_JA_RE = /[぀-ゟ゠-ヿ一-鿿]/;
 
+// 外部LLM (有料API) へ切り替えた理由の表示名。msg.cloudLlm.reason に入る
+const CLOUD_REASON_LABELS = {
+  toggle: '🌩️ トグルON (最終回答を外部LLMに依頼)',
+  manual: '手動で聞き直し',
+  ctxExhausted: 'ローカルのコンテキスト不足',
+  lengthCapped: 'ローカルの出力打ち切り',
+  thinkingOnly: 'ローカルが思考のみで終了',
+  emptyResponse: 'ローカルの応答が空',
+  loopDetected: 'ローカルの思考ループ',
+  giveUp: 'ローカルが回答できず',
+  error: 'ローカル推論のエラー',
+};
+
 // ─── 「印なしで漏れた思考ブロック」の検出 ───
 // Qwen3.6 35B-A3B[MoE] は <think> も reasoning_content も付かないまま、
 // 英語の計画メモを本文の先頭に書いてしまうことがある:
@@ -2434,6 +2447,15 @@ function App() {
   // gdriveEnabled はチャット欄のトグル。接続済みでもユーザーがOFFにすればツールを出さない。
   const [gdriveStatus, setGdriveStatus] = useState(null);
   const [gdriveEnabled, setGdriveEnabled] = useState(true);
+  // ─── 外部LLM (有料API) フォールバック ───
+  // cloudLlmStatus: サーバーの /cloud-llm/status (設定の有無・プロバイダ・自動エスカレーション条件・利用回数)。
+  //   キーや URL は含まれない (サーバーが返さない)。
+  // cloudLlmEnabled: チャット欄の 🌩️ トグル。ON の間は「ツール実行はローカル、最終回答は外部LLM」。
+  //   OFF でも、ローカルが限界の時に「外部LLMに聞き直す」ボタンや自動エスカレーションで使える。
+  //   課金が絡むので新規チャットでは常に OFF から始める (チャット毎に保存はする)
+  const [cloudLlmStatus, setCloudLlmStatus] = useState(null);
+  const [cloudLlmEnabled, setCloudLlmEnabled] = useState(false);
+  const cloudConfirmedRef = useRef(false);   // 送信前の確認ダイアログはセッション中1回
   const [gdriveFiles, setGdriveFiles] = useState([]);
   const [gdriveFolderId, setGdriveFolderId] = useState('');
   // パンくず: [{ id, name }]。先頭は常にルート
@@ -5740,6 +5762,25 @@ function App() {
           };
         }
 
+        // ─── 🌩️ トグルON: 最終回答は外部LLMに書かせる ───
+        // ツール判断・検索・Python・RAG はここまでにローカルで済んでいる。外部には
+        // その結果を含む会話だけを送る (tools は渡さない)。ローカル向けの救済
+        // (思考のみ/空応答の引き直し) は外部モデルには不要なのでここで抜ける。
+        // 設定不足や確認ダイアログのキャンセル時は従来どおりローカルで回答する
+        if (cloudLlmEnabled && cloudLlmStatus?.enabled && confirmCloudSend()) {
+          const cloudIdx = await new Promise(resolve => { setMessages(prev => { resolve(prev.length - 1); return prev; }); });
+          // ragPolicy が send 以外なら、ツール案内や添付ドキュメント名を含む system は外部に出さず
+          // 最小限のものに差し替える (資料の検索結果は runCloudAnswer 側で伏せる)
+          const cloudMessages = (cloudLlmStatus.ragPolicy || 'redact') === 'send'
+            ? finalMessages
+            : [{ role: 'system', content: buildCloudSystemPrompt() }, ...finalMessages.filter(m => m.role !== 'system' || finalMessages.indexOf(m) !== 0)];
+          await runCloudAnswer({
+            idx: cloudIdx, requestMessages: cloudMessages, reason: 'toggle', controller,
+            genMedia: { audios: generatedAudios, images: generatedImages },
+          });
+          return;
+        }
+
         const finalRes = await fetchWithRetry('/v1/chat/completions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -6029,6 +6070,27 @@ function App() {
         fullSystemPrompt = applyRolePrompt(fullSystemPrompt, chatRole);
 
         const sentMessages = [{ role: 'system', content: fullSystemPrompt }, ...history];
+
+        // 🌩️ トグルON: 資料の注入までは同じで、回答だけ外部LLMに書かせる (agentic 経路と同じ扱い)
+        if (cloudLlmEnabled && cloudLlmStatus?.enabled && confirmCloudSend()) {
+          const cloudCtx = contexts.length > 0 ? contexts : null;
+          setMessages(prev => [...prev, { role: 'assistant', content: '', thinking: '', contexts: cloudCtx }]);
+          const cloudIdx = await new Promise(resolve => { setMessages(prev => { resolve(prev.length - 1); return prev; }); });
+          // 従来モードは資料を system に直接注入している。send 以外では資料を外し、
+          // 「参考資料」マーカー付きの別メッセージにして (abstract の材料にしつつ) 伏せる
+          let cloudMessages = sentMessages;
+          if ((cloudLlmStatus.ragPolicy || 'redact') !== 'send') {
+            cloudMessages = [{ role: 'system', content: buildCloudSystemPrompt() }];
+            if (contexts.length > 0) {
+              const ctxText = contexts.map((c, i) => `[資料${i + 1}: ${c.docName}]\n${c.chunk}`).join('\n\n');
+              cloudMessages.push({ role: 'system', content: '【参考資料 (ローカルの検索結果)】\n' + ctxText });
+            }
+            cloudMessages.push(...history);
+          }
+          await runCloudAnswer({ idx: cloudIdx, requestMessages: cloudMessages, reason: 'toggle', controller });
+          return;
+        }
+
         const res = await fetchWithRetry('/v1/chat/completions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -6083,6 +6145,11 @@ function App() {
           }
         }
       }
+
+      // ─── 外部LLMへの自動エスカレーション ───
+      // ここまでの救済 (思考のみ/空応答の引き直し) でも限界の印が残っていれば、
+      // cloudLlm.autoEscalate の設定に従って外部LLMに聞き直す
+      await maybeAutoEscalate(controller);
     } catch (e) {
       if (e.name === 'AbortError') {
         // 停止ボタンで中断
@@ -6117,6 +6184,8 @@ function App() {
           return copy;
         });
         setError(e.message);
+        // ローカル推論のエラー (llama-server 停止・タイムアウト等) も外部LLMへの引き金にできる
+        try { await maybeEscalateAfterError(controller); } catch {}
       }
     } finally {
       abortRef.current = null;
@@ -7041,6 +7110,21 @@ function App() {
 
   // ─── Google Drive ───
   // 接続状態を取得。ツール提供の可否判定にも使うのでチャット画面の初期化でも呼ぶ。
+  // ─── 外部LLM の状態取得 ───
+  // トグル/ボタンの出し分けと、自動エスカレーションの判定 (autoTriggers / giveUpPatterns) に使う
+  async function loadCloudLlmStatus() {
+    try {
+      const res = await fetch('/cloud-llm/status');
+      if (!res.ok) { setCloudLlmStatus(null); return null; }
+      const st = await res.json();
+      setCloudLlmStatus(st);
+      return st;
+    } catch {
+      setCloudLlmStatus(null);
+      return null;
+    }
+  }
+
   async function loadGdriveStatus() {
     try {
       const res = await fetch('/gdrive/status');
@@ -7624,6 +7708,548 @@ function App() {
   }, []);
 
   // ─── 思考停止からの続き生成 ───
+  // ═══════════════════════════════════════════════════════════════
+  // 外部LLM (有料API) フォールバック
+  // ───────────────────────────────────────────────────────────────
+  // ローカルLLMで限界 (コンテキスト不足 / 出力打ち切り / 思考のみ / 空応答 / ループ /
+  // 「分かりません」/ 推論エラー) の時に、同じ会話を外部の大きなLLMに投げて回答をもらう。
+  // 入口は3つ:
+  //   1. 🌩️ トグルON … sendMessage の最終回答を最初から外部LLMに書かせる (ツールはローカル)
+  //   2. 「🌩️ 外部LLMに聞き直す」ボタン … 最後の回答を外部LLMの回答で置き換える
+  //   3. 自動エスカレーション (cloudLlm.autoEscalate) … 1 の後に限界を検知したら 2 を自動で行う
+  // どの経路も送信先は /cloud/v1/chat/completions (サーバーがプロバイダ差を吸収し、
+  // llama-server と同じ OpenAI 互換 SSE で返す)。API キーはブラウザに来ない。
+  // ═══════════════════════════════════════════════════════════════
+
+  function cloudLlmLabel(st) {
+    st = st || cloudLlmStatus;
+    if (!st) return '外部LLM';
+    return `${st.label || st.provider}${st.model ? ` / ${st.model}` : ''}`;
+  }
+
+  // 送信前の確認。会話の内容が手元のサーバーの外に出る操作なので、
+  // confirmBeforeSend (既定 true) ならセッション中1回だけ明示的に聞く。
+  // 設定不足の時は理由をエラー表示して false (呼び出し元はローカルに戻す)
+  function confirmCloudSend() {
+    const st = cloudLlmStatus;
+    if (!st?.enabled) {
+      setError('外部LLM は無効です。config.json の cloudLlm.enabled を true にしてください');
+      return false;
+    }
+    if (!st.configured) {
+      const missing = !st.hasApiKey ? 'API キー (cloudLlm.apiKey か環境変数)'
+        : !st.model ? 'model (cloudLlm.model)'
+        : 'baseUrl (cloudLlm.baseUrl)';
+      setError(`外部LLM (${st.label}) の設定が足りません: ${missing} が未設定です`);
+      return false;
+    }
+    if (st.confirmBeforeSend === false || cloudConfirmedRef.current) return true;
+    const policyNote = st.ragPolicy === 'abstract'
+      ? 'RAG の資料は送らず、ローカルLLMが機密を伏せて一般化した質問だけを送ります（cloudLlm.ragPolicy=abstract）。'
+      : st.ragPolicy === 'send'
+        ? '⚠️ RAG の資料（検索結果の本文）も送ります（cloudLlm.ragPolicy=send）。'
+        : 'RAG の資料（登録資料・添付ドキュメントの検索結果）は送りません（cloudLlm.ragPolicy=redact）。';
+    const ok = window.confirm(
+      `この会話の内容（質問・履歴・添付・Web検索やツールの結果）を外部サービス「${cloudLlmLabel(st)}」に送信します。\n`
+      + policyNote + '\n'
+      + '送信した内容は手元のサーバーの外に出ます。有料APIの場合は課金されます。\n\n'
+      + '続行しますか？（このセッション中は再確認しません）'
+    );
+    if (ok) cloudConfirmedRef.current = true;
+    return ok;
+  }
+
+  // 「ローカルが限界だった」の判定。msg は最終回答の assistant メッセージ。
+  // 戻り値は理由 (CLOUD_REASON_LABELS のキー) か null。
+  // autoTriggers で個別に無効化できる。giveUp は短い回答にだけ適用する
+  // (長い回答の中の「〜は分かりません」1文で丸ごと外部に投げ直さないため)
+  function detectLocalLimit(msg) {
+    if (!msg || msg.role !== 'assistant' || msg.cloudLlm) return null;
+    const st = cloudLlmStatus;
+    const t = st?.autoTriggers || {};
+    if (msg.ctxExhausted && t.ctxExhausted !== false) return 'ctxExhausted';
+    if (msg.loopDetected && t.loopDetected !== false) return 'loopDetected';
+    if (msg.thinkingOnly && (msg.rescueFailed || msg.lengthCapped) && t.thinkingOnly !== false) return 'thinkingOnly';
+    if (msg.lengthCapped && t.lengthCapped !== false) return 'lengthCapped';
+    const content = (msg.content || '').trim();
+    if (!content && t.emptyResponse !== false) return 'emptyResponse';
+    if (t.giveUp !== false && content && content.length <= (st?.giveUpMaxChars || 400)) {
+      const pats = Array.isArray(st?.giveUpPatterns) ? st.giveUpPatterns : [];
+      for (const p of pats) {
+        try { if (new RegExp(p, 'i').test(content)) return 'giveUp'; } catch {}
+      }
+    }
+    return null;
+  }
+
+  // ─── RAG (機密資料) を外部に出さないための道具 ───
+  // 判定規則はサーバー (cloud_llm.js normalizeMessages) と同じ。サーバー側でも必ず掛かるが、
+  // ブラウザ側でも伏せておくと「何件伏せたか」をバッジに出せ、abstract モードの材料も取れる
+  function cloudPrivateTools() {
+    const t = cloudLlmStatus?.privateTools;
+    return Array.isArray(t) ? t : ['search_documents', 'search_persistent_documents'];
+  }
+  function cloudPrivateMarkers() {
+    const m = cloudLlmStatus?.privateMarkers;
+    return Array.isArray(m) && m.length ? m : ['【前のターンで実際に読んだ資料】', '【参考資料'];
+  }
+  function isCloudPrivateText(text) {
+    const t = String(typeof text === 'string' ? text : (Array.isArray(text) ? text.filter(p => p?.type === 'text').map(p => p.text).join('\n') : '')).trimStart();
+    return cloudPrivateMarkers().some(mk => t.startsWith(mk));
+  }
+  // messages から「資料由来の内容」を伏せたコピーと、伏せた本文 (abstract の材料) を返す
+  function redactPrivateForCloud(messages) {
+    const privateTools = cloudPrivateTools();
+    const callNames = new Map();
+    for (const m of messages) {
+      if (m?.role === 'assistant' && Array.isArray(m.tool_calls)) {
+        for (const tc of m.tool_calls) if (tc?.id) callNames.set(tc.id, tc.function?.name || '');
+      }
+    }
+    const out = [];
+    const privateTexts = [];
+    for (const m of messages) {
+      if (!m) continue;
+      if (m.role === 'tool') {
+        const fn = m.name || callNames.get(m.tool_call_id) || '';
+        if (privateTools.includes(fn) || isCloudPrivateText(m.content)) {
+          privateTexts.push(String(m.content || ''));
+          out.push({ ...m, content: '[資料の検索結果は機密のため外部には送っていません]' });
+          continue;
+        }
+      } else if ((m.role === 'system' || m.role === 'user') && isCloudPrivateText(m.content)) {
+        privateTexts.push(String(m.content || ''));
+        continue;
+      }
+      out.push(m);
+    }
+    return { messages: out, privateTexts, redacted: privateTexts.length };
+  }
+
+  // 外部LLM向けの最小限のシステムプロンプト。ツール案内や添付ドキュメント名 (sp.documents の
+  // docList) は外部には不要で、ファイル名自体が機密になり得るので載せない
+  function buildCloudSystemPrompt() {
+    const now = new Date();
+    const dateStr = now.toLocaleDateString('ja-JP', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'long' });
+    const sp = appConfig.systemPrompts || {};
+    const fillTemplate = (str, vars) => (str || '').replace(/\{(\w+)\}/g, (_, k) => vars[k] != null ? vars[k] : '');
+    let systemPrompt = fillTemplate(sp.base || '', { date: dateStr });
+    if (sp.math) systemPrompt += '\n\n' + sp.math;
+    systemPrompt += '\n\n## この応答での制約\n'
+      + '- この応答ではツールを呼び出せません。検索クエリやツール名だけを書かず、必ずユーザーへの回答本文を書いてください。\n'
+      + '- 会話中の「ツール実行結果」は、すでに手元で実行した結果です。追加の検索はできないので、その結果と自分の知識で答えてください。';
+    return applyRolePrompt(systemPrompt, chatRole);
+  }
+
+  // ローカルLLMへの短い非ストリーム呼び出し (abstract モードの一般化質問づくり用)。
+  // 思考型モデルが思考だけで予算を食い潰さないよう enable_thinking=false にする
+  async function localCompletion(messages, { maxTokens = 512, temperature = 0.2, signal } = {}) {
+    const res = await fetchWithRetry('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: chatModel,
+        messages,
+        stream: false,
+        temperature,
+        max_tokens: maxTokens,
+        cache_prompt: true,
+        chat_template_kwargs: { enable_thinking: false },
+      }),
+      signal,
+    });
+    if (!res.ok) throw new Error(`ローカルLLM API Error: ${res.status}`);
+    const data = await res.json();
+    return String(data.choices?.[0]?.message?.content || '')
+      .replace(/<think>[\s\S]*?(<\/think>|$)/gi, '').trim();
+  }
+
+  // 履歴から外部LLM向けの messages を組み立てる (continueGeneration の履歴構築と同じ規則:
+  // コンパクション済みなら最後のマーカー以前は要約に置き換え、画像は content 配列で渡す)。
+  // failed = 置き換える対象のローカル回答。検索で得た資料 (contexts / ragSources) は
+  // 履歴に残らないので、ここで「参考資料」として直前に差し込む。
+  // ツール結果そのもの (Python の出力等) は取れないため、外部LLMは資料と自分の知識で答える
+  function buildCloudRequestMessages(upTo, failed) {
+    const systemPrompt = buildCloudSystemPrompt();
+
+    let markerIdx = -1;
+    for (let i = upTo.length - 1; i >= 0; i--) {
+      if (upTo[i].role === 'compaction') { markerIdx = i; break; }
+    }
+    const summary = markerIdx >= 0
+      ? [{ role: 'system', content: `【これまでの会話の要約】\n以下はコンテキスト節約のため要約された、それ以前の会話の内容です。\n\n${upTo[markerIdx].content}` }]
+      : [];
+    const history = summary.concat(upTo.slice(markerIdx + 1)
+      .filter(m => m.role === 'user' || m.role === 'assistant')
+      .map(m => {
+        const hasImages = m.images && m.images.length > 0;
+        const contentText = expandInlineTextFiles(m, m.content);
+        if (!hasImages) return { role: m.role, content: contentText };
+        const content = [];
+        if (contentText) content.push({ type: 'text', text: contentText });
+        for (const img of m.images) {
+          const dataUrl = img.base64.startsWith('data:') ? img.base64 : `data:image/png;base64,${img.base64}`;
+          content.push({ type: 'image_url', image_url: { url: dataUrl } });
+        }
+        return { role: m.role, content };
+      }));
+
+    // ローカル検索で得た資料を「参考資料」として最後の質問の直前に差し込む。
+    // ragPolicy=redact では最初から入れない (abstract では一般化の材料として入れ、送信前に伏せる。
+    // send では外部にもそのまま渡る)
+    const refs = [];
+    const ragPolicy = cloudLlmStatus?.ragPolicy || 'redact';
+    const seen = new Set();
+    if (ragPolicy !== 'redact') for (const c of (failed?.contexts || [])) {
+      const key = `${c.docName}|${(c.chunk || '').slice(0, 80)}`;
+      if (seen.has(key) || !c.chunk) continue;
+      seen.add(key);
+      refs.push(`[資料: ${c.docName}]\n${c.chunk}`);
+    }
+    if (ragPolicy !== 'redact') for (const src of (failed?.ragSources || [])) {
+      const key = `${src.filename}|${src.pageText}`;
+      if (seen.has(key) || !src.text) continue;
+      seen.add(key);
+      refs.push(`[資料: ${src.label || src.filename}${src.pageText ? ` p.${src.pageText}` : ''}]\n${src.text}`);
+    }
+    if (refs.length > 0) {
+      let refText = refs.join('\n\n');
+      if (refText.length > 40000) refText = refText.slice(0, 40000) + '\n…(省略)';
+      const note = {
+        role: 'system',
+        content: '【参考資料 (ローカルの検索結果)】\n以下はユーザーの資料からローカル検索で得た抜粋です。回答に使う場合は資料名を添えてください。\n\n' + refText,
+      };
+      let lastUser = history.length - 1;
+      while (lastUser >= 0 && history[lastUser].role !== 'user') lastUser--;
+      history.splice(Math.max(0, lastUser), 0, note);
+    }
+
+    const msgs = [{ role: 'system', content: systemPrompt }, ...history];
+    // 履歴が assistant で終わっている (置き換え対象より後にメッセージが無いのが普通だが念のため)
+    if (msgs[msgs.length - 1].role !== 'user') {
+      msgs.push({ role: 'user', content: '先ほどの質問への回答をお願いします。' });
+    }
+    return msgs;
+  }
+
+  // 外部LLMの SSE (サーバーが OpenAI 互換に揃えて返す) を messages[idx] に流し込む。
+  // streamResponse は llama.cpp 向けの救済 (コンテキスト判定・思考の昇格) を含み、
+  // 外部モデルには当てはまらないので、ここは素直に content / reasoning だけ拾う
+  async function streamCloudInto(res, idx, { keepStatus = false } = {}) {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let content = '';
+    let thinking = '';
+    let buffer = '';
+    let usage = null;
+    let finish = null;
+    const flush = () => setMessages(prev => {
+      const cur = prev[idx];
+      if (!cur) return prev;
+      const copy = [...prev];
+      // <think> タグ形式の思考 (ローカルモデルの突き合わせ段階で出る) は思考欄へ
+      let c = content, t = thinking;
+      const tm = c.match(/^\s*<think>([\s\S]*?)(<\/think>)?([\s\S]*)$/);
+      if (tm) { t = (t ? t + '\n' : '') + tm[1].trim(); c = tm[2] ? tm[3].replace(/^\s+/, '') : ''; }
+      copy[idx] = { ...cur, content: c, thinking: t, agentStatus: keepStatus ? cur.agentStatus : null };
+      return copy;
+    });
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split('\n\n');
+      buffer = events.pop() || '';
+      for (const event of events) {
+        const dataLines = event.split('\n').filter(l => l.startsWith('data: ')).map(l => l.slice(6));
+        if (dataLines.length === 0) continue;
+        const dataStr = dataLines.join('\n');
+        if (dataStr === '[DONE]') continue;
+        let json;
+        try { json = JSON.parse(dataStr); } catch { continue; }
+        // サーバーはプロバイダのエラーを data 内の error で知らせる (ヘッダ送信後なので)
+        if (json.error) throw new Error(json.error.message || String(json.error));
+        const delta = json.choices?.[0]?.delta || {};
+        if (delta.reasoning_content) thinking += delta.reasoning_content;
+        if (delta.content) content += delta.content;
+        if (json.choices?.[0]?.finish_reason) finish = json.choices[0].finish_reason;
+        if (json.usage) usage = { promptTokens: json.usage.prompt_tokens || 0, completionTokens: json.usage.completion_tokens || 0 };
+        flush();
+      }
+    }
+    flush();
+    return { content, thinking, usage, lengthCapped: finish === 'length' };
+  }
+
+  // 外部LLMに問い合わせて messages[idx] を回答で置き換える (共通本体)。
+  // localAttempt = 置き換える前のローカル回答 (バッジから見られるよう残す)。
+  // genMedia = ローカルのツールが生成した画像/音声 (外部LLMがマーカーを書かなくても末尾に補う)
+  async function runCloudAnswer({ idx, requestMessages, reason, localAttempt, localThinking, controller, genMedia }) {
+    const st = cloudLlmStatus || {};
+    const ragPolicy = st.ragPolicy || 'redact';
+    // RAG の資料を伏せる (send 以外)。伏せた本文は abstract の材料にだけ使い、外部には出さない
+    const redaction = ragPolicy === 'send'
+      ? { messages: requestMessages, privateTexts: [], redacted: 0 }
+      : redactPrivateForCloud(requestMessages);
+    const meta = {
+      provider: st.provider, label: st.label || st.provider, model: st.model,
+      reason, localAttempt: localAttempt || '', localThinking: localThinking || '',
+      ragPolicy, redacted: redaction.redacted,
+      pending: true,
+    };
+    setMessages(prev => {
+      const cur = prev[idx];
+      if (!cur) return prev;
+      const copy = [...prev];
+      copy[idx] = {
+        ...cur,
+        content: '', thinking: '',
+        agentStatus: `🌩️ 外部LLM (${cloudLlmLabel(st)}) に問い合わせ中...`,
+        cloudLlm: meta,
+        // ローカルの終了状態は置き換え後の表示・判定を汚すのでクリア
+        ctxExhausted: false, ctxErrorDetail: '', lengthCapped: false, loopDetected: false,
+        thinkingOnly: false, rescueFailed: false, tokenInfo: null,
+      };
+      return copy;
+    });
+    console.log(`[外部LLM] ${cloudLlmLabel(st)} へ問い合わせ (理由: ${reason}, ragPolicy=${ragPolicy}, messages=${requestMessages.length}件, 伏せた資料=${redaction.redacted}件)`);
+
+    const setStatus = (text) => setMessages(prev => {
+      const cur = prev[idx];
+      if (!cur) return prev;
+      const copy = [...prev];
+      copy[idx] = { ...cur, agentStatus: text };
+      return copy;
+    });
+    const postCloud = async (messagesToSend, { keepStatus = false } = {}) => {
+      const res = await fetch('/cloud/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: messagesToSend,
+          stream: true,
+          max_tokens: appConfig.chatMaxTokens || 8192,
+        }),
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        let msg = `API Error: ${res.status}`;
+        try { const j = await res.json(); if (j?.error) msg = j.error; } catch {}
+        throw new Error(msg);
+      }
+      return streamCloudInto(res, idx, { keepStatus });
+    };
+
+    let out;
+    try {
+      if (ragPolicy === 'abstract') {
+        // ─── abstract: 資料は送らず、ローカルLLMが機密を伏せた「一般化した質問」を作って送る ───
+        // 1) ローカルで一般化  2) 外部に一般化質問だけを送る  3) ローカルで資料と突き合わせて最終回答
+        const lastUser = [...requestMessages].reverse().find(m => m.role === 'user' && !isCloudPrivateText(m.content));
+        const question = typeof lastUser?.content === 'string' ? lastUser.content
+          : (lastUser?.content || []).filter(p => p?.type === 'text').map(p => p.text).join('\n');
+        let context = redaction.privateTexts.join('\n\n');
+        if (context.length > 40000) context = context.slice(0, 40000) + '\n…(省略)';
+        const fill = (tpl, vars) => String(tpl || '').replace(/\{(\w+)\}/g, (_, k) => vars[k] != null ? vars[k] : '');
+
+        setStatus('🔒 機密情報を伏せた一般化質問をローカルLLMで作成中...');
+        const generalQuestion = await localCompletion([
+          { role: 'user', content: fill(st.abstractPrompt, { question, context: context || '(資料なし)' }) },
+        ], { maxTokens: 768, signal: controller.signal });
+        if (!generalQuestion) throw new Error('一般化した質問を作れなかったため、外部には何も送っていません');
+        meta.sentQuestion = generalQuestion;
+        console.log(`[外部LLM] 一般化した質問: ${generalQuestion}`);
+
+        setStatus(`🌩️ 外部LLM (${cloudLlmLabel(st)}) に一般化した質問で問い合わせ中...`);
+        const general = await postCloud([
+          { role: 'system', content: buildCloudSystemPrompt() },
+          { role: 'user', content: generalQuestion },
+        ], { keepStatus: true });
+        meta.generalAnswer = general.content;
+        out = general;
+
+        if (st.abstractCompose !== false && context) {
+          // 外部の一般的な回答と手元の資料をローカルで突き合わせる。外部には何も追加送信しない
+          setStatus('🔒 外部LLMの回答と手元の資料をローカルLLMで突き合わせ中...');
+          const sp = appConfig.systemPrompts || {};
+          let composeSystem = buildCloudSystemPrompt();
+          if (sp.rag) composeSystem += '\n\n' + sp.rag;
+          const composeUser = fill(st.composePrompt, { question, context, generalQuestion, generalAnswer: general.content });
+          const res = await fetchWithRetry('/v1/chat/completions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: chatModel,
+              messages: [{ role: 'system', content: composeSystem }, { role: 'user', content: composeUser }],
+              stream: true,
+              stream_options: { include_usage: true },
+              temperature: appConfig.temperature,
+              top_k: appConfig.topK,
+              top_p: appConfig.topP,
+              max_tokens: appConfig.agentContext?.largePredict || appConfig.chatMaxTokens || 8192,
+              cache_prompt: true,
+            }),
+            signal: controller.signal,
+          });
+          if (!res.ok) throw new Error(`ローカルLLM API Error: ${res.status}`);
+          const composed = await streamCloudInto(res, idx, { keepStatus: true });
+          if (composed.content.trim()) {
+            out = { ...general, content: composed.content, thinking: composed.thinking, lengthCapped: composed.lengthCapped };
+            meta.composed = true;
+          } else {
+            // 突き合わせが空 (思考のみ等) なら外部の一般的な回答をそのまま見せる
+            console.warn('[外部LLM] ローカルの突き合わせが空 → 外部の一般的な回答をそのまま表示');
+            setMessages(prev => {
+              const cur = prev[idx];
+              if (!cur) return prev;
+              const copy = [...prev];
+              copy[idx] = { ...cur, content: general.content, thinking: general.thinking };
+              return copy;
+            });
+          }
+        }
+      } else {
+        out = await postCloud(redaction.messages);
+      }
+    } catch (e) {
+      // 失敗・中断でも「問い合わせ中」のまま残さない (バッジと聞き直しボタンの出し分けに効く)。
+      // 本文の扱い (ローカル回答に戻す / エラー追記) は呼び出し元が決める
+      setMessages(prev => {
+        const cur = prev[idx];
+        if (!cur) return prev;
+        const copy = [...prev];
+        copy[idx] = {
+          ...cur,
+          agentStatus: null,
+          cloudLlm: { ...meta, pending: false, ...(e.name === 'AbortError' ? {} : { error: e.message }) },
+        };
+        return copy;
+      });
+      throw e;
+    }
+
+    // ツールが生成した画像/音声のマーカーを補完 (streamResponse の fixGenMarkers の簡易版)
+    let finalContent = out.content;
+    for (const a of (genMedia?.audios || [])) {
+      if (!finalContent.includes(a.url)) finalContent += `\n\n[[gen_audio:${a.url}|${encodeURIComponent(a.text || '')}]]`;
+    }
+    for (const im of (genMedia?.images || [])) {
+      if (!finalContent.includes(im.url)) finalContent += `\n\n[[gen_image:${im.url}|${encodeURIComponent(im.prompt || '')}]]`;
+    }
+    setMessages(prev => {
+      const cur = prev[idx];
+      if (!cur) return prev;
+      const copy = [...prev];
+      copy[idx] = {
+        ...cur,
+        content: finalContent,
+        cloudLlm: { ...meta, pending: false, usage: out.usage, lengthCapped: out.lengthCapped },
+        agentStatus: out.lengthCapped
+          ? (meta.composed
+            ? '✂️ ローカルLLM の最大出力トークンに達したため途中で終了しました。'
+            : '✂️ 外部LLM の最大出力トークン (config の cloudLlm.maxTokens) に達したため途中で終了しました。')
+          : null,
+      };
+      return copy;
+    });
+    messagesDirtyRef.current = true;
+    loadCloudLlmStatus();   // 利用回数の表示を更新
+    return out;
+  }
+
+  // 「外部LLMに聞き直す」: messages[idx] (最後の assistant) を外部LLMの回答で置き換える。
+  // opts.controller が渡された時は sendMessage の途中 (自動エスカレーション) からの呼び出しで、
+  // isLoading / abortRef は呼び出し元が管理する
+  async function escalateToCloud(idx, reason, opts = {}) {
+    const own = !opts.controller;
+    if (own && isLoading) return;
+    if (!confirmCloudSend()) return false;
+    const snapshot = await new Promise(resolve => { setMessages(prev => { resolve(prev); return prev; }); });
+    const target = snapshot[idx];
+    if (!target || target.role !== 'assistant') return false;
+    const controller = opts.controller || new AbortController();
+    if (own) {
+      setIsLoading(true);
+      abortRef.current = controller;
+      setError('');
+    }
+    try {
+      const requestMessages = buildCloudRequestMessages(snapshot.slice(0, idx), target);
+      await runCloudAnswer({
+        idx, requestMessages, reason,
+        localAttempt: target.content || '', localThinking: target.thinking || '',
+        controller,
+      });
+      return true;
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        setMessages(prev => {
+          const cur = prev[idx];
+          if (!cur) return prev;
+          const copy = [...prev];
+          copy[idx] = { ...cur, agentStatus: null, cloudLlm: cur.cloudLlm ? { ...cur.cloudLlm, pending: false } : undefined };
+          return copy;
+        });
+      } else {
+        // 失敗したらローカルの回答を戻し、失敗理由をバッジに残す
+        console.warn(`[外部LLM] 失敗: ${e.message}`);
+        setMessages(prev => {
+          const cur = prev[idx];
+          if (!cur) return prev;
+          const copy = [...prev];
+          copy[idx] = {
+            ...cur,
+            content: target.content || '',
+            thinking: target.thinking || '',
+            agentStatus: null,
+            cloudLlm: { ...(cur.cloudLlm || {}), pending: false, error: e.message },
+          };
+          return copy;
+        });
+        setError(`外部LLM: ${e.message}`);
+      }
+      return false;
+    } finally {
+      if (own) {
+        abortRef.current = null;
+        setIsLoading(false);
+      }
+    }
+  }
+
+  // sendMessage の最後に呼ぶ自動エスカレーション。
+  // cloudLlm.autoEscalate が true で、最後の回答にローカルの限界の印があれば外部LLMに聞き直す
+  async function maybeAutoEscalate(controller) {
+    const st = cloudLlmStatus;
+    if (!st?.enabled || !st.configured || !st.autoEscalate) return;
+    if (cloudLlmEnabled) return;   // 既に外部LLMで回答している
+    const snapshot = await new Promise(resolve => { setMessages(prev => { resolve(prev); return prev; }); });
+    const idx = snapshot.length - 1;
+    const reason = detectLocalLimit(snapshot[idx]);
+    if (!reason) return;
+    console.warn(`[外部LLM] ローカルの限界を検知 (${reason}) → 自動で外部LLMに聞き直します`);
+    await escalateToCloud(idx, reason, { controller });
+  }
+
+  // ローカル推論がエラーで落ちた時 (llama-server 停止・タイムアウト等) の自動エスカレーション。
+  // assistant の受け皿がまだ無ければ作ってから聞き直す
+  async function maybeEscalateAfterError(controller) {
+    const st = cloudLlmStatus;
+    if (!st?.enabled || !st.configured || !st.autoEscalate || st.autoTriggers?.error === false) return;
+    if (cloudLlmEnabled) return;
+    const snapshot = await new Promise(resolve => { setMessages(prev => { resolve(prev); return prev; }); });
+    let idx = snapshot.length - 1;
+    if (idx < 0) return;
+    if (snapshot[idx].cloudLlm) return;   // 外部LLM自体のエラー。二重に投げない
+    if (snapshot[idx].role !== 'assistant') {
+      if (snapshot[idx].role !== 'user') return;
+      setMessages(prev => [...prev, { role: 'assistant', content: '', thinking: '' }]);
+      idx += 1;
+    }
+    console.warn('[外部LLM] ローカル推論のエラー → 自動で外部LLMに聞き直します');
+    await escalateToCloud(idx, 'error', { controller });
+  }
+
   async function continueGeneration(idx) {
     const target = messages[idx];
     if (!target || target.role !== 'assistant') return;
@@ -7807,6 +8433,7 @@ function App() {
             persistentRag: persistentRagEnabled,          // 旧形式 (後方互換のため残す)
             persistentRagCategory,                        // 新形式: 'off'/'all'/''/カテゴリ名
             gdrive: gdriveEnabled,
+            cloudLlm: cloudLlmEnabled,
           },
         }),
       });
@@ -7837,6 +8464,7 @@ function App() {
       else if (tg.persistentRag !== undefined) setPersistentRagCategory(tg.persistentRag ? 'all' : 'off');
       else setPersistentRagCategory(appConfig.ragEnabledByDefault === true ? 'all' : 'off');
       setGdriveEnabled(tg.gdrive !== undefined ? !!tg.gdrive : true);
+      setCloudLlmEnabled(!!tg.cloudLlm);   // 課金が絡むので保存が無ければ OFF
       messagesDirtyRef.current = false;  // ロードしただけでは dirty にしない
     } finally {
       setChatLoading(false);
@@ -7850,6 +8478,7 @@ function App() {
     setChatTitle('');
     setChatRole('');
     setShowRoleEditor(false);
+    setCloudLlmEnabled(false);   // 外部LLM (課金) は新規チャットでは常に OFF から
     setMessages([]);
     setDocuments([]);
     setChatTextFiles([]);  // 送信前のインライン添付も破棄
@@ -7914,6 +8543,8 @@ function App() {
     loadFileList();
     // Google Drive の接続状態 (ツール提供の可否判定に使う)
     loadGdriveStatus();
+    // 外部LLM (有料API) の設定状態
+    loadCloudLlmStatus();
     // 外部APIサーバー情報を取得 → embedding 可否を永続RAG判定に渡す (fetch重複回避)
     loadExternalServers().then(({ embeddingAvailable }) => {
       loadPersistentRagInfo(embeddingAvailable);
@@ -8150,7 +8781,7 @@ function App() {
       messagesDirtyRef.current = false;  // 保存したらクリア
     }, 1500);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-  }, [messages, documents, isLoading, webSearchEnabled, persistentRagCategory, gdriveEnabled]);
+  }, [messages, documents, isLoading, webSearchEnabled, persistentRagCategory, gdriveEnabled, cloudLlmEnabled]);
 
   // ─── エラー自動消去 ───
   useEffect(() => {
@@ -8805,6 +9436,51 @@ function App() {
                     );
                   })()}
                   {msg.orchestra && <OrchestraPanel orch={msg.orchestra} />}
+                  {/* 外部LLM (有料API) の回答であることを明示する。どこに何を送ったかが
+                      分からないと「手元に残す」原則の例外を使った自覚が持てないため */}
+                  {msg.cloudLlm && (
+                    <div className={`cloud-llm-badge ${msg.cloudLlm.error ? 'error' : ''} ${msg.cloudLlm.pending ? 'pending' : ''}`}>
+                      <div className="cloud-llm-badge-main">
+                        🌩️ {msg.cloudLlm.error ? '外部LLMへの問い合わせに失敗 (ローカルの回答を表示中)'
+                          : msg.cloudLlm.pending ? '外部LLMに問い合わせ中'
+                          : '外部LLMの回答'}
+                        {' '}<span className="cloud-llm-badge-model">{msg.cloudLlm.label}{msg.cloudLlm.model ? ` / ${msg.cloudLlm.model}` : ''}</span>
+                      </div>
+                      <div className="cloud-llm-badge-sub">
+                        理由: {CLOUD_REASON_LABELS[msg.cloudLlm.reason] || msg.cloudLlm.reason}
+                        {msg.cloudLlm.usage ? ` · 入力 ${(msg.cloudLlm.usage.promptTokens || 0).toLocaleString()} / 出力 ${(msg.cloudLlm.usage.completionTokens || 0).toLocaleString()} トークン` : ''}
+                        {msg.cloudLlm.error ? ` · ⚠️ ${msg.cloudLlm.error}` : ''}
+                      </div>
+                      {/* RAG (機密資料) をどう扱ったか。「何を外に出したか」が見えないと安心して使えない */}
+                      {msg.cloudLlm.ragPolicy && (
+                        <div className="cloud-llm-badge-sub">
+                          {msg.cloudLlm.ragPolicy === 'abstract'
+                            ? `🔒 資料は送らず、ローカルで一般化した質問だけを送信${msg.cloudLlm.composed ? '（回答は資料とローカルで突き合わせ済み）' : ''}`
+                            : msg.cloudLlm.ragPolicy === 'send'
+                              ? '⚠️ 資料の検索結果も送信（ragPolicy=send）'
+                              : `🔒 資料の検索結果は送信していません${msg.cloudLlm.redacted ? `（${msg.cloudLlm.redacted}件を伏せた）` : ''}`}
+                        </div>
+                      )}
+                      {msg.cloudLlm.sentQuestion && (
+                        <details className="cloud-llm-local">
+                          <summary>外部に送った一般化した質問</summary>
+                          <div className="cloud-llm-local-body">{msg.cloudLlm.sentQuestion}</div>
+                        </details>
+                      )}
+                      {msg.cloudLlm.generalAnswer && msg.cloudLlm.composed && (
+                        <details className="cloud-llm-local">
+                          <summary>外部LLMの一般的な回答（突き合わせ前）</summary>
+                          <div className="cloud-llm-local-body">{msg.cloudLlm.generalAnswer}</div>
+                        </details>
+                      )}
+                      {msg.cloudLlm.localAttempt && !msg.cloudLlm.error && !msg.cloudLlm.pending && (
+                        <details className="cloud-llm-local">
+                          <summary>置き換える前のローカルLLMの回答</summary>
+                          <div className="cloud-llm-local-body">{msg.cloudLlm.localAttempt}</div>
+                        </details>
+                      )}
+                    </div>
+                  )}
                   {msg.role === 'assistant' ? (
                     <div className="msg-bubble">
                       <MarkdownContent
@@ -8868,6 +9544,16 @@ function App() {
                             🔄 続きを生成
                           </button>
                         )}
+                        {i === messages.length - 1 && cloudLlmStatus?.enabled && (
+                          <button
+                            className="ctx-error-btn ctx-error-btn-ghost"
+                            onClick={() => escalateToCloud(i, 'ctxExhausted')}
+                            disabled={isLoading}
+                            title={`この質問を外部LLM (${cloudLlmLabel()}) に聞き直します。会話の内容が外部に送信されます`}
+                          >
+                            🌩️ 外部LLMで回答
+                          </button>
+                        )}
                       </div>
                     </div>
                   )}
@@ -8902,6 +9588,17 @@ function App() {
                           {msg.loopDetected ? '⚠️ 思考ループを中断・回答を要求'
                             : msg.lengthCapped ? '✂️ 途中で終了 — 続きを生成'
                             : '🔄 続きを生成'}
+                        </button>
+                      )}
+                      {/* 外部LLM (有料API) に聞き直す。最後の回答にだけ出す (履歴の途中を
+                          置き換えると以降の文脈が変わるため)。ローカルの限界の印がある時は強調 */}
+                      {i === messages.length - 1 && cloudLlmStatus?.enabled && !msg.cloudLlm?.pending && (
+                        <button
+                          className={`msg-action-btn cloud-btn ${detectLocalLimit(msg) ? 'suggest' : ''}`}
+                          title={`この質問を外部LLM (${cloudLlmLabel()}) に聞き直します。会話の内容が外部に送信されます`}
+                          onClick={() => escalateToCloud(i, 'manual')}
+                        >
+                          🌩️ {msg.cloudLlm ? '外部LLMにもう一度聞く' : '外部LLMに聞き直す'}
                         </button>
                       )}
                     </div>
@@ -9150,6 +9847,27 @@ function App() {
                     }}
                   >
                     ☁️
+                  </button>
+                )}
+                {/* 外部LLM (有料API): 設定で有効な時だけ出す。ON の間は最終回答を外部LLMが書く
+                    (ツール判断・検索・Python はローカルのまま)。未設定ならクリックで理由を表示 */}
+                {appConfig.cloudLlm?.enabled && (
+                  <button
+                    className={`toolbar-btn cloud-llm-toggle ${cloudLlmEnabled ? 'active' : ''}`}
+                    title={
+                      !cloudLlmStatus?.configured
+                        ? `外部LLM (${appConfig.cloudLlm.label || appConfig.cloudLlm.provider}): 未設定（config.json の cloudLlm に API キーと model を設定）`
+                        : cloudLlmEnabled
+                          ? `外部LLM (${cloudLlmLabel()}): ON — ツール実行はローカル、最終回答は外部LLM（クリックでOFF）`
+                          : `外部LLM (${cloudLlmLabel()}): OFF — ローカルが限界の時だけボタン/自動で使う（クリックでON）`
+                    }
+                    onClick={() => {
+                      if (!cloudLlmStatus?.configured) { confirmCloudSend(); return; }
+                      setCloudLlmEnabled(v => !v);
+                      messagesDirtyRef.current = true;
+                    }}
+                  >
+                    🌩️
                   </button>
                 )}
               </div>

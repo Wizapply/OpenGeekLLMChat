@@ -27,7 +27,7 @@ OpenGeekLLMChatは、**クラウドに依存しないローカルLLM環境を自
 - クライアント: `public/index.html` + `public/styles.css`（React/Babel CDN、ビルドツール不要）
 - LLM推論: llama.cppの `llama-server` バイナリを子プロセスとして起動・管理
 
-データは全て手元に残ります。**クラウドAPIへの送信は一切ありません。**
+データは全て手元に残ります。**既定ではクラウドAPIへの送信は一切ありません。**（例外は、管理者が `cloudLlm.enabled` を明示的に true にして使う [🌩️ 外部LLMフォールバック](#️-外部llmフォールバックローカルが限界の時だけ有料apiに聞き直す) だけです。OFF の間は外部への送信は起きません）
 
 ---
 
@@ -66,6 +66,36 @@ LLMが直接サーバーのファイルシステムに `.py` / `.xml` / `.json` 
 - **図入りの資料を永続RAGに入れたい場合**は、`/rag.html` の OCR タブの「☁️ Google Drive から取り込み」を使うと、Google ドキュメント/スライド等を **PDF に変換して Vision LLM で OCR** します（テキスト export と違い図・表・レイアウトが残る。詳細は [📄 PDF OCR](#-pdf-ocrvision-llm--markdown--rag自動登録) の節）
 
 → セットアップ手順は [☁️ Google Drive 連携のセットアップ](#️-google-drive-連携のセットアップ) を参照
+
+### 🌩️ 外部LLMフォールバック（ローカルが限界の時だけ有料APIに聞き直す）
+
+ローカルLLMで**限界に達した時だけ**、同じ会話を外部の大きなLLM（OpenAI / Anthropic / Gemini / OpenRouter / Groq / DeepSeek / Mistral / xAI / 任意の OpenAI 互換API）に投げて回答をもらう機能です。追加の npm パッケージは不要（Node標準の `https` だけで各社APIを叩く `cloud_llm.js`）。**既定は無効**で、`config.json` の `cloudLlm.enabled` を true にしない限り外部への送信は一切起きません。
+
+| 入口 | 動き |
+|---|---|
+| チャット欄の **🌩️ トグル** | ON の間は「ツール判断・Web検索・Python・RAG検索はローカル、**最終回答だけ外部LLM**」。検索結果やツールの出力を含む会話を送るので、外部LLMは手元の資料を踏まえて答えられる |
+| 回答の **「🌩️ 外部LLMに聞き直す」ボタン** | 最後の回答を外部LLMの回答で置き換える。ローカルの回答はバッジから見返せる |
+| **自動エスカレーション**（`cloudLlm.autoEscalate: true`） | ローカルの回答に「限界の印」があれば自動で聞き直す。何を限界とみなすかは `autoTriggers` で選べる |
+
+「限界」として検知するもの（`autoTriggers`）：
+
+- `ctxExhausted` … コンテキスト不足で途中終了（📦 圧縮でも足りない大きな資料など）
+- `lengthCapped` … `max_tokens` で出力が打ち切られた
+- `thinkingOnly` … 思考型モデルが思考だけで終わり、思考なしの引き直しでも回答に到達しなかった
+- `emptyResponse` / `loopDetected` … 空応答、暴走ループ
+- `giveUp` … 「分かりません」「回答できません」等で終わった短い回答（`giveUpPatterns` / `giveUpMaxChars` で調整）
+- `error` … ローカル推論のエラー（llama-server 停止・タイムアウト等）
+
+**安全側に倒した設計**
+
+- API キーは `config.json`（`/config` には出ない）か環境変数（`OPENAI_API_KEY` 等）から**サーバーだけが読み**、ブラウザには一切返しません。ブラウザは `/cloud/v1/chat/completions` を叩き、サーバーがプロバイダ差を吸収して llama-server と同じ OpenAI 互換 SSE で返します
+- **送信前に確認ダイアログ**（`confirmBeforeSend`、セッション中1回）。外部LLMの回答には 🌩️ バッジで「どこに・なぜ送ったか・入出力トークン数」を表示
+- `maxRequestsPerDay`（1日の回数上限）と `maxInputChars`（送信量の上限。超えたら古いツール結果から切り詰め）で**うっかり高額課金を防止**。利用回数とトークン数は `cloud_llm_usage.json` に日別で記録し、`/cloud-llm/status` で確認できます
+- **RAG（登録資料・添付ドキュメント）は機密として扱い、既定では外部に送りません**（`ragPolicy: "redact"`）。`"abstract"` にすると、ローカルLLMが機密を伏せた「一般化した質問」だけを外部に送り、返ってきた一般的な回答と手元の資料の突き合わせはローカルLLMが行います。詳細は [RAG（機密資料）を外部に出さない](#rag機密資料を外部に出さない)
+- `sendImages: false` で画像を落とす、`sendSystemPrompt: false` でシステムプロンプトを送らない、といった送信内容の絞り込みも可能
+- 🌩️ トグルは**新規チャットでは常に OFF** から始まります（チャットごとに保存はされます）
+
+→ セットアップ手順は [🌩️ 外部LLMフォールバックのセットアップ](#️-外部llmフォールバックのセットアップ) を参照
 
 ### 📄 PDF OCR（Vision LLM → Markdown → RAG自動登録）
 
@@ -1316,7 +1346,7 @@ opengeek-llm-chat/
 
 ### カテゴリ構成とコメントキー（`"// ..."`）
 
-同梱の `config.json` は、キーを以下の15カテゴリ順に並べています（見出し等の余計なキーは含みません。並び順は動作に影響しないため、自由に入れ替えてかまいません）：
+同梱の `config.json` は、キーを以下の16カテゴリ順に並べています（見出し等の余計なキーは含みません。並び順は動作に影響しないため、自由に入れ替えてかまいません）：
 
 | # | カテゴリ | 主なキー |
 |:--|:--|:--|
@@ -1335,6 +1365,7 @@ opengeek-llm-chat/
 | 13 | ファインチューニング | `tuning` |
 | 14 | オーケストレーション | `orchestration` |
 | 15 | Google Drive 連携 | `googleDrive` |
+| 16 | 外部LLMフォールバック | `cloudLlm` |
 
 - RAG カテゴリの PDF OCR 取り込みは、config.json 上のキー名を **`ocrRag`** としています（`htmlRag` と対になる名前）。旧名 `ocr` も互換で受け付け、内部的には同じ設定です。本README リファレンスの `ocr.*` 表記は `ocrRag.*` に読み替えられます。
 
@@ -1527,6 +1558,27 @@ opengeek-llm-chat/
 | `googleDrive.maxTextChars` | LLMに渡すテキストの最大文字数（既定20000） |
 | `googleDrive.sharedDrives` | 共有ドライブ（旧チームドライブ）も対象に含める |
 | `googleDrive.tokenFile` | リフレッシュトークンの保存先（既定 `gdrive_token.json`、chmod600） |
+| `cloudLlm.enabled` | 外部LLMフォールバック ON/OFF（既定 false。false の間は外部送信は一切起きない） |
+| `cloudLlm.provider` | `openai` / `anthropic` / `gemini` / `openrouter` / `groq` / `deepseek` / `mistral` / `xai` / `openai-compatible` |
+| `cloudLlm.model` | モデル名（例: `gpt-4o`、`claude-sonnet-5`、`gemini-2.5-pro`、OpenRouter は `openai/gpt-4o` 形式） |
+| `cloudLlm.apiKey` / `apiKeyEnv` | API キー。空なら環境変数（`apiKeyEnv`、未指定ならプロバイダ既定の `OPENAI_API_KEY` 等）から読む。`/config` には出ない |
+| `cloudLlm.baseUrl` | API のベースURL（空ならプロバイダ既定。`openai-compatible` では必須。例 `http://host:8000/v1`） |
+| `cloudLlm.label` | UI に出す表示名（空ならプロバイダ名） |
+| `cloudLlm.maxTokens` / `temperature` / `timeoutMs` | 出力上限・温度（`null` で送らない。推論モデルは temperature を拒否することがある）・タイムアウト |
+| `cloudLlm.maxInputChars` | 送信する会話の最大文字数（既定 200000）。超えたら古いツール結果から切り詰め、それでも足りなければ古い会話を落とす |
+| `cloudLlm.maxRequestsPerDay` | 1日の呼び出し上限（0 で無制限）。超えると 429 で拒否 |
+| `cloudLlm.sendImages` / `sendSystemPrompt` / `systemPromptPrefix` | 添付画像を送るか / システムプロンプトを送るか / 外部LLM にだけ付ける前置き |
+| `cloudLlm.maxTokensParam` | `max_tokens` か `max_completion_tokens` か（空ならプロバイダ既定。OpenAI は後者） |
+| `cloudLlm.extraBody` / `extraHeaders` | リクエスト本文・ヘッダに足す任意キー（`{"reasoning_effort":"low"}`、OpenRouter の `HTTP-Referer` 等） |
+| `cloudLlm.autoEscalate` | true でローカルの限界を検知したら自動で聞き直す（既定 false = ボタン/トグルのみ） |
+| `cloudLlm.autoTriggers` | 限界の判定条件（`ctxExhausted` `lengthCapped` `thinkingOnly` `emptyResponse` `loopDetected` `giveUp` `error`、各 true/false） |
+| `cloudLlm.giveUpPatterns` / `giveUpMaxChars` | 「分かりません」判定の正規表現（空なら内蔵の既定）と、判定対象にする回答の最大文字数（既定 400） |
+| `cloudLlm.confirmBeforeSend` | 送信前にブラウザで確認ダイアログを出す（既定 true、セッション中1回） |
+| `cloudLlm.ragPolicy` | RAG（登録資料・添付ドキュメント）の扱い。`redact`（既定: 資料を送らない） / `abstract`（ローカルで一般化した質問だけ送る） / `send`（資料も送る） |
+| `cloudLlm.privateTools` | 結果を外部に送らないツール名（既定 `search_documents` `search_persistent_documents`。`read_file` `gdrive_read_file` 等も追加可） |
+| `cloudLlm.privateMarkers` | 資料由来のメッセージの先頭マーカー（空なら内蔵の既定）。これで始まる system/user メッセージは送らない |
+| `cloudLlm.abstractPrompt` / `composePrompt` | `abstract` で使う2つのプロンプト（一般化質問の作成 / 外部の回答と資料の突き合わせ）。空なら内蔵の既定 |
+| `cloudLlm.abstractCompose` | `abstract` の突き合わせをローカルで行う（既定 true。false なら外部の一般的な回答をそのまま表示） |
 | `ocr.enabled` | PDF OCR 機能 ON/OFF。要 poppler-utils（`pdftoppm` / `pdfinfo`） |
 | `ocr.vlmPoolModel` | **設定するとVision LLMをLLMプール管理にする**。`chatModels[].name` を入れる。OCR中だけロードされ、終われば `orchestration.idleUnloadMs` でアンロード。空なら従来どおり `vlmEndpoint` を使う（既定 空） |
 | `ocr.vlmEndpoint` | Vision LLM の OpenAI互換エンドポイント（自分で別ポートに起動しておく場合）。`vlmPoolModel` 設定時は無視される |
@@ -2064,6 +2116,97 @@ PDF・画像・Excel などのバイナリは `gdrive_read_file` では読めな
 
 ---
 
+## 🌩️ 外部LLMフォールバックのセットアップ
+
+「ローカルで粘って、ダメな時だけ外部の大きなモデルに聞く」ための設定です。`config.json` の `cloudLlm` を編集して再起動します（`/editconfig.html` からも編集できます。「cloudLlm」で絞り込むと全キーの説明が出ます）。
+
+### 1. プロバイダとモデルを選ぶ
+
+```jsonc
+"cloudLlm": {
+  "enabled": true,
+  "provider": "anthropic",          // openai / anthropic / gemini / openrouter / groq / deepseek / mistral / xai / openai-compatible
+  "model": "claude-sonnet-5",       // OpenAI なら "gpt-4o"、Gemini なら "gemini-2.5-pro"、OpenRouter なら "openai/gpt-4o" など
+  "apiKey": "",                     // 空なら環境変数 (下記) から読む。config.json に書く場合は chmod 600 を推奨
+  "maxRequestsPerDay": 50,          // うっかり課金の安全網 (0 で無制限)
+  "autoEscalate": false             // まずは手動 (🌩️ トグル / 聞き直しボタン) で試し、慣れたら true に
+}
+```
+
+API キーは環境変数でも渡せます（`cloudLlm.apiKey` が空の時に読みます）。systemd なら `Environment=` に、手動起動ならシェルで：
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...     # provider: anthropic
+export OPENAI_API_KEY=sk-...            # provider: openai
+export GEMINI_API_KEY=...               # provider: gemini
+export OPENROUTER_API_KEY=sk-or-...     # provider: openrouter
+node server.js
+```
+
+自前の OpenAI 互換サーバー（vLLM / 別マシンの llama-server / 社内プロキシ等）に投げる場合は `provider: "openai-compatible"` にして `baseUrl`（例 `http://gpu-box:8000/v1`）を指定します。キーは `CLOUD_LLM_API_KEY` か `apiKey` に。
+
+### 2. 疎通確認
+
+```bash
+curl -s -X POST http://localhost:3000/cloud-llm/test -b cookie.txt
+# → {"ok":true,"provider":"anthropic","model":"claude-sonnet-5","reply":"OK","latencyMs":812,"usage":{...}}
+curl -s http://localhost:3000/cloud-llm/status -b cookie.txt     # 設定状態と利用回数 (キーは含まれない)
+```
+
+401 なら API キー、404 なら `model` か `baseUrl`、429 ならレート制限か残高不足です（エラー文にヒントを付けて返します）。
+
+### 3. 使い方
+
+- **手動**: チャット欄の 🌩️ ボタンを ON にして送信すると、ツール実行（検索・Python・RAG）はローカルで行い、最終回答だけ外部LLMが書きます。回答の下の「🌩️ 外部LLMに聞き直す」で、直前のローカル回答を外部LLMの回答に置き換えることもできます（ローカルの回答はバッジから見返せます）
+- **自動**: `autoEscalate: true` にすると、ローカルの回答にコンテキスト不足・出力打ち切り・思考のみ・空応答・ループ・「分かりません」・推論エラーの印があった時に自動で聞き直します。条件は `autoTriggers` で個別に外せます。「分かりません」判定は `giveUpMaxChars`（既定400文字）以下の短い回答にだけ効くので、長い回答の中の一言で丸ごと投げ直すことはありません
+- 初回送信時に確認ダイアログが出ます（`confirmBeforeSend: false` で省略可）。外部LLMの回答には 🌩️ バッジが付き、どこに・なぜ送ったか・入出力トークン数が分かります
+
+### RAG（機密資料）を外部に出さない
+
+登録資料・添付ドキュメントは機密である前提で、`cloudLlm.ragPolicy` で扱いを選びます。**既定は `redact`（送らない）** です。
+
+| `ragPolicy` | 外部に送るもの | 向いている場面 |
+|---|---|---|
+| `redact`（既定） | 会話履歴・Web検索やPythonの結果は送るが、**資料の検索結果（`privateTools` の結果）と資料由来のメッセージ（出典台帳・参考資料）は本文を伏せる**。添付ドキュメント名を含むツール案内のシステムプロンプトも送らず、最小限のものに差し替える | 資料の中身に依らない一般的な質問（コードの解説、一般知識、文章の推敲など）を大きなモデルに頼みたい |
+| `abstract` | **資料も会話履歴も送らない。** ローカルLLMが質問と資料を見て、固有名詞・数値・社内用語を伏せた「一般化した質問」を1つ作り、**それだけ**を送る。返ってきた一般的な回答と手元の資料の突き合わせはローカルLLMが行い、外部には追加で何も送らない | 資料の内容を踏まえた回答が欲しいが、資料そのものは絶対に外に出せない |
+| `send` | 資料の検索結果もそのまま送る | 公開資料や、外部に出してよいと判断した資料だけを登録している運用 |
+
+`abstract` の流れ（バッジの「外部に送った一般化した質問」で、実際に何を送ったかを毎回確認できます）：
+
+```
+質問「A社向け製品Xの歩留まり85%を90%に上げる手順は？」 + 資料（検索結果）
+  → [ローカル] 一般化: 「ある製造業の部品の歩留まりを数%改善する一般的な手順と考え方は？」
+  → [外部LLM] 一般化した質問だけに回答（資料も固有名詞も見ていない）
+  → [ローカル] 外部の一般的な回答 + 手元の資料 → 最終回答（資料の具体値を優先）
+```
+
+伏せる判定はサーバー側（`cloud_llm.js`）で必ず掛かります。ブラウザが伏せ忘れても、外部APIへの唯一の出口であるサーバーが `privateTools` の結果と `privateMarkers` で始まるメッセージを落とします。**ツール結果の関数名は `tool_calls` の `id` から引くので、`read_file` や `gdrive_read_file` の結果も伏せたい場合は `privateTools` に足してください。**
+
+`redact` / `abstract` でも残るもの（注意）：
+
+- ユーザーの質問文そのもの、過去のターンの回答本文（`redact` のみ）。過去の回答が資料を引用していれば、その引用は履歴として送られます。これも避けたい場合は `abstract` を使ってください
+- `abstract` の一般化はローカルLLMの作業なので、小さいモデルだと固有名詞を伏せ損ねることがあります。バッジの「外部に送った一般化した質問」で確認し、心配なら `abstractPrompt` に禁止語や伏せ方の例を足してください
+- ローカル推論のエラーが引き金（`autoTriggers.error`）の時、`abstract` は一般化の段階でも失敗するため外部には何も送られません（安全側）
+
+### 外部LLMに送られるもの・送られないもの
+
+| 送る | 送らない |
+|---|---|
+| システムプロンプト（`ragPolicy: send` 以外では最小限のものに差し替え。`sendSystemPrompt: false` で省略可）・役割設定・会話履歴（コンパクション済みなら要約） | API キー以外の `config.json` の中身 |
+| 添付画像（`sendImages: false` で省略可）・インライン添付テキスト | llama.cpp 固有のサンプラー設定（`top_k` / `dry_*` 等） |
+| ツールの呼び出しと結果（Web検索・Python の出力をテキストに畳んだもの） | ツール定義（外部LLM 側でツールは実行しない） |
+| `ragPolicy: send` の時だけ: RAG検索の結果、聞き直し時のローカル検索の抜粋（`contexts` / `ragSources`、最大4万字） | 置き換え対象のローカルの回答本文。`redact` / `abstract` では RAG の検索結果と資料由来のメッセージ |
+
+`abstract` では上の表に関わらず「一般化した質問」1つだけを送ります。送信量は `maxInputChars`（既定20万字）で頭打ちにし、超えた分は古いツール結果から切り詰めます。
+
+### 注意点
+
+- 外部LLMには **tools を渡しません**。ツールが必要な質問はローカルが判断・実行した後の「最終回答」だけを外部に頼む設計です（🌩️ トグル ON でもこの順序は同じ）
+- Anthropic は Messages API（`/v1/messages`）に変換して呼び、`thinking_delta` は思考欄に出ます。他はすべて OpenAI Chat Completions 互換で呼びます。OpenAI の新しいモデルは `max_completion_tokens` を要求するため、`provider: "openai"` では既定でそちらを送ります（`maxTokensParam` で変更可）
+- `cloud_llm_usage.json`（日別の回数・トークン数）は `.gitignore` 済みです。90日より古い記録は自動で捨てます
+
+---
+
 ## 🧪 環境変数
 
 | 変数名 | デフォルト | 説明 |
@@ -2072,6 +2215,7 @@ PDF・画像・Excel などのバイナリは `gdrive_read_file` では読めな
 | `PYTHON_TIMEOUT` | `60000` | Python実行タイムアウト(ms) |
 | `GPU_INTERVAL` | `1000` | GPU監視間隔(ms) |
 | `CHATS_DIR` | `./chats` | チャット履歴保存先 |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `OPENROUTER_API_KEY` / `GROQ_API_KEY` / `DEEPSEEK_API_KEY` / `MISTRAL_API_KEY` / `XAI_API_KEY` / `CLOUD_LLM_API_KEY` | - | 外部LLMフォールバックの API キー（`cloudLlm.apiKey` が空の時に `cloudLlm.provider` に応じて読む。`cloudLlm.apiKeyEnv` で変数名を変更可） |
 
 `llama-server` の接続先（ホスト・ポート）は `config.json` の `llamaServer.*` で設定します。
 
@@ -2086,6 +2230,9 @@ PDF・画像・Excel などのバイナリは `gdrive_read_file` では読めな
 | `GET` | `/models` | ✓ | 利用可能モデル一覧 + 現在ロード中モデル |
 | `POST` | `/models/load` | ✓ | モデル切替（サーバー再起動） |
 | `POST` | `/models/unload` | ✓ | 現在のチャットモデルをアンロード |
+| `POST` | `/cloud/v1/chat/completions` | ✓ | 外部LLM（有料API）にチャット補完を依頼。OpenAI 互換の入出力（tools は不可。llama.cpp 固有のサンプラー引数は無視） |
+| `GET` | `/cloud-llm/status` | ✓ | 外部LLMの設定状態・自動エスカレーション条件・日別/月別の利用回数とトークン数（キーは返さない） |
+| `POST` | `/cloud-llm/test` | ✓ | 外部LLMの疎通テスト（短い応答を1回もらう。キー・モデル名・URL の確認用） |
 | `GET` | `/external-servers` | ✓ | 外部APIサーバー一覧（ctx/np含む） |
 | `POST` | `/external-servers` | ✓ | 外部APIサーバー新規起動 |
 | `POST` | `/external-servers/:id/stop` | ✓ | プロセスのみ停止（設定保持） |

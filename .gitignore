@@ -13,6 +13,8 @@ key.pem
 # Google Drive のリフレッシュトークン / サービスアカウントキー（機密）
 gdrive_token.json
 gdrive-service-account*.json
+# 外部LLM (有料API) の利用記録 (日別の回数・トークン数。環境依存の実績データ)
+cloud_llm_usage.json
 # 配布用ZIP（更新ファイルをまとめた成果物。ソースではないので追跡しない）
 opengeek-llmchat-*.zip
 # Python venv

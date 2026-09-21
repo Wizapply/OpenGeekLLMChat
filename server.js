@@ -11,6 +11,7 @@ const { startAgentServer } = require('./agent_proxy');
 const { createLlmPool } = require('./llm_pool');
 const { createOrchestrator, validateWorkflow } = require('./orchestrator');
 const { createGoogleDrive, isVlmImportableMime } = require('./google_drive');
+const { createCloudLlm } = require('./cloud_llm');
 const { createOcrManager, sanitizeSourceName, uniqueName: uniqueUploadName } = require('./ocr');
 const { createHtmlRagManager } = require('./html_rag');
 const { createRagTuneManager } = require('./rag_tune');
@@ -174,6 +175,52 @@ const DEFAULT_CONFIG = {
     defaultPageSize: 30,            // 一覧・検索の既定件数
     sharedDrives: true,             // 共有ドライブ(旧チームドライブ)も対象に含める
     tokenFile: 'gdrive_token.json', // リフレッシュトークンの保存先
+  },
+  // ─── 外部LLM (有料API) フォールバック ───
+  // ローカルLLMで限界 (コンテキスト不足・出力打ち切り・思考のみ・「分かりません」・エラー) の時や、
+  // チャット欄の 🌩️ トグルで頼んだ時だけ、外部の大きなLLMに同じ会話を投げて回答をもらう。
+  // 既定は無効。有効にしない限り外部への送信は一切起きない (このアプリの原則の例外なので明示的にON)。
+  // ツール (検索・Python・RAG) はローカルで実行し、外部LLMには会話とその結果のテキストだけを送る。
+  cloudLlm: {
+    enabled: false,
+    // openai | anthropic | gemini | openrouter | groq | deepseek | mistral | xai | openai-compatible
+    provider: 'openai',
+    model: '',                      // 例: gpt-4o / claude-sonnet-5 / gemini-2.5-pro / openai/gpt-4o (OpenRouter)
+    apiKey: '',                     // 空なら apiKeyEnv (未指定ならプロバイダ既定: OPENAI_API_KEY 等) から読む
+    apiKeyEnv: '',
+    baseUrl: '',                    // 空ならプロバイダ既定。openai-compatible では必須 (例: http://host:8000/v1)
+    label: '',                      // UI 表示名 (空ならプロバイダ名)
+    maxTokens: 8192,                // 1応答の最大出力トークン
+    temperature: null,              // null なら送らない (推論モデルは temperature を拒否することがある)
+    timeoutMs: 300000,
+    maxInputChars: 200000,          // 送信する会話の最大文字数 (超えたら古いツール結果から切り詰め)
+    maxRequestsPerDay: 0,           // 1日の呼び出し上限 (0 で無制限)。うっかり課金の安全網
+    sendImages: true,               // 添付画像も送る (false で画像を落とす)
+    sendSystemPrompt: true,         // システムプロンプト (役割・ツール案内) も送る
+    systemPromptPrefix: '',         // 外部LLM にだけ付ける前置き (例: "あなたはローカルLLMの代打です…")
+    maxTokensParam: '',             // 空ならプロバイダ既定 (openai: max_completion_tokens / 他: max_tokens)
+    extraBody: {},                  // リクエスト本文に足す任意キー (例: {"reasoning_effort": "low"})
+    extraHeaders: {},               // 追加ヘッダ (OpenRouter の HTTP-Referer 等)
+    // ── 自動エスカレーション ──
+    autoEscalate: false,            // true: ローカルが限界の時、確認の上で自動的に外部LLMへ聞き直す
+    autoTriggers: {                 // 何を「限界」とみなすか
+      ctxExhausted: true, lengthCapped: true, thinkingOnly: true,
+      emptyResponse: true, loopDetected: true, giveUp: true, error: true,
+    },
+    giveUpPatterns: [],             // 「分かりません」判定の正規表現 (空なら内蔵の既定)
+    giveUpMaxChars: 400,            // この文字数以下の短い回答だけ giveUp 判定の対象にする
+    confirmBeforeSend: true,        // 送信前にブラウザで確認ダイアログを出す (セッション中1回)
+    // ── RAG (登録資料・添付ドキュメント) は機密として扱う ──
+    //   redact   … 資料の検索結果と資料由来のメッセージを外部に送らない (既定)
+    //   abstract … ローカルLLMが機密を伏せた「一般化した質問」を作り、それだけを外部に送る。
+    //              外部の一般的な回答と資料の突き合わせはローカルLLMが行う
+    //   send     … 資料の検索結果もそのまま送る (公開資料など外部に出してよい時だけ)
+    ragPolicy: 'redact',
+    privateTools: ['search_documents', 'search_persistent_documents'],  // 結果を外部に出さないツール (read_file 等も追加可)
+    privateMarkers: [],             // 資料由来メッセージの先頭マーカー (空なら内蔵の既定)
+    abstractPrompt: '',             // abstract: 一般化した質問を作るプロンプト (空なら内蔵の既定。{question} {context})
+    composePrompt: '',              // abstract: 外部の回答と資料を突き合わせるプロンプト (空なら内蔵の既定)
+    abstractCompose: true,          // abstract: 突き合わせをローカルで行う (false なら外部の一般的な回答をそのまま表示)
   },
   // ─── OCR (PDF → Markdown → RAG) 設定 ───
   // アップロードされたPDFを1ページずつ画像化し、Vision LLM (Qwen2.5-VL 等の
@@ -454,7 +501,7 @@ function loadConfig() {
         delete userConfig.ocrRag;
       }
       const merged = { ...DEFAULT_CONFIG, ...userConfig };
-      ['systemPrompts', 'agentContext', 'harness', 'contextCompaction', 'transcribe', 'llamaServer', 'embeddingModel', 'ml', 'irodoriTts', 'orchestration', 'googleDrive', 'ocr', 'htmlRag'].forEach(key => {
+      ['systemPrompts', 'agentContext', 'harness', 'contextCompaction', 'transcribe', 'llamaServer', 'embeddingModel', 'ml', 'irodoriTts', 'orchestration', 'googleDrive', 'cloudLlm', 'ocr', 'htmlRag'].forEach(key => {
         if (DEFAULT_CONFIG[key] && typeof DEFAULT_CONFIG[key] === 'object') {
           merged[key] = { ...DEFAULT_CONFIG[key], ...(userConfig[key] || {}) };
         }
@@ -471,6 +518,14 @@ const appConfig = loadConfig();
 // log は関数宣言なので巻き上げにより、この時点で参照しても問題ない。
 const gdrive = createGoogleDrive({
   getConfig: () => appConfig.googleDrive,
+  baseDir: __dirname,
+  log: (ip, msg) => log(ip, msg),
+});
+
+// ─── 外部LLM (有料API) フォールバック ───
+// 設定は毎回 appConfig.cloudLlm から読む。API キーはこのプロセスの外 (ブラウザ) に出さない
+const cloudLlm = createCloudLlm({
+  getConfig: () => appConfig.cloudLlm,
   baseDir: __dirname,
   log: (ip, msg) => log(ip, msg),
 });
@@ -2224,6 +2279,36 @@ app.use('/embed/v1', requireAuth, proxyToLlama(
   '/v1',
   false
 ));
+
+// ─── 外部LLM (有料API) フォールバック ───
+// ブラウザは llama-server と同じ OpenAI 互換の SSE を期待するので、プロバイダ差は
+// cloud_llm.js で吸収して同じ形で返す (index.jsx のストリーム処理を共用するため)。
+// 認証必須。API キーはサーバー側にしか無く、ブラウザから直接プロバイダへは繋がない。
+app.post('/cloud/v1/chat/completions', requireAuth, jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  if (!Array.isArray(req.body?.messages) || req.body.messages.length === 0) {
+    return res.status(400).json({ error: 'messages が必要です' });
+  }
+  await cloudLlm.handleChatCompletions(req, res, ip);
+});
+
+// 状態 (設定の有無・プロバイダ・自動エスカレーションの条件・利用回数)。機密は返さない
+app.get('/cloud-llm/status', requireAuth, (req, res) => {
+  res.json(cloudLlm.status());
+});
+
+// 疎通テスト: 短い応答を1回もらってキー・モデル名・URL を確認する (課金は最小限)
+app.post('/cloud-llm/test', requireAuth, async (req, res) => {
+  const ip = getIP(req);
+  try {
+    const r = await cloudLlm.test();
+    log(ip, `CLOUD LLM TEST OK ${r.label} (${r.model}) ${r.latencyMs}ms`);
+    res.json(r);
+  } catch (e) {
+    log(ip, `CLOUD LLM TEST ERROR ${e.message}`);
+    res.status(e.status || 502).json({ ok: false, error: e.message });
+  }
+});
 
 // ─── モデル管理API ───
 // 利用可能モデル一覧（config.jsonから）+ 現在のロード状態
@@ -4255,7 +4340,8 @@ function requirePermission(perm) {
 app.get('/config', (req, res) => {
   // 公開しない: password, llamaServer内のbinPath, embeddingModelの実体パス, ml.apiTokens(機密),
   //             googleDrive の clientId/clientSecret/サービスアカウント鍵(機密)
-  const { password, llamaServer, embeddingModel, ml, irodoriTts, googleDrive, ocr: ocrCfg, htmlRag: htmlRagCfg, ...rest } = appConfig;
+  //             cloudLlm の apiKey / baseUrl / extraHeaders(機密)
+  const { password, llamaServer, embeddingModel, ml, irodoriTts, googleDrive, cloudLlm: cloudLlmCfg, ocr: ocrCfg, htmlRag: htmlRagCfg, ...rest } = appConfig;
   const safeConfig = {
     ...rest,
     // llamaServer情報は最小限のみ
@@ -4291,6 +4377,20 @@ app.get('/config', (req, res) => {
       allowWrite: !!(googleDrive.allowWrite && googleDrive.readOnly === false),
       allowDelete: !!googleDrive.allowDelete,
       authMode: googleDrive.authMode === 'serviceAccount' ? 'serviceAccount' : 'oauth',
+    };
+  }
+  // 外部LLM は「使えるか」と自動エスカレーションの条件だけ公開。キー・URL・ヘッダは一切出さない
+  // (詳細は認証後に /cloud-llm/status から取る)
+  if (cloudLlmCfg) {
+    const st = cloudLlm.status();
+    safeConfig.cloudLlm = {
+      enabled: st.enabled,
+      configured: st.configured,
+      provider: st.provider,
+      label: st.label,
+      model: st.model,
+      autoEscalate: st.autoEscalate,
+      confirmBeforeSend: st.confirmBeforeSend,
     };
   }
   // irodoriTts は機密(command/args/cwd/env/host/port)を伏せ、UI表示用の最小限のみ公開
