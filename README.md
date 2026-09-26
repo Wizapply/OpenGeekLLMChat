@@ -1,4 +1,4 @@
-# OpenGeekLLMChat
+# OpenGeekLLM
 
 <div align="center">
 <img src="docs/ogllm_icon.png" alt="OpenGeekLLMアイコン" width="256" /><br />
@@ -13,15 +13,15 @@
 [![No Cloud](https://img.shields.io/badge/No%20Cloud-ever-red)](#)
 
 <!-- スクリーンショット -->
-<img src="docs/image.png" alt="OpenGeekLLMChat" width="800" /><br />
-<img src="docs/image_ft.png" alt="OpenGeekLLMChat Fine-Tuning" width="800" />
+<img src="docs/image.png" alt="OpenGeekLLM" width="800" /><br />
+<img src="docs/image_ft.png" alt="OpenGeekLLM Fine-Tuning" width="800" />
 </div>
 
 ---
 
 ## 🎯 何ができるのか
 
-OpenGeekLLMChatは、**クラウドに依存しないローカルLLM環境を自宅サーバーや社内LANで動かすため** に設計されたチャットアプリです。ギークが自由に弄り倒せるよう、**依存を最小限に絞り、すべてがファイル1枚で完結する構成** になっています。
+OpenGeekLLMは、**クラウドに依存しないローカルLLM環境を自宅サーバーや社内LANで動かすため** に設計されたチャットアプリです。ギークが自由に弄り倒せるよう、**依存を最小限に絞り、すべてがファイル1枚で完結する構成** になっています。
 
 - サーバー: `server.js` 1ファイル（依存は `express` と `ws` のみ）
 - クライアント: `public/index.html` + `public/styles.css`（React/Babel CDN、ビルドツール不要）
