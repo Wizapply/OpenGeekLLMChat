@@ -4098,7 +4098,19 @@ function RLView({ showToast }) {
           onClick={() => setSubTab('agents')}>🤖 エージェント</button>
         <button className={`subtab ${subTab === 'world' ? 'active' : ''}`}
           onClick={() => setSubTab('world')}>🌍 世界モデル</button>
+        <button className={`subtab ${subTab === 'sim' ? 'active' : ''}`}
+          onClick={() => setSubTab('sim')}>🔌 シミュレータ連携</button>
       </div>
+
+      {subTab === 'sim' && (
+        <SimPanel
+          running={running}
+          liveLog={liveLog}
+          onCancel={cancelTrain}
+          showToast={showToast}
+          appendLog={appendLog}
+        />
+      )}
 
       {subTab === 'world' && (
         <WorldModelPanel
@@ -4792,6 +4804,599 @@ function WorldModelTrainDialog({ datasets, onClose, onStarted, showToast }) {
         <div className="modal-footer">
           <button className="btn" onClick={onClose} disabled={busy}>キャンセル</button>
           <button className="btn primary" onClick={start} disabled={busy}>▶ 学習を開始</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── 🔌 シミュレータ連携 (TD-MPC2 / PETS / SAC) パネル ───
+// 外部シミュレータと HTTP (GET /info, POST /reset, POST /step) でやり取りし、
+// 同じ試行数・同じ評価条件で方式を比べる。未知条件での成功率の低下と、1手の計算時間も測る。
+function SimPanel({ running, liveLog, onCancel, showToast, appendLog }) {
+  const [models, setModels] = useState([]);
+  const [algos, setAlgos] = useState([]);
+  const [showTrain, setShowTrain] = useState(false);
+  const [detailFor, setDetailFor] = useState(null);   // モデル名
+  const [detail, setDetail] = useState(null);         // metrics.json
+  const [evalFor, setEvalFor] = useState(null);       // 評価ダイアログ対象モデル
+  const logRef = useRef(null);
+  const simRunning = running && (running.env === 'sim' || running.env === 'sim-eval') ? running : null;
+
+  async function load() {
+    try {
+      const r = await fetch('/ml/rl/sim/models');
+      const d = r.ok ? await r.json() : {};
+      setModels(d.models || []);
+    } catch {}
+  }
+  async function loadDetail(name) {
+    try {
+      const r = await fetch(`/ml/rl/sim/models/${encodeURIComponent(name)}/metrics`);
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      setDetail(d);
+    } catch (e) { setDetail(null); }
+  }
+  useEffect(() => {
+    load();
+    fetch('/ml/rl/sim/algos').then(r => r.json()).then(d => setAlgos(d.algos || [])).catch(() => {});
+    const t = setInterval(load, 5000);
+    return () => clearInterval(t);
+  }, []);
+  // 詳細を開いている間は学習曲線を更新し続ける (学習中のモデルなら途中経過が伸びていく)
+  useEffect(() => {
+    if (!detailFor) return;
+    loadDetail(detailFor);
+    const t = setInterval(() => loadDetail(detailFor), 5000);
+    return () => clearInterval(t);
+  }, [detailFor]);
+  useEffect(() => { if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; }, [liveLog]);
+
+  async function deleteModel(name) {
+    if (!window.confirm(`モデル「${name}」を削除します。経験ログのテーブルは残ります。よろしいですか？`)) return;
+    try {
+      const r = await fetch(`/ml/rl/sim/models/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      showToast(`削除しました: ${name}`, 'success');
+      if (detailFor === name) { setDetailFor(null); setDetail(null); }
+      load();
+    } catch (e) { showToast(`削除失敗: ${e.message}`, 'error'); }
+  }
+
+  const evalOf = (m) => m.lastEval || m.finalEval;
+  const trainCond = (ev) => ev?.conditions?.find(c => c.kind === 'train') || null;
+
+  return (
+    <>
+      <div className="toolbar">
+        <button className="btn primary" onClick={() => setShowTrain(true)} disabled={!!running}>
+          ➕ シミュレータで学習
+        </button>
+        {running && <span style={{ background: 'var(--orange-dim)', color: 'var(--orange)',
+          padding: '4px 10px', borderRadius: 10, fontSize: 12, fontFamily: 'var(--font-mono)' }}>
+          ⚙️ 実行中: {running.name}{running.env === 'sim-eval' ? ' (評価)' : ''}</span>}
+      </div>
+
+      <div className="ml-layout">
+        <div className="ml-table-list">
+          {models.length === 0 ? (
+            <div className="empty-state">
+              シミュレータ学習のモデルがありません。<br />
+              「➕ シミュレータで学習」でシミュレータの URL を指定して始めます。<br /><br />
+              <span style={{ fontSize: 12 }}>
+                シミュレータ側は <code>GET /info</code>・<code>POST /reset</code>・<code>POST /step</code> の
+                3つの HTTP の受け口を用意します（仕様は <code>system/sim/sim_http.py</code>）。<br />
+                試すだけなら <code>python3 system/sim/sim_dummy_server.py</code> で見本のシミュレータが立ち上がります。
+              </span>
+            </div>
+          ) : models.map(m => {
+            const ev = evalOf(m);
+            const tc = trainCond(ev);
+            const p99 = ev?.latency?.p99;
+            const drop = ev?.criteria?.maxHoldoutDropPts;
+            return (
+              <div key={m.name} className="ml-table-item" style={{ position: 'relative' }}>
+                <button className="ml-model-delete-btn" disabled={running && running.name === m.name}
+                  onClick={(e) => { e.stopPropagation(); deleteModel(m.name); }}>×</button>
+                <div className="ml-table-name" style={{ paddingRight: 24 }}>🔌 {m.name}</div>
+                <div className="ml-table-meta">
+                  {m.algoLabel} | {m.sim} | seed {m.seed} | {m.envSteps ?? 0}/{m.totalSteps} ステップ
+                  {m.status === 'running' && <b style={{ color: 'var(--orange)' }}> ⚙️ 学習中</b>}
+                  {m.status === 'evaluating' && <b style={{ color: 'var(--orange)' }}> 🧪 評価中</b>}
+                  {m.status === 'failed' && <b style={{ color: 'var(--red, #e55)' }}> ✕ 失敗</b>}
+                  {m.status === 'stopped' && <b style={{ color: 'var(--orange)' }}> ⏹ 中断</b>}
+                </div>
+                {tc && (
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4, fontFamily: 'var(--font-mono)' }}>
+                    成功率 {tc.successRate}% · 危険終了 {tc.unsafeRate}% · p99 {p99 ?? '—'}ms
+                    {ev?.criteria && !ev.criteria.latencyOk && <b style={{ color: 'var(--orange)' }}> ⚠ 時間超過</b>}
+                    {drop != null && <> · 未知条件 -{Math.max(drop, 0)}pt</>}
+                    {drop != null && drop > 15 && <b style={{ color: 'var(--orange)' }}> ⚠</b>}
+                  </div>
+                )}
+                <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
+                  <button className="btn small" onClick={() => setDetailFor(detailFor === m.name ? null : m.name)}>📈 詳細</button>
+                  <button className="btn small primary" disabled={!!running || !m.hasModel}
+                    onClick={() => setEvalFor(m)}>🧪 評価</button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="ml-table-detail">
+          {simRunning && (
+            <div className="rl-panel">
+              <div className="rl-panel-title">📜 ログ（ライブ）: {simRunning.name}
+                <button className="btn small danger" style={{ float: 'right' }} onClick={onCancel}>⏹ キャンセル</button>
+              </div>
+              <pre ref={logRef} className="train-log rl-log">{liveLog || '(出力待ち...)'}</pre>
+              <div className="field-hint">キャンセルしても、それまでのチェックポイントと記録済みのエピソードは残ります。</div>
+            </div>
+          )}
+
+          {detailFor && detail && <SimDetail name={detailFor} metrics={detail} onClose={() => setDetailFor(null)} />}
+
+          {!detailFor && <SimCompareTable models={models} />}
+        </div>
+      </div>
+
+      {showTrain && (
+        <SimTrainDialog
+          algos={algos}
+          onClose={() => setShowTrain(false)}
+          onStarted={(name, table) => {
+            setShowTrain(false);
+            appendLog(`🔌 シミュレータ学習を開始: ${name} (経験ログ → ${table})`);
+            load();
+          }}
+          showToast={showToast}
+        />
+      )}
+      {evalFor && (
+        <SimEvalDialog
+          model={evalFor}
+          onClose={() => setEvalFor(null)}
+          onStarted={() => { appendLog(`🧪 評価を開始: ${evalFor.name}`); setEvalFor(null); }}
+          showToast={showToast}
+        />
+      )}
+    </>
+  );
+}
+
+// ─── 方式の比較表 (同じシミュレータごと) ───
+// 資料の合格基準に合わせ、1手の計算時間・未知条件での成功率の低下・乱数による差を並べる。
+function SimCompareTable({ models }) {
+  const done = models.filter(m => m.finalEval || m.lastEval);
+  if (done.length === 0) {
+    return (
+      <div className="empty-state">
+        学習が終わると、ここに方式ごとの比較表が出ます。<br />
+        <span style={{ fontSize: 12 }}>
+          同じシミュレータ・同じ試行数で TD-MPC2 / PETS / SAC を学習すると、
+          成功率・未知条件での低下・1手の計算時間を横並びで比べられます。
+          乱数シードだけ変えて同じ方式を複数回学習すると、結果の再現性も確かめられます。
+        </span>
+      </div>
+    );
+  }
+  const bySim = {};
+  for (const m of done) (bySim[m.sim] = bySim[m.sim] || []).push(m);
+  return (
+    <>
+      {Object.entries(bySim).map(([sim, ms]) => {
+        // 再現性: 同じ方式・同じ試行数で、シードだけ違う学習の成功率の幅
+        const groups = {};
+        for (const m of ms) {
+          const tc = (m.lastEval || m.finalEval)?.conditions?.find(c => c.kind === 'train');
+          if (!tc || tc.successRate == null) continue;
+          const key = `${m.algoLabel} · ${m.totalSteps}ステップ`;
+          (groups[key] = groups[key] || []).push({ seed: m.seed, sr: tc.successRate });
+        }
+        const repro = Object.entries(groups).filter(([, v]) => new Set(v.map(x => x.seed)).size >= 2);
+        return (
+          <div key={sim} className="rl-panel">
+            <div className="rl-panel-title">📊 方式の比較: {sim}</div>
+            <div className="rl-sample-wrap">
+              <table className="rl-sample-table">
+                <thead><tr>
+                  <th>モデル</th><th>方式</th><th>seed</th><th>試行数</th>
+                  <th>成功率</th><th>収益</th><th>危険終了</th><th>未知条件の低下</th>
+                  <th>1手 p50 / p99</th><th>パラメータ</th><th>学習時間</th>
+                </tr></thead>
+                <tbody>
+                  {ms.map(m => {
+                    const ev = m.lastEval || m.finalEval;
+                    const tc = ev.conditions?.find(c => c.kind === 'train') || {};
+                    const cr = ev.criteria || {};
+                    const drop = cr.maxHoldoutDropPts;
+                    return (
+                      <tr key={m.name}>
+                        <td>{m.name}</td><td>{m.algoLabel}</td><td>{m.seed}</td>
+                        <td>{(m.envSteps ?? 0).toLocaleString()}</td>
+                        <td><b>{tc.successRate ?? '—'}%</b></td>
+                        <td>{tc.meanReturn ?? '—'}</td>
+                        <td>{tc.unsafeRate ?? '—'}%</td>
+                        <td>{drop == null ? '—' : <>{drop > 0 ? `-${drop}` : `+${-drop}`}pt {drop <= 15 ? '✓' : '⚠'}</>}</td>
+                        <td>{ev.latency?.p50 ?? '—'} / <b>{ev.latency?.p99 ?? '—'}</b>ms {cr.latencyOk ? '✓' : '⚠'}</td>
+                        <td>{m.nParams != null ? `${(m.nParams / 1e6).toFixed(2)}M` : '—'}</td>
+                        <td>{m.elapsedSec != null ? `${Math.round(m.elapsedSec / 60)}分` : '—'}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            {repro.length > 0 && (
+              <div className="rl-agent-meta" style={{ marginTop: 8 }}>
+                再現性（シード違いの成功率の幅）:{' '}
+                {repro.map(([k, v]) => {
+                  const srs = v.map(x => x.sr);
+                  const spread = Math.round((Math.max(...srs) - Math.min(...srs)) * 10) / 10;
+                  return <span key={k} style={{ marginRight: 12 }}>{k} → {spread}pt {spread <= 10 ? '✓' : '⚠'} ({v.length}本)</span>;
+                })}
+              </div>
+            )}
+            <div className="field-hint" style={{ marginTop: 6 }}>
+              成功率・収益・危険終了は「学習条件」での評価（探索ノイズなし・方式間で同じ乱数と物理条件）。
+              未知条件の低下は、学習に使っていない条件で成功率が何ポイント下がったか（✓ は15ポイント以内）。
+              1手の時間は操作を選ぶ計算だけで、シミュレータとの通信は含みません（✓ は目標時間以内）。
+              再現性の ✓ は、シードを変えた学習の成功率の差が10ポイント以内。
+            </div>
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+// ─── モデルの詳細: 学習曲線・評価条件ごとの結果・計算時間 ───
+function SimDetail({ name, metrics, onClose }) {
+  const eps = metrics.trainEpisodes || [];
+  // 学習エピソードの収益は揺れが大きいので、直近20本の移動平均で見る
+  const smooth = [];
+  for (let i = 0; i < eps.length; i++) {
+    const w = eps.slice(Math.max(0, i - 19), i + 1);
+    smooth.push(w.reduce((s, e) => s + (e.return || 0), 0) / w.length);
+  }
+  const evalSr = (metrics.evalHistory || []).map(e => e.successRate);
+  const lossArr = (metrics.lossHistory || []).map(l => l.loss).filter(v => v != null);
+  const ev = (metrics.evals && metrics.evals.length) ? metrics.evals[metrics.evals.length - 1] : metrics.finalEval;
+  return (
+    <div className="rl-panel">
+      <div className="rl-panel-title">📈 {name}（{metrics.algoLabel} · {metrics.sim}）
+        <button className="btn small" style={{ float: 'right' }} onClick={onClose}>✕ 閉じる</button>
+      </div>
+      <div className="rl-agent-meta">
+        {metrics.envSteps?.toLocaleString()} / {metrics.totalSteps?.toLocaleString()} ステップ ·
+        {' '}{metrics.episodes} エピソード · 更新 {metrics.updates?.toLocaleString()} 回 ·
+        {' '}{metrics.nEnvs} 環境 · {metrics.device} · {metrics.elapsedSec}秒 · 状態: {metrics.status}
+      </div>
+      <div className="rl-panel-title" style={{ fontSize: 12, marginTop: 10 }}>学習エピソードの収益（直近20本の移動平均）</div>
+      {smooth.length >= 2 ? <OnlineSeriesChart data={smooth} color="#7c4dff" /> : <div className="field-hint">まだデータがありません</div>}
+      <div className="rl-panel-title" style={{ fontSize: 12, marginTop: 10 }}>評価の成功率（学習条件, %）</div>
+      {evalSr.length >= 2 ? <OnlineSeriesChart data={evalSr} color="#2ecc71" /> :
+        <div className="field-hint">{evalSr.length === 1 ? `${evalSr[0]}%（評価1回目）` : 'まだ評価していません'}</div>}
+      {lossArr.length >= 2 && (
+        <>
+          <div className="rl-panel-title" style={{ fontSize: 12, marginTop: 10 }}>損失</div>
+          <OnlineSeriesChart data={lossArr} color="#f5a623" />
+        </>
+      )}
+
+      {ev && (
+        <>
+          <div className="rl-panel-title" style={{ fontSize: 12, marginTop: 14 }}>
+            評価結果（{ev.episodes}本/条件{metrics.evals && metrics.evals.length ? ' · 最新の評価ジョブ' : ' · 学習直後'}）
+          </div>
+          <div className="rl-sample-wrap">
+            <table className="rl-sample-table">
+              <thead><tr><th>条件</th><th>成功率</th><th>危険終了</th><th>収益 (±σ)</th><th>平均長</th><th>終了理由</th></tr></thead>
+              <tbody>
+                {ev.conditions.map((c, i) => (
+                  <tr key={i}>
+                    <td>{c.label}{c.params ? <span style={{ color: 'var(--text-muted)' }}> {Object.entries(c.params).map(([k, v]) => `${k}=${v}`).join(', ')}</span> : null}</td>
+                    <td><b>{c.successRate}%</b></td>
+                    <td>{c.unsafeRate}%</td>
+                    <td>{c.meanReturn} (±{c.stdReturn})</td>
+                    <td>{c.meanLength}</td>
+                    <td style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>
+                      {Object.entries(c.endReasons || {}).map(([k, v]) => `${k}:${v}`).join(' ')}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="rl-agent-meta" style={{ marginTop: 8 }}>
+            1手の計算時間: p50 <b>{ev.latency?.p50}</b>ms · p95 {ev.latency?.p95}ms · p99 <b>{ev.latency?.p99}</b>ms ·
+            最大 {ev.latency?.max}ms（目標 {ev.criteria?.latencyBudgetMs}ms {ev.criteria?.latencyOk ? '✓' : '⚠ 超過'}）
+            {ev.simStepMs?.p50 != null && <> · シミュレータ応答 p50 {ev.simStepMs.p50}ms</>}
+            {ev.uncertainty?.mean != null && <> · 不確実さ 平均 {ev.uncertainty.mean} / p95 {ev.uncertainty.p95}</>}
+          </div>
+          {ev.criteria && !ev.criteria.latencyOk && (
+            <div className="field-hint" style={{ color: 'var(--orange)' }}>
+              目標時間を超えています。操作列の本数（num_samples）や探索回数（iterations）を減らすか、
+              操作を直接出す軽い方策（SAC など）と比べてください。
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── 物理条件の入力 (/info の params から自動で作る) ───
+function SimParamRangeEditor({ params, value, onChange }) {
+  const names = Object.keys(params || {});
+  if (names.length === 0) return <div className="field-hint">このシミュレータは変えられる物理条件（params）を公開していません。</div>;
+  return (
+    <div className="rl-sample-wrap">
+      <table className="rl-sample-table">
+        <thead><tr><th>変える</th><th>条件</th><th>下限</th><th>上限</th><th>既定値</th></tr></thead>
+        <tbody>
+          {names.map(n => {
+            const p = params[n] || {};
+            const on = Array.isArray(value[n]);
+            const cur = on ? value[n] : [p.min ?? p.default ?? 0, p.max ?? p.default ?? 0];
+            const set = (i, v) => { const x = [...cur]; x[i] = parseFloat(v); onChange({ ...value, [n]: x }); };
+            return (
+              <tr key={n} title={p.description || ''}>
+                <td><input type="checkbox" checked={on} onChange={e => {
+                  const nv = { ...value };
+                  if (e.target.checked) nv[n] = cur; else delete nv[n];
+                  onChange(nv);
+                }} /></td>
+                <td>{n}{p.unit ? ` [${p.unit}]` : ''}<div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{p.description}</div></td>
+                <td><input className="input" type="number" step="any" disabled={!on} value={cur[0]} onChange={e => set(0, e.target.value)} style={{ width: 90 }} /></td>
+                <td><input className="input" type="number" step="any" disabled={!on} value={cur[1]} onChange={e => set(1, e.target.value)} style={{ width: 90 }} /></td>
+                <td style={{ fontFamily: 'var(--font-mono)' }}>{p.default ?? '—'}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// 未知条件 (学習に使わない物理条件の組) の入力。空欄の条件はシミュレータの既定値になる
+function SimHoldoutEditor({ params, value, onChange }) {
+  const names = Object.keys(params || {});
+  if (names.length === 0) return null;
+  const upd = (i, patch) => onChange(value.map((h, j) => (j === i ? { ...h, ...patch } : h)));
+  return (
+    <>
+      {value.map((h, i) => (
+        <div key={i} style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginBottom: 6 }}>
+          <input className="input" style={{ width: 130 }} value={h.label} placeholder="名前"
+            onChange={e => upd(i, { label: e.target.value })} />
+          {names.map(n => (
+            <label key={n} style={{ fontSize: 11, display: 'flex', alignItems: 'center', gap: 3 }}>
+              {n}
+              <input className="input" type="number" step="any" style={{ width: 70 }}
+                value={h.params[n] ?? ''} placeholder={String(params[n]?.default ?? '')}
+                onChange={e => {
+                  const ps = { ...h.params };
+                  if (e.target.value === '') delete ps[n]; else ps[n] = parseFloat(e.target.value);
+                  upd(i, { params: ps });
+                }} />
+            </label>
+          ))}
+          <button className="btn small" onClick={() => onChange(value.filter((_, j) => j !== i))}>削除</button>
+        </div>
+      ))}
+      <button className="btn small" onClick={() => onChange([...value, { label: `未知条件${value.length + 1}`, params: {} }])}>
+        ＋ 未知条件を追加
+      </button>
+    </>
+  );
+}
+
+// ─── 学習ダイアログ ───
+function SimTrainDialog({ algos, onClose, onStarted, showToast }) {
+  const [urls, setUrls] = useState('http://127.0.0.1:18080');
+  const [info, setInfo] = useState(null);
+  const [probeMsg, setProbeMsg] = useState('');
+  const [form, setForm] = useState({
+    name: 'tdmpc2_s0', algo: 'tdmpc2', totalSteps: 100000, seed: 0,
+    evalEvery: '', evalEpisodes: 10, finalEvalEpisodes: 20, latencyBudgetMs: 100,
+    hyper: '', logTransitions: true,
+  });
+  const [randomize, setRandomize] = useState({});
+  const [holdouts, setHoldouts] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const upd = (k, v) => setForm(f => ({ ...f, [k]: v }));
+  const urlList = () => urls.split(/\s+/).map(s => s.trim()).filter(Boolean);
+
+  async function probe() {
+    setProbeMsg('⏳ 接続中...'); setInfo(null);
+    try {
+      const results = [];
+      for (const u of urlList()) {
+        const r = await fetch('/ml/rl/sim/probe', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: u }),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(`${u}: ${d.error || `HTTP ${r.status}`}`);
+        results.push(d);
+      }
+      const first = results[0];
+      const mismatch = results.find(d => JSON.stringify(d.info.stateNames) !== JSON.stringify(first.info.stateNames)
+        || JSON.stringify(d.info.actionNames) !== JSON.stringify(first.info.actionNames));
+      if (mismatch) throw new Error(`${mismatch.url} の状態/行動の定義が ${first.url} と一致しません`);
+      setInfo(first.info);
+      setProbeMsg(`✓ ${results.length} 環境に接続（${first.info.name} · 応答 ${first.latencyMs}ms）`);
+    } catch (e) { setProbeMsg(`✕ ${e.message}`); }
+  }
+
+  function pickAlgo(a) {
+    setForm(f => ({ ...f, algo: a, name: /^(tdmpc2|pets|sac)_s\d+$/.test(f.name) ? `${a}_s${f.seed}` : f.name }));
+  }
+
+  async function start() {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(form.name)) { showToast('モデル名は英数字・ハイフン・アンダースコア', 'error'); return; }
+    if (!info) { showToast('先に「接続確認」をしてください', 'error'); return; }
+    let hyper = {};
+    if (form.hyper.trim()) {
+      try { hyper = JSON.parse(form.hyper); } catch { showToast('詳細設定 (JSON) が読めません', 'error'); return; }
+    }
+    const payload = {
+      name: form.name, algo: form.algo, simUrls: urlList(),
+      totalSteps: form.totalSteps, seed: form.seed,
+      evalEpisodes: form.evalEpisodes, finalEvalEpisodes: form.finalEvalEpisodes,
+      latencyBudgetMs: form.latencyBudgetMs, randomize,
+      holdouts: holdouts.filter(h => Object.keys(h.params).length > 0),
+      hyper, logTransitions: form.logTransitions,
+    };
+    if (form.evalEvery) payload.evalEvery = parseInt(form.evalEvery);
+    setBusy(true);
+    try {
+      const r = await fetch('/ml/rl/sim/train', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      showToast(`学習開始: ${form.name}`, 'success');
+      onStarted(form.name, d.logTable);
+    } catch (e) { showToast(`開始失敗: ${e.message}`, 'error'); }
+    finally { setBusy(false); }
+  }
+
+  const algo = algos.find(a => a.name === form.algo);
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 820 }}>
+        <div className="modal-header">
+          <div className="modal-title">🔌 シミュレータで学習</div>
+          <button className="modal-close" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          <div className="field">
+            <label className="field-label">シミュレータの URL（1行に1つ。複数書くと同時に動かして試行を稼ぎます）</label>
+            <textarea className="input" rows={2} value={urls} onChange={e => { setUrls(e.target.value); setInfo(null); }}
+              style={{ fontFamily: 'var(--font-mono)' }} />
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 6 }}>
+              <button className="btn small" onClick={probe}>🔗 接続確認</button>
+              <span className="field-hint" style={{ margin: 0 }}>{probeMsg}</span>
+            </div>
+          </div>
+
+          {info && (
+            <>
+              <div className="rl-agent-meta" style={{ marginBottom: 10 }}>
+                状態 {info.stateNames.length} 次元: <code>{info.stateNames.join(', ')}</code><br />
+                行動 {info.actionNames.length} 次元: <code>{info.actionNames.join(', ')}</code>
+                {info.dt ? ` · 周期 ${info.dt}s` : ''}{info.maxSteps ? ` · 上限 ${info.maxSteps} ステップ/エピソード` : ''}
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 12 }}>
+                <div className="field"><label className="field-label">方式</label>
+                  <select className="select" value={form.algo} onChange={e => pickAlgo(e.target.value)}>
+                    {algos.map(a => <option key={a.name} value={a.name}>{a.label}</option>)}
+                  </select></div>
+                <div className="field"><label className="field-label">モデル名</label>
+                  <input className="input" value={form.name} onChange={e => upd('name', e.target.value)} /></div>
+                <div className="field"><label className="field-label">試行数（ステップ）</label>
+                  <input className="input" type="number" min="1000" step="1000" value={form.totalSteps}
+                    onChange={e => upd('totalSteps', parseInt(e.target.value) || 100000)} /></div>
+                <div className="field"><label className="field-label">乱数シード</label>
+                  <input className="input" type="number" min="0" value={form.seed}
+                    onChange={e => {
+                      const s = parseInt(e.target.value) || 0;
+                      setForm(f => ({ ...f, seed: s, name: /^(tdmpc2|pets|sac)_s\d+$/.test(f.name) ? `${f.algo}_s${s}` : f.name }));
+                    }} /></div>
+              </div>
+              {algo && <div className="field-hint" style={{ marginTop: -4 }}>{algo.desc}</div>}
+
+              <div className="rl-panel-title" style={{ fontSize: 12, marginTop: 12 }}>学習中に変える物理条件（エピソードごとに範囲から引く）</div>
+              <SimParamRangeEditor params={info.params} value={randomize} onChange={setRandomize} />
+
+              <div className="rl-panel-title" style={{ fontSize: 12, marginTop: 12 }}>未知条件（学習には使わず、最後の評価だけで試す）</div>
+              <SimHoldoutEditor params={info.params} value={holdouts} onChange={setHoldouts} />
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 12, marginTop: 12 }}>
+                <div className="field"><label className="field-label">評価の間隔（空欄=1/10ごと）</label>
+                  <input className="input" type="number" min="100" value={form.evalEvery} onChange={e => upd('evalEvery', e.target.value)} /></div>
+                <div className="field"><label className="field-label">途中評価の本数</label>
+                  <input className="input" type="number" min="1" max="200" value={form.evalEpisodes}
+                    onChange={e => upd('evalEpisodes', parseInt(e.target.value) || 10)} /></div>
+                <div className="field"><label className="field-label">最終評価の本数/条件</label>
+                  <input className="input" type="number" min="1" max="1000" value={form.finalEvalEpisodes}
+                    onChange={e => upd('finalEvalEpisodes', parseInt(e.target.value) || 20)} /></div>
+                <div className="field"><label className="field-label">1手の目標時間 (ms)</label>
+                  <input className="input" type="number" min="1" value={form.latencyBudgetMs}
+                    onChange={e => upd('latencyBudgetMs', parseFloat(e.target.value) || 100)} /></div>
+              </div>
+              <div className="field">
+                <label className="field-label">詳細設定（JSON・任意。例: {'{"horizon": 5, "num_samples": 256}'}）</label>
+                <input className="input" value={form.hyper} onChange={e => upd('hyper', e.target.value)}
+                  style={{ fontFamily: 'var(--font-mono)' }} placeholder='{}' />
+              </div>
+              <label style={{ fontSize: 12, display: 'flex', gap: 6, alignItems: 'center' }}>
+                <input type="checkbox" checked={form.logTransitions} onChange={e => upd('logTransitions', e.target.checked)} />
+                すべての遷移を経験ログ（DuckDB の <code>sim_{form.name.replace(/[^A-Za-z0-9_]/g, '_')}</code>）に保存する
+              </label>
+              <div className="field-hint">
+                方式を比べる時は、<b>試行数・物理条件・未知条件をそろえて</b>方式だけを変えます
+                （評価は方式が違っても同じ乱数・同じ条件で行います）。
+                最初は数千ステップのランダム操作で初期データを集め、そこから学習が始まります。
+              </div>
+            </>
+          )}
+        </div>
+        <div className="modal-footer">
+          <button className="btn" onClick={onClose} disabled={busy}>キャンセル</button>
+          <button className="btn primary" onClick={start} disabled={busy || !info}>▶ 学習を開始</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── 評価ダイアログ (学習済みモデルを、未知条件を足して試し直す) ───
+function SimEvalDialog({ model, onClose, onStarted, showToast }) {
+  const [episodes, setEpisodes] = useState(20);
+  const [holdouts, setHoldouts] = useState(model.holdouts || []);
+  const [busy, setBusy] = useState(false);
+  async function start() {
+    setBusy(true);
+    try {
+      const r = await fetch(`/ml/rl/sim/models/${encodeURIComponent(model.name)}/eval`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ episodes, holdouts: holdouts.filter(h => Object.keys(h.params).length > 0) }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      showToast(`評価開始: ${model.name}`, 'success');
+      onStarted();
+    } catch (e) { showToast(`開始失敗: ${e.message}`, 'error'); }
+    finally { setBusy(false); }
+  }
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 720 }}>
+        <div className="modal-header">
+          <div className="modal-title">🧪 評価: {model.name}</div>
+          <button className="modal-close" onClick={onClose}>×</button>
+        </div>
+        <div className="modal-body">
+          <div className="field-hint" style={{ marginBottom: 10 }}>
+            学習条件と、下の未知条件で {model.algoLabel} を動かし、成功率・危険な終了・1手の計算時間を測ります。
+            シミュレータは学習時と同じ URL（{model.simUrls.join(', ')}）を使います。
+          </div>
+          <div className="field"><label className="field-label">条件ごとのエピソード数</label>
+            <input className="input" type="number" min="1" max="1000" value={episodes} style={{ width: 120 }}
+              onChange={e => setEpisodes(parseInt(e.target.value) || 20)} /></div>
+          <div className="rl-panel-title" style={{ fontSize: 12 }}>未知条件</div>
+          <SimHoldoutEditor params={model.params} value={holdouts} onChange={setHoldouts} />
+        </div>
+        <div className="modal-footer">
+          <button className="btn" onClick={onClose} disabled={busy}>キャンセル</button>
+          <button className="btn primary" onClick={start} disabled={busy}>▶ 評価を開始</button>
         </div>
       </div>
     </div>

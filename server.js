@@ -7,14 +7,14 @@ const fs = require('fs');
 const crypto = require('crypto');
 const os = require('os');
 const { WebSocketServer } = require('ws');
-const { startAgentServer } = require('./agent_proxy');
-const { createLlmPool } = require('./llm_pool');
-const { createOrchestrator, validateWorkflow } = require('./orchestrator');
-const { createGoogleDrive, isVlmImportableMime } = require('./google_drive');
-const { createCloudLlm } = require('./cloud_llm');
-const { createOcrManager, sanitizeSourceName, uniqueName: uniqueUploadName } = require('./ocr');
-const { createHtmlRagManager } = require('./html_rag');
-const { createRagTuneManager } = require('./rag_tune');
+const { startAgentServer } = require('./system/agent/agent_proxy');
+const { createLlmPool } = require('./system/llm/llm_pool');
+const { createOrchestrator, validateWorkflow } = require('./system/agent/orchestrator');
+const { createGoogleDrive, isVlmImportableMime } = require('./system/gdrive/google_drive');
+const { createCloudLlm } = require('./system/llm/cloud_llm');
+const { createOcrManager, sanitizeSourceName, uniqueName: uniqueUploadName } = require('./system/rag/ocr');
+const { createHtmlRagManager } = require('./system/rag/html_rag');
+const { createRagTuneManager } = require('./system/tuning/rag_tune');
 
 // systemd等で起動された際、カレントディレクトリをserver.jsと同じに固定する
 // これにより相対パスでアクセスされるリソース(モデルキャッシュ等)も安定動作する
@@ -3030,9 +3030,11 @@ const RL_JOBS_FILE = path.join(ML_DIR, 'rl_jobs.json'); // RL 学習ジョブ履
 const VJEPA2_CACHE_DIR = path.join(ML_DIR, 'vjepa2_cache');
 // 世界モデル (V-JEPA 2-AC: 行動条件付き predictor)。名前毎にディレクトリ
 const AC_MODELS_DIR = path.join(ML_DIR, 'ac_models');
+// シミュレータ接続学習 (TD-MPC2 / PETS / SAC)。外部シミュレータと HTTP でやり取りする
+const SIM_MODELS_DIR = path.join(ML_DIR, 'sim_models');
 
 // ディレクトリ作成
-for (const d of [TUNING_DIR, TUNING_DATA_DIR, TUNING_RUNS_DIR, TUNING_HF_CACHE_DIR, ML_DIR, ML_MODELS_DIR, RAG_DIR, TORCH_CACHE_DIR, IMAGE_DATASETS_DIR, IMAGE_MODELS_DIR, KEYPOINT_DATASETS_DIR, KEYPOINT_MODELS_DIR, RL_MODELS_DIR, VJEPA2_CACHE_DIR, AC_MODELS_DIR]) {
+for (const d of [TUNING_DIR, TUNING_DATA_DIR, TUNING_RUNS_DIR, TUNING_HF_CACHE_DIR, ML_DIR, ML_MODELS_DIR, RAG_DIR, TORCH_CACHE_DIR, IMAGE_DATASETS_DIR, IMAGE_MODELS_DIR, KEYPOINT_DATASETS_DIR, KEYPOINT_MODELS_DIR, RL_MODELS_DIR, VJEPA2_CACHE_DIR, AC_MODELS_DIR, SIM_MODELS_DIR]) {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 }
 
@@ -3375,7 +3377,7 @@ app.post('/tuning/jobs', requireAuth, jsonParser, async (req, res) => {
 
   // Python実行
   const pythonPath = appConfig.tuning?.pythonPath || appConfig.pythonPath || 'python3';
-  const tuneScript = path.join(__dirname, 'tune_runner.py');
+  const tuneScript = path.join(__dirname, 'system', 'tuning', 'tune_runner.py');
   if (!fs.existsSync(tuneScript)) {
     return res.status(500).json({ error: `tune_runner.py が見つかりません: ${tuneScript}` });
   }
@@ -3636,7 +3638,7 @@ app.post('/tuning/jobs/:id/postprocess', requireAuth, jsonParser, (req, res) => 
   }
 
   function step1Merge() {
-    const mergeScript = path.join(__dirname, 'merge_adapter.py');
+    const mergeScript = path.join(__dirname, 'system', 'tuning', 'merge_adapter.py');
     if (!fs.existsSync(mergeScript)) {
       postLog.end(`ERROR: merge_adapter.py が見つかりません: ${mergeScript}\n`);
       postprocessFailed(jobId, `merge_adapter.py が見つかりません`);
@@ -6603,7 +6605,7 @@ app.post('/ml/jobs/start', requireAuth, requirePermission('ml:write'), jsonParse
   fs.writeFileSync(tmpCfg, JSON.stringify(runConfig, null, 2));
 
   const pythonCmd = appConfig.pythonPath || 'python3';
-  const scriptPath = path.join(__dirname, 'ml_runner.py');
+  const scriptPath = path.join(__dirname, 'system', 'ml', 'ml_runner.py');
   if (!fs.existsSync(scriptPath)) {
     return res.status(500).json({ error: `ml_runner.py が見つかりません: ${scriptPath}` });
   }
@@ -6917,7 +6919,7 @@ function runImageDetect(imageBase64, modelName, threshold, customModelName, opts
     }
 
     const pythonCmd = appConfig.pythonPath || 'python3';
-    const scriptPath = path.join(__dirname, 'image_detect.py');
+    const scriptPath = path.join(__dirname, 'system', 'image', 'image_detect.py');
     if (!fs.existsSync(scriptPath)) {
       try { fs.unlinkSync(tmpPath); } catch {}
       return reject(new Error('image_detect.py が見つかりません'));
@@ -7490,7 +7492,7 @@ app.post('/ml/image/train', requireAuth, requirePermission('ml:write'), jsonPars
   const datasetDir = path.join(IMAGE_DATASETS_DIR, datasetName);
   const outputDir = path.join(IMAGE_MODELS_DIR, modelName);
   const pythonCmd = appConfig.pythonPath || 'python3';
-  const scriptPath = path.join(__dirname, 'image_train.py');
+  const scriptPath = path.join(__dirname, 'system', 'image', 'image_train.py');
   if (!fs.existsSync(scriptPath)) return res.status(500).json({ error: 'image_train.py が見つかりません' });
 
   const jobId = `imgjob_${Date.now()}`;
@@ -7836,7 +7838,7 @@ function runKeypointDetect(imageBase64, threshold, customModelName, opts) {
     const pythonCmd = appConfig.pythonPath || 'python3';
     // 3Dモデルは ResNet回帰スクリプト、それ以外(COCO/2Dカスタム)は Keypoint R-CNN スクリプト
     const scriptName = is3dModel ? 'image_keypoint3d_detect.py' : 'image_keypoint_detect.py';
-    const scriptPath = path.join(__dirname, scriptName);
+    const scriptPath = path.join(__dirname, 'system', 'image', scriptName);
     if (!fs.existsSync(scriptPath)) {
       try { fs.unlinkSync(tmpPath); } catch {}
       return reject(new Error(`${scriptName} が見つかりません`));
@@ -8317,7 +8319,7 @@ app.post('/ml/image/keypoint/train', requireAuth, requirePermission('ml:write'),
     base = (baseModel && KEYPOINT3D_BACKBONE_NAMES.includes(baseModel)) ? baseModel : 'resnet18';
     scriptName = 'image_keypoint3d_train.py';
     argv = [
-      path.join(__dirname, scriptName),
+      path.join(__dirname, 'system', 'image', scriptName),
       '--dataset-dir', datasetDir,
       '--output-dir', outputDir,
       '--backbone', base,
@@ -8331,7 +8333,7 @@ app.post('/ml/image/keypoint/train', requireAuth, requirePermission('ml:write'),
       ? baseModel : 'keypointrcnn_resnet50_fpn';
     scriptName = 'image_keypoint_train.py';
     argv = [
-      path.join(__dirname, scriptName),
+      path.join(__dirname, 'system', 'image', scriptName),
       '--dataset-dir', datasetDir,
       '--output-dir', outputDir,
       '--base-model', base,
@@ -8341,7 +8343,7 @@ app.post('/ml/image/keypoint/train', requireAuth, requirePermission('ml:write'),
       '--cache-dir', TORCH_CACHE_DIR,
     ];
   }
-  const scriptPath = path.join(__dirname, scriptName);
+  const scriptPath = path.join(__dirname, 'system', 'image', scriptName);
   if (!fs.existsSync(scriptPath)) return res.status(500).json({ error: `${scriptName} が見つかりません` });
 
   const jobId = `kpjob_${Date.now()}`;
@@ -8926,7 +8928,7 @@ async function startRlTraining(b, ip) {
     const e = new Error('エージェント名は英数字・ハイフン・アンダースコア (1〜64文字)'); e.status = 400; throw e;
   }
   const algo = RL_ALGOS.some(a => a.name === b.algo) ? b.algo : 'dqn';
-  const scriptPath = path.join(__dirname, 'rl_runner.py');
+  const scriptPath = path.join(__dirname, 'system', 'rl', 'rl_runner.py');
   if (!fs.existsSync(scriptPath)) {
     const e = new Error(`rl_runner.py が見つかりません: ${scriptPath}`); e.status = 500; throw e;
   }
@@ -9182,7 +9184,7 @@ async function ensureRlOnlineWorker() {
   }
   rlOnlineWorker.starting = true;
   try {
-    const scriptPath = path.join(__dirname, 'rl_online_server.py');
+    const scriptPath = path.join(__dirname, 'system', 'rl', 'rl_online_server.py');
     if (!fs.existsSync(scriptPath)) throw new Error('rl_online_server.py が見つかりません');
     const pythonCmd = appConfig.pythonPath || 'python3';
     const { spawn } = require('child_process');
@@ -9287,7 +9289,7 @@ async function ensureVjepa2Worker() {
   }
   vjepa2Worker.starting = true;
   try {
-    const scriptPath = path.join(__dirname, 'vjepa2_server.py');
+    const scriptPath = path.join(__dirname, 'system', 'worldmodel', 'vjepa2_server.py');
     if (!fs.existsSync(scriptPath)) throw new Error('vjepa2_server.py が見つかりません');
     const pythonCmd = appConfig.pythonPath || 'python3';
     const { spawn } = require('child_process');
@@ -9489,7 +9491,7 @@ function runRlEval(name, episodes) {
     if (currentRlJob) return reject(new Error(`学習中のため評価できません: ${currentRlJob.name}`));
     const modelDir = path.join(RL_MODELS_DIR, name);
     if (!fs.existsSync(path.join(modelDir, 'model.pt'))) return reject(new Error('エージェントが学習されていません'));
-    const scriptPath = path.join(__dirname, 'rl_runner.py');
+    const scriptPath = path.join(__dirname, 'system', 'rl', 'rl_runner.py');
     if (!fs.existsSync(scriptPath)) return reject(new Error('rl_runner.py が見つかりません'));
 
     const isDataset = getRlAgentEnv(name) === 'dataset';
@@ -9543,7 +9545,7 @@ function runRlPolicy(name, state) {
     if (!isValidAgentName(name)) return reject(new Error('無効なエージェント名'));
     const modelDir = path.join(RL_MODELS_DIR, name);
     if (!fs.existsSync(path.join(modelDir, 'model.pt'))) return reject(new Error('エージェントが学習されていません'));
-    const scriptPath = path.join(__dirname, 'rl_runner.py');
+    const scriptPath = path.join(__dirname, 'system', 'rl', 'rl_runner.py');
     if (!fs.existsSync(scriptPath)) return reject(new Error('rl_runner.py が見つかりません'));
     const embDim = getRlAgentEmbDim(name);
     const polCfg = path.join(modelDir, `_policy_${Date.now()}.json`);
@@ -10033,7 +10035,7 @@ async function startAcTraining(b, ip) {
     const e = new Error('モデル名は英数字・ハイフン・アンダースコア (1〜64文字)'); e.status = 400; throw e;
   }
   if (!isValidTableName(b.table)) { const e = new Error('無効なテーブル名'); e.status = 400; throw e; }
-  const scriptPath = path.join(__dirname, 'vjepa2_ac_runner.py');
+  const scriptPath = path.join(__dirname, 'system', 'worldmodel', 'vjepa2_ac_runner.py');
   if (!fs.existsSync(scriptPath)) { const e = new Error('vjepa2_ac_runner.py が見つかりません'); e.status = 500; throw e; }
 
   const actionType = b.actionType === 'continuous' ? 'continuous' : 'discrete';
@@ -10213,6 +10215,366 @@ app.post('/ml/rl/ac/models/:name/plan', requireAuth, requirePermission('ml:read'
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// 🔌 シミュレータ接続学習 (TD-MPC2 / PETS / SAC): 外部シミュレータと HTTP でやり取りする
+// ═══════════════════════════════════════════════════════════════════
+// シミュレータ側が HTTP サーバー (GET /info, POST /reset, POST /step) になり、
+// 学習ジョブ (sim_rl_runner.py) がクライアントとして操作を送る。プロトコルは sim_http.py 参照。
+// 学習・評価ジョブは RL 学習と同じスロット (currentRlJob) を使う (GPU を取り合わないため)。
+// DuckDB は学習中に使わない (遷移はファイルに書き、終了後にここで取り込む) ので、
+// DB の一時クローズは不要。
+
+const SIM_ALGOS = [
+  { name: 'tdmpc2', label: 'TD-MPC2 5M', desc: '潜在状態・報酬・価値を予測し、MPPI で操作列を毎周期選び直す (第一候補)' },
+  { name: 'pets', label: 'PETS', desc: '確率的な予測器のアンサンブル + CEM。予測の不確実さを扱う比較対象' },
+  { name: 'sac', label: 'SAC', desc: '世界モデルなし。方策が操作を直接出す。効果と実行速度の基準' },
+];
+const SIM_MAX_URLS = 16;
+
+// シミュレータの URL は「サーバーから接続しに行く先」になるので、既定では
+// localhost と LAN (プライベートアドレス) だけを許す。169.254.x.x (クラウドのメタデータ等) は許さない。
+// 別名のホストを使う場合は config.json の ml.simRl.allowedHosts に書く。
+function isLoopbackOrPrivateHost(host) {
+  const h = host.replace(/^\[|\]$/g, '').toLowerCase();
+  if (h === 'localhost') return true;
+  const v = require('net').isIP(h);
+  if (v === 4) {
+    const [a, b] = h.split('.').map(Number);
+    return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+  }
+  if (v === 6) return h === '::1' || h.startsWith('fc') || h.startsWith('fd');
+  return false;
+}
+function validateSimUrl(raw) {
+  if (typeof raw !== 'string' || raw.length > 300) throw Object.assign(new Error('URL が不正です'), { status: 400 });
+  let u;
+  try { u = new URL(raw.trim()); } catch { throw Object.assign(new Error(`URL が不正です: ${raw}`), { status: 400 }); }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    throw Object.assign(new Error(`http(s) の URL を指定してください: ${raw}`), { status: 400 });
+  }
+  if (u.username || u.password) throw Object.assign(new Error('URL に認証情報は含めないでください'), { status: 400 });
+  const allowed = appConfig.ml?.simRl?.allowedHosts;
+  const host = u.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  const listed = Array.isArray(allowed) && allowed.some(a => String(a).toLowerCase() === host);
+  if (!listed && !isLoopbackOrPrivateHost(u.hostname)) {
+    throw Object.assign(new Error(
+      `接続先 ${u.hostname} は許可されていません (localhost / LAN のアドレスのみ。` +
+      `別のホストは config.json の ml.simRl.allowedHosts に追加してください)`), { status: 400 });
+  }
+  return u.origin + u.pathname.replace(/\/+$/, '');
+}
+function validateSimUrls(list) {
+  const arr = (Array.isArray(list) ? list : [list]).filter(u => typeof u === 'string' && u.trim());
+  if (arr.length === 0) throw Object.assign(new Error('シミュレータの URL を1つ以上指定してください'), { status: 400 });
+  if (arr.length > SIM_MAX_URLS) throw Object.assign(new Error(`URL は ${SIM_MAX_URLS} 個までです`), { status: 400 });
+  return [...new Set(arr.map(validateSimUrl))];
+}
+
+// 物理条件のランダム化範囲 { 名前: [下限, 上限] } / 固定値の検証
+function sanitizeSimRandomize(r) {
+  const out = {};
+  if (!r || typeof r !== 'object') return out;
+  for (const [k, v] of Object.entries(r)) {
+    if (typeof k !== 'string' || k.length > 64) continue;
+    if (Array.isArray(v) && v.length === 2 && v.every(x => typeof x === 'number' && Number.isFinite(x))) out[k] = [v[0], v[1]];
+    else if (typeof v === 'number' && Number.isFinite(v)) out[k] = v;
+  }
+  return out;
+}
+function sanitizeSimHoldouts(list) {
+  if (!Array.isArray(list)) return [];
+  return list.slice(0, 10).map((h, i) => {
+    const params = {};
+    for (const [k, v] of Object.entries(h?.params || {})) {
+      if (typeof k === 'string' && k.length <= 64 && typeof v === 'number' && Number.isFinite(v)) params[k] = v;
+    }
+    return { label: String(h?.label || `未知条件${i + 1}`).slice(0, 40), params };
+  }).filter(h => Object.keys(h.params).length > 0);
+}
+function sanitizeSimHyper(h) {
+  const out = {};
+  if (!h || typeof h !== 'object') return out;
+  for (const [k, v] of Object.entries(h)) {
+    if (/^[a-z_]{1,40}$/.test(k) && typeof v === 'number' && Number.isFinite(v)) out[k] = v;
+  }
+  return out;
+}
+function defaultSimLogTable(name) {
+  return ('sim_' + name.replace(/[^A-Za-z0-9_]/g, '_')).slice(0, 64);
+}
+
+// 経験ログ用テーブルが「このシミュレータ学習の持ち物か」を確かめる。
+// 同名の手作りテーブルを学習のたびに作り直して消してしまわないため。
+function simTableConflict(tableName) {
+  const t = loadMlMeta().tables?.[tableName];
+  return !!(t && t.rl?.source !== 'sim');
+}
+
+// ジョブが書いた transitions/*.ndjson を DuckDB に取り込む。
+// replace=true (学習) なら作り直し、false (評価) なら追記する。
+async function importSimTransitions(modelDir, replace, ip) {
+  const dir = path.join(modelDir, 'transitions');
+  if (!fs.existsSync(dir)) return 0;
+  const files = fs.readdirSync(dir).filter(f => f.endsWith('.ndjson'));
+  if (files.length === 0) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} return 0; }
+  const cfg = JSON.parse(fs.readFileSync(path.join(modelDir, 'config.json'), 'utf-8'));
+  const table = cfg.logTable;
+  if (!isValidTableName(table)) throw new Error(`経験ログのテーブル名が不正です: ${table}`);
+  if (simTableConflict(table)) throw new Error(`テーブル "${table}" はシミュレータ学習以外で使われているため取り込みません`);
+  const TYPES = ['VARCHAR', 'BIGINT', 'DOUBLE', 'BOOLEAN', 'TIMESTAMP'];
+  const cols = Object.entries(cfg.logSchema || {})
+    .filter(([c, t]) => /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(c) && TYPES.includes(t));
+  if (cols.length === 0) throw new Error('経験ログの列定義 (logSchema) がありません');
+  const colSpec = '{' + cols.map(([c, t]) => `'${c}': '${t}'`).join(', ') + '}';
+  const glob = path.join(dir, '*.ndjson').replace(/'/g, "''");
+  const src = `read_json('${glob}', format='newline_delimited', columns=${colSpec})`;
+  const exists = Number((await mlQuery(
+    `SELECT COUNT(*) AS c FROM duckdb_tables() WHERE schema_name = 'main' AND table_name = ?`, [table]))[0].c) > 0;
+  if (replace || !exists) {
+    await mlExec(`CREATE OR REPLACE TABLE "${table}" AS SELECT * FROM ${src}`);
+  } else {
+    await mlExec(`INSERT INTO "${table}" BY NAME SELECT * FROM ${src}`);
+  }
+  const rows = Number((await mlQuery(`SELECT COUNT(*) AS c FROM "${table}"`))[0].c) || 0;
+  const names = cols.map(([c]) => c);
+  saveRlDatasetMeta(table, {
+    source: 'sim', model: cfg.name, sim: cfg.sim?.name || null,
+    actionType: 'continuous',
+    actionColumns: names.filter(c => c.startsWith('a_')),
+    stateColumns: names.filter(c => c.startsWith('s_')).map(c => ({ name: c, type: 'numeric' })),
+    useObservation: false, useReward: true,
+  }, `シミュレータ学習 ${cfg.name} (${cfg.algo}) の経験ログ`);
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  log(ip, `[シミュレータ学習] 経験ログを取り込み: ${table} (${files.length}エピソード, 計${rows}行)`);
+  return rows;
+}
+// 他の学習ジョブが DB を握っている間は取り込めないので、空くまで待って再試行する
+function importSimTransitionsWithRetry(modelDir, replace, ip, attempt = 0) {
+  if (mlDbBusyReason()) {
+    if (attempt < 120) setTimeout(() => importSimTransitionsWithRetry(modelDir, replace, ip, attempt + 1), 30000);
+    else log(ip, `[シミュレータ学習] 経験ログの取り込みを断念 (DB が使用中のまま): ${modelDir}`);
+    return;
+  }
+  importSimTransitions(modelDir, replace, ip)
+    .catch(e => log(ip, `[シミュレータ学習] 経験ログの取り込みに失敗: ${e.message}`));
+}
+
+function spawnSimJob(kind, name, runConfig, ip, onDone) {
+  const scriptPath = path.join(__dirname, 'system', 'sim', 'sim_rl_runner.py');
+  if (!fs.existsSync(scriptPath)) { const e = new Error('sim_rl_runner.py が見つかりません'); e.status = 500; throw e; }
+  const modelDir = path.join(SIM_MODELS_DIR, name);
+  if (!fs.existsSync(modelDir)) fs.mkdirSync(modelDir, { recursive: true });
+  const tmpCfg = path.join(modelDir, `_run_config_${kind}.json`);
+  fs.writeFileSync(tmpCfg, JSON.stringify(runConfig, null, 2));
+  const jobId = `simjob_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const { spawn } = require('child_process');
+  const proc = spawn(appConfig.pythonPath || 'python3', [scriptPath, tmpCfg], {
+    cwd: __dirname, env: rlPythonEnv(), detached: true,
+  });
+  currentRlJob = { jobId, name, env: kind === 'train' ? 'sim' : 'sim-eval', algo: runConfig.algo || null,
+    isDataset: false, proc, log: [], startedAt: Date.now() };
+  const handleData = (d) => {
+    if (!currentRlJob || currentRlJob.jobId !== jobId) return;
+    currentRlJob.log.push(d.toString());
+    if (currentRlJob.log.length > 1000) currentRlJob.log = currentRlJob.log.slice(-800);
+  };
+  proc.stdout.on('data', handleData);
+  proc.stderr.on('data', handleData);
+  proc.on('close', (code) => {
+    try { fs.unlinkSync(tmpCfg); } catch {}
+    const job = currentRlJob && currentRlJob.jobId === jobId ? currentRlJob : null;
+    const fullLog = job ? job.log.join('') : '';
+    const wasCancelled = job && job.cancelled;
+    let result = null;
+    const m = fullLog.match(/RESULT_JSON:(.+)/);
+    if (m) { try { result = JSON.parse(m[1]); } catch {} }
+    const jobs = loadRlJobs();
+    jobs.unshift({
+      jobId, name, env: job ? job.env : 'sim', algo: runConfig.algo || result?.algo || null,
+      status: wasCancelled ? 'cancelled' : ((code === 0 && result?.status === 'completed') ? 'completed' : 'failed'),
+      successRate: result?.successRate ?? null, latencyP99: result?.latencyP99 ?? null,
+      device: result?.device ?? null,
+      error: wasCancelled ? null : (result?.error ?? (code !== 0 ? `exit ${code}` : null)),
+      startedAt: job ? job.startedAt : Date.now(), finishedAt: Date.now(),
+      log: fullLog.slice(-5000),
+    });
+    saveRlJobs(jobs);
+    log('-', `[シミュレータ学習] ${kind === 'train' ? '学習' : '評価'}終了: ${name} (exit ${code})`);
+    if (job) currentRlJob = null;
+    // 中断・失敗でも、書き終えたエピソードは取り込む (途中までの試行も検証材料になる)
+    if (fs.existsSync(path.join(modelDir, 'config.json'))) importSimTransitionsWithRetry(modelDir, kind === 'train', ip);
+    if (onDone) onDone(code, result);
+  });
+  proc.on('error', (err) => {
+    try { fs.unlinkSync(tmpCfg); } catch {}
+    log('-', `[シミュレータ学習] プロセスエラー: ${err.message}`);
+    if (currentRlJob && currentRlJob.jobId === jobId) currentRlJob = null;
+  });
+  return jobId;
+}
+
+// ─── アルゴリズム一覧 ───
+app.get('/ml/rl/sim/algos', requireAuth, requirePermission('ml:read'), (req, res) => {
+  res.json({ algos: SIM_ALGOS, maxUrls: SIM_MAX_URLS });
+});
+
+// ─── 接続確認: シミュレータの /info を取って返す ───
+app.post('/ml/rl/sim/probe', requireAuth, requirePermission('ml:write'), jsonParser, async (req, res) => {
+  try {
+    const url = validateSimUrl(req.body?.url);
+    const t0 = Date.now();
+    const r = await fetch(`${url}/info`, { signal: AbortSignal.timeout(5000) });
+    const text = await r.text();
+    if (!r.ok) return res.status(502).json({ error: `シミュレータが HTTP ${r.status} を返しました: ${text.slice(0, 200)}` });
+    let info;
+    try { info = JSON.parse(text); } catch { return res.status(502).json({ error: '/info の応答が JSON ではありません' }); }
+    if (!Array.isArray(info.stateNames) || !Array.isArray(info.actionNames)) {
+      return res.status(502).json({ error: '/info に stateNames / actionNames (配列) がありません' });
+    }
+    res.json({ ok: true, url, latencyMs: Date.now() - t0, info });
+  } catch (e) {
+    const msg = e.name === 'TimeoutError' ? '5秒以内に応答がありません' : e.message;
+    res.status(e.status || 502).json({ error: `接続できません: ${msg}` });
+  }
+});
+
+// ─── 学習開始 ───
+// body: { name, algo, simUrls[], totalSteps, seed?, seedSteps?, maxSteps?, evalEvery?, evalEpisodes?,
+//         finalEvalEpisodes?, randomize?{名前:[下限,上限]}, holdouts?[{label, params}],
+//         latencyBudgetMs?, updatesPerStep?, hyper?{}, logTransitions?, logTable?, cpu? }
+app.post('/ml/rl/sim/train', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  const ip = getIP(req);
+  try {
+    const b = req.body || {};
+    if (currentRlJob) return res.status(409).json({ error: `既に学習中: ${currentRlJob.name}` });
+    if (!isValidAgentName(b.name)) return res.status(400).json({ error: 'モデル名は英数字・ハイフン・アンダースコア (1〜64文字)' });
+    const algo = SIM_ALGOS.some(a => a.name === b.algo) ? b.algo : 'tdmpc2';
+    const simUrls = validateSimUrls(b.simUrls);
+    const logTable = b.logTable || defaultSimLogTable(b.name);
+    if (!isValidTableName(logTable)) return res.status(400).json({ error: `経験ログのテーブル名が不正です: ${logTable}` });
+    if (simTableConflict(logTable)) {
+      return res.status(409).json({ error: `テーブル "${logTable}" は既に別の用途で使われています (logTable で別名を指定してください)` });
+    }
+    const clampInt = (v, def, lo, hi) => Math.min(Math.max(parseInt(v) || def, lo), hi);
+    const clampNum = (v, def, lo, hi) => Math.min(Math.max(typeof v === 'number' ? v : (parseFloat(v) || def), lo), hi);
+    const totalSteps = clampInt(b.totalSteps, 100000, 1000, 3000000);
+    const outputDir = path.join(SIM_MODELS_DIR, b.name);
+    // 同名で学習し直す時は前のモデル・評価結果を消す (古い評価が混ざらないように)
+    if (fs.existsSync(outputDir)) { try { fs.rmSync(outputDir, { recursive: true, force: true }); } catch {} }
+    const runConfig = {
+      mode: 'train', name: b.name, algo, simUrls, outputDir, logTable,
+      totalSteps,
+      seed: clampInt(b.seed, 0, 0, 2 ** 31 - 1),
+      seedSteps: b.seedSteps ? clampInt(b.seedSteps, 1000, 100, totalSteps) : null,
+      maxSteps: b.maxSteps ? clampInt(b.maxSteps, 1000, 10, 100000) : null,
+      evalEvery: b.evalEvery ? clampInt(b.evalEvery, 10000, 100, totalSteps) : null,
+      evalEpisodes: clampInt(b.evalEpisodes, 10, 1, 200),
+      finalEvalEpisodes: clampInt(b.finalEvalEpisodes, 20, 1, 1000),
+      randomize: sanitizeSimRandomize(b.randomize),
+      holdouts: sanitizeSimHoldouts(b.holdouts),
+      latencyBudgetMs: clampNum(b.latencyBudgetMs, 100, 1, 10000),
+      updatesPerStep: clampNum(b.updatesPerStep, 1, 0.05, 16),
+      hyper: sanitizeSimHyper(b.hyper),
+      logTransitions: b.logTransitions !== false,
+      timeoutSec: clampNum(b.timeoutSec, 30, 1, 600),
+      cpu: !!b.cpu,
+    };
+    const jobId = spawnSimJob('train', b.name, runConfig, ip);
+    log(ip, `[シミュレータ学習] 学習開始: ${b.name} (${algo}, ${simUrls.length}環境, ${totalSteps}ステップ)`);
+    res.json({ ok: true, jobId, logTable });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// ─── 学習済みモデルを評価 (未知条件を足して試す等) ───
+// body: { episodes?, holdouts?[{label, params}], simUrls?[], latencyBudgetMs?, logTransitions? }
+app.post('/ml/rl/sim/models/:name/eval', requireAuth, requirePermission('ml:write'), jsonParser, (req, res) => {
+  const ip = getIP(req);
+  try {
+    const name = req.params.name;
+    if (!isValidAgentName(name)) return res.status(400).json({ error: '無効なモデル名' });
+    const modelDir = path.join(SIM_MODELS_DIR, name);
+    if (!fs.existsSync(path.join(modelDir, 'model.pt'))) return res.status(404).json({ error: 'モデルが見つかりません (先に学習してください)' });
+    if (currentRlJob) return res.status(409).json({ error: `既に実行中: ${currentRlJob.name}` });
+    const b = req.body || {};
+    const runConfig = {
+      mode: 'eval', modelDir,
+      episodes: Math.min(Math.max(parseInt(b.episodes) || 20, 1), 1000),
+      logTransitions: b.logTransitions !== false,
+    };
+    if (b.simUrls) runConfig.simUrls = validateSimUrls(b.simUrls);
+    if (Array.isArray(b.holdouts)) runConfig.holdouts = sanitizeSimHoldouts(b.holdouts);
+    if (typeof b.latencyBudgetMs === 'number') runConfig.latencyBudgetMs = Math.min(Math.max(b.latencyBudgetMs, 1), 10000);
+    const jobId = spawnSimJob('eval', name, runConfig, ip);
+    log(ip, `[シミュレータ学習] 評価開始: ${name} (${runConfig.episodes}本/条件)`);
+    res.json({ ok: true, jobId });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// ─── モデル一覧 (比較表用の要約つき) ───
+app.get('/ml/rl/sim/models', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const models = [];
+  try {
+    for (const name of fs.readdirSync(SIM_MODELS_DIR)) {
+      const dir = path.join(SIM_MODELS_DIR, name);
+      const cfgPath = path.join(dir, 'config.json');
+      if (!fs.existsSync(cfgPath)) continue;
+      try {
+        const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+        let m = {};
+        try { m = JSON.parse(fs.readFileSync(path.join(dir, 'metrics.json'), 'utf-8')); } catch {}
+        const running = !!(currentRlJob && currentRlJob.name === name);
+        const evaluating = running && currentRlJob.env === 'sim-eval';
+        models.push({
+          name, algo: cfg.algo, algoLabel: m.algoLabel || cfg.algo,
+          sim: cfg.sim?.name || null, simUrls: cfg.simUrls || [],
+          stateNames: cfg.sim?.stateNames || [], actionNames: cfg.sim?.actionNames || [],
+          params: cfg.sim?.params || {},
+          seed: cfg.seed, totalSteps: cfg.totalSteps, epLen: cfg.epLen,
+          randomize: cfg.randomize || {}, holdouts: cfg.holdouts || [],
+          latencyBudgetMs: cfg.latencyBudgetMs, logTable: cfg.logTable,
+          hasModel: fs.existsSync(path.join(dir, 'model.pt')),
+          status: evaluating ? 'evaluating' : running ? 'running'
+            : (m.status === 'running' ? 'stopped' : (m.status || 'unknown')),
+          envSteps: m.envSteps ?? null, episodes: m.episodes ?? null, nParams: m.nParams ?? null,
+          device: m.device || null, elapsedSec: m.elapsedSec ?? null,
+          evalHistory: m.evalHistory || [],
+          finalEval: m.finalEval || null,
+          lastEval: Array.isArray(m.evals) && m.evals.length ? m.evals[m.evals.length - 1] : null,
+          trainedAt: cfg.trainedAt,
+        });
+      } catch {}
+    }
+  } catch {}
+  models.sort((a, b) => (b.trainedAt || 0) - (a.trainedAt || 0));
+  res.json({ models });
+});
+
+// ─── 学習曲線などの詳細 ───
+app.get('/ml/rl/sim/models/:name/metrics', requireAuth, requirePermission('ml:read'), (req, res) => {
+  const name = req.params.name;
+  if (!isValidAgentName(name)) return res.status(400).json({ error: '無効なモデル名' });
+  const mp = path.join(SIM_MODELS_DIR, name, 'metrics.json');
+  if (!fs.existsSync(mp)) return res.status(404).json({ error: 'メトリクスが見つかりません' });
+  try { res.json(JSON.parse(fs.readFileSync(mp, 'utf-8'))); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── 削除 (経験ログのテーブルは残す。検証の記録として後から SQL で見られるように) ───
+app.delete('/ml/rl/sim/models/:name', requireAuth, requirePermission('ml:write'), (req, res) => {
+  const name = req.params.name;
+  if (!isValidAgentName(name)) return res.status(400).json({ error: '無効なモデル名' });
+  if (currentRlJob && currentRlJob.name === name) return res.status(409).json({ error: '実行中のモデルは削除できません' });
+  const dir = path.join(SIM_MODELS_DIR, name);
+  if (!fs.existsSync(dir)) return res.status(404).json({ error: 'モデルが見つかりません' });
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+  log(getIP(req), `[シミュレータ学習] 削除: ${name}`);
+  res.json({ ok: true });
+});
+
 // ─── リアルタイム/オンラインRL 外部API (常駐ワーカー経由) ───
 
 // オンラインエージェントの作成: fromAgent でウォームスタート、または spec でゼロから新規
@@ -10367,7 +10729,7 @@ function runMlPredict(modelName, features) {
     if (feats.length > 100) return reject(new Error('features は100件以下にしてください'));
 
     const pythonCmd = appConfig.pythonPath || 'python3';
-    const scriptPath = path.join(__dirname, 'ml_predict.py');
+    const scriptPath = path.join(__dirname, 'system', 'ml', 'ml_predict.py');
     if (!fs.existsSync(scriptPath)) return reject(new Error(`ml_predict.py が見つかりません`));
 
     const { spawn } = require('child_process');

@@ -282,7 +282,10 @@
     },
     "vjepa2Port": 11601,
     "vjepa2IdleMs": 600000,
-    "vjepa2TimeoutMs": 600000
+    "vjepa2TimeoutMs": 600000,
+    "simRl": {
+      "allowedHosts": []
+    }
   },
   "tuning": {
     "pythonPath": "/home/[user]/opengeek-llm-chat/venv-tuning/bin/python",

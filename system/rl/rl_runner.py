@@ -24,7 +24,7 @@ next_state も同じ変換を適用する。視覚埋め込みには scaler を�
 LayerNorm で正規化する (rl_common.build_qnet 参照)。
 
 使い方:
-  python rl_runner.py <config.json>
+  python system/rl/rl_runner.py <config.json>
 
 config.json (mode 別):
   train  : 学習。{ "mode":"train", "name", "tableName", "stateColumns", "actionColumn",
@@ -52,6 +52,12 @@ import traceback
 from pathlib import Path
 
 # 共通モジュール (モデル構築・状態エンコード・損失計算を online ワーカーと共有)
+# 内部システムは system/<機能>/ に分かれている。同じ機能のモジュールに加え、
+# 共通部品 (system/ml, system/worldmodel) も import できるようにする
+_SYSTEM_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_DIR = os.path.dirname(_SYSTEM_DIR)   # リポジトリ直下 (ml/ や public/ の基点)
+for _d in ('ml', 'worldmodel',):
+    sys.path.insert(0, os.path.join(_SYSTEM_DIR, _d))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rl_common import (
     build_qnet,
@@ -61,7 +67,7 @@ from rl_common import (
 )
 
 DEFAULT_VJEPA2_CACHE_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), 'ml', 'vjepa2_cache')
+    REPO_DIR, 'ml', 'vjepa2_cache')
 
 
 def log(msg):

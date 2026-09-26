@@ -2,7 +2,7 @@
  * harness_test.js — エージェントハーネス (harness.js) のスモークテスト
  *
  * 依存パッケージ・LLM 不要 (chat をモックして検証する)。
- * 使い方:  node harness_test.js
+ * 使い方:  node system/agent/harness_test.js
  * 全テストが PASS なら exit 0、失敗があれば exit 1。
  */
 
@@ -327,7 +327,7 @@ async function main() {
   // 通常チャット (index.jsx) が使うクライアント実装が、サーバー側と同じ判定になるか
   section('12. harness_client.js (通常チャットのゲート)');
   {
-    const HC = require('./public/js/harness_client.js');
+    const HC = require('../../public/js/harness_client.js');
 
     // 権限判定のマッピング (サーバー側 decidePermission と同一規則)
     check(HC.decidePermission({ permissionMode: 'plan' }, 'web_search').decision === 'allow', 'plan: 読み取り専用は許可');

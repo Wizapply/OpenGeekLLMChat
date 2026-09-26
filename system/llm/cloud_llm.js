@@ -130,7 +130,7 @@ const DEFAULT_COMPOSE_PROMPT = '以下の「ユーザーの質問」に、「手
   + '## ユーザーの質問\n{question}\n\n## 手元の資料\n{context}\n\n## 一般的な知識（外部AIの回答。一般化した質問「{generalQuestion}」への回答）\n{generalAnswer}';
 
 function createCloudLlm({ getConfig, baseDir, log }) {
-  const usageFile = path.join(baseDir || __dirname, 'cloud_llm_usage.json');
+  const usageFile = path.join(baseDir || path.join(__dirname, '..', '..'), 'cloud_llm_usage.json');
   const _log = typeof log === 'function' ? log : () => {};
 
   // ─── 設定の解決 ───

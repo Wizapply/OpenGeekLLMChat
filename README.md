@@ -630,7 +630,7 @@ config.json から HTTPサーバーや llama-server の細かな設定を調整�
   - **埋め込みはディスクにキャッシュされる** (`ml/vjepa2_cache/`)。エンコードは学習本体より2〜3桁遅いので、ハイパラを変えた再学習は2回目以降すぐ始まる。キャッシュのキーは (モデルID・フレーム数・間隔・プーリング・ファイルの指紋)。
   - 観測パスは **uploads フォルダからの相対パス**で書く (この外を指すパスはサーバ側が拒否)。例: `demos/ep01.mp4`、`demos/ep01/`。
   - プーリングは3種類。`mean` (全トークン平均 / 既定)、`mean_last` (直近フレームのみ・制御向け)、`spatial_mean` (空間だけ潰して**時間軸を残す**。動きの向きや速さが効くタスク向けだが、埋め込み次元とキャッシュがフレーム数に比例して増える)。
-  - 事前にキャッシュを温める / 環境を確認するには `python3 vjepa2_encode.py --probe` および `--table <表> --column <列>`。要 `transformers>=4.52` + 動画デコーダ (`torchcodec` 等、`tune_requirements.txt` 参照)。
+  - 事前にキャッシュを温める / 環境を確認するには `python3 system/worldmodel/vjepa2_encode.py --probe` および `--table <表> --column <列>`。要 `transformers>=4.52` + 動画デコーダ (`torchcodec` 等、`tune_requirements.txt` 参照)。
 - **🤖 Behavior Cloning の拡張 (連続行動・行動チャンキング・検証分割)**: デモの模倣を実用レベルにするためのオプション群。いずれも `algo=bc` のときだけ使えます。
   - **連続行動**: 「行動の種類」で *連続* を選ぶと、行動カラムを**数値の複数列**（関節角・スティック入力など）として Huber 損失で回帰します。列ごとに正規化してから学習するので、スケールの違う列が混ざっていても大丈夫。評価は一致率ではなく **MAE / RMSE**（ログ行動の標準偏差との比も表示）で見ます。
   - **行動チャンキング**: 1つの状態から **K ステップ先までの行動をまとめて予測**します（ACT / π0 系の定番）。1手ずつ予測して誤差が積み上がる BC の弱点が緩和され、動きが滑らかになります。エピソードカラムの指定が必須（境界をまたいだ未来の行動を教師にしないため）。推論は先頭1手だけ実行しても、`actionChunk` の K 手をまとめて実行しても構いません。
@@ -708,6 +708,70 @@ requests.post(f"{BASE}/ml/rl/datasets/record", headers=H, json={
   - オンラインの `📈 学習曲線` = reward/loss EMA のライブ推移 (パネル表示中にサンプリング)、`🔍 方策を評価` = 状態を入力して act(ε=0) の Q値・推奨行動をバーで可視化。
 - **📝 操作ログ**: 評価・act・learn・チェックポイント・削除などの操作結果を、右パネル下部に時系列で常時表示。
 - **自動チェックポイント**: オンラインワーカーは 500ステップ または 60秒ごとに最新の重みを `ml/rl_models/<name>/` (`model.pt` / `config.json` / `metrics.json`) へ自動保存。サーバ再起動後は次回 `act` 時にディスクから自動再ロード。
+
+### 🔌 シミュレータ連携（TD-MPC2 / PETS / SAC を HTTP で接続した外部シミュレータで学習・比較）
+
+「🎮 強化学習」タブの `🔌 シミュレータ連携` サブタブ。外部の物理シミュレータと **HTTP の API** でやり取りし、**状態ベクトル（画像ではない）と連続操作**を前提に、世界モデルを使う方式と使わない方式を**同じ条件**で学習・比較します。🌍 世界モデル（V-JEPA 2-AC）が「カメラ画像から学ぶ」系統なのに対し、こちらは「シミュレータの内部状態を直接使う」系統です。
+
+| 方式 | 仕組み | 位置づけ |
+|---|---|---|
+| **TD-MPC2 5M** | 潜在状態・報酬・価値（Q 5本）・方策を同時に学び、毎周期 MPPI で操作列を試算し直して先頭だけ実行 | 第一候補。公式の単一タスク 5M 構成の既定値（潜在 512 次元 / ホライズン 3 / 操作列 512 本 / 探索 6 回）に合わせてある |
+| **PETS** | 確率的な予測器 5本のアンサンブル + CEM で操作列を探す | 予測の不確実さ（予測のばらつき）を扱う比較対象 |
+| **SAC** | 世界モデルなし。方策が操作を直接出す | 世界モデルの効果と実行速度を測る基準 |
+
+**シミュレータ側が用意するもの（HTTP の受け口 3つ）** — 仕様の詳細は `sim_http.py` の冒頭
+
+| メソッド | 役割 |
+|---|---|
+| `GET /info` | 状態・行動の名前、行動の範囲（`actionLow` / `actionHigh`）、周期 `dt`、エピソード上限 `maxSteps`、**変えられる物理条件 `params`**（既定値・範囲・説明）、報酬の内訳 `rewardTerms`、危険な終了理由 `unsafeReasons` |
+| `POST /reset` | `{"seed", "params"}` でエピソードを始め、最初の `state` を返す |
+| `POST /step` | `{"action": [...]}`（シミュレータの単位）を受けて、`state`・`reward`・`done`（終端）・`truncated`（時間切れ）・`endReason`・`rewardTerms` を返す |
+
+学習ジョブ（`sim_rl_runner.py`）がクライアントになってシミュレータを進めます。TD-MPC2 のようなオンライン学習は「自分で操作して集めたデータ」で学ぶため、ジョブ側が主導する形にしています。**URL を複数渡すと複数のシミュレータを同時に進めて**試行を稼げます（1 URL = 1 環境。操作の計算は順番に、シミュレータの `step` は並列に投げます）。
+
+**まず試す（見本のシミュレータ）**
+
+```bash
+# 油圧の遅れ・レバーの遊び・土の抵抗を持つ 2関節アームの到達タスク (標準ライブラリだけで動く)
+python3 system/sim/sim_dummy_server.py --port 18080 --instances 2   # 18080 と 18081 に 2環境
+```
+
+`/ml.html` → 🎮 強化学習 → 🔌 シミュレータ連携 → 「➕ シミュレータで学習」で URL（`http://127.0.0.1:18080` と `http://127.0.0.1:18081`）を入れて「🔗 接続確認」。`/info` の `params` から物理条件の入力欄が自動で作られます。
+
+**検証の進め方（画面の機能との対応）**
+
+- **接続**: 「🔗 接続確認」で `/info` を取り、状態・行動の定義を確かめる。すべての遷移（状態・操作・報酬の内訳・終了理由・物理条件・乱数シード・シミュレータ時刻）は、状態を観測した時刻にそろえて経験ログ（DuckDB の `sim_<モデル名>`）に保存されます。🎬 経験ログ / 🔍 SQLクエリでそのまま見られ、`source` 列で学習（`train`）と評価（`eval:<条件名>`）を分けられます
+- **学習**: 最初に数千ステップのランダム操作で初期データを集め、状態の正規化を決めてから学習を始めます（TD-MPC2 は公式と同じく、初期データのステップ数だけまとめて事前学習）
+- **比較**: 試行数・物理条件・未知条件をそろえて方式だけを変えて学習すると、右の **📊 方式の比較**に成功率・収益・危険終了・未知条件での低下・1手の計算時間・パラメータ数が並びます。評価は**方式が違っても同じ乱数・同じ物理条件**で行います（探索ノイズなし）
+- **未知条件**: 学習中は「学習中に変える物理条件」の範囲からエピソードごとに条件を引き、「未知条件」は学習に使わず最後の評価だけで試します。**成功率が何ポイント下がったか**を出します（15ポイント以内なら ✓）
+- **実時間**: 評価中の**1手の計算時間（p50 / p95 / p99 / 最大）**を測ります（シミュレータとの通信は含まない）。目標時間（既定 100ms）を p99 が超えると ⚠。超える時は `num_samples` や `iterations` を減らすか、SAC のような直接方策と比べます
+- **再現性**: 乱数シードだけ変えて同じ方式を複数回学習すると、成功率の幅を出します（10ポイント以内なら ✓）
+- **不確実さ**: TD-MPC2 は Q 5本のばらつき、PETS は予測器 5本の次状態のばらつき、SAC は Q 2本の差を、1手ごとに `uncertainty` 列へ記録します（安全監視を作る時の材料）
+
+| エンドポイント | 用途 |
+|---|---|
+| `POST /ml/rl/sim/probe` | 接続確認（`{"url"}` → シミュレータの `/info`） |
+| `POST /ml/rl/sim/train` | 学習開始（`name`, `algo`, `simUrls[]`, `totalSteps`, `seed`, `randomize{}`, `holdouts[]`, `hyper{}` 等） |
+| `POST /ml/rl/sim/models/:name/eval` | 学習済みモデルを評価（`episodes`, `holdouts[]` で未知条件を足せる） |
+| `GET /ml/rl/sim/models` | モデル一覧（比較表用の評価結果つき） |
+| `GET /ml/rl/sim/models/:name/metrics` | 学習曲線・評価の詳細 |
+| `DELETE /ml/rl/sim/models/:name` | モデル削除（経験ログのテーブルは残る） |
+| `GET /ml/rl/train/status` / `POST /ml/rl/train/cancel` | 実行中ジョブのログ / キャンセル（強化学習の学習ジョブと共通） |
+
+```python
+# 学習の最小例: 見本のシミュレータ 2環境で TD-MPC2 を 5万ステップ
+requests.post(f"{BASE}/ml/rl/sim/train", headers=H, json={
+    "name": "tdmpc2_s0", "algo": "tdmpc2", "seed": 0, "totalSteps": 50000,
+    "simUrls": ["http://127.0.0.1:18080", "http://127.0.0.1:18081"],
+    "randomize": {"lag": [0.05, 0.25], "soil_hardness": [0.5, 1.5]},   # 学習中に変える条件
+    "holdouts": [{"label": "硬い土", "params": {"soil_hardness": 2.8}}], # 学習に使わない条件
+})
+```
+
+- **接続先の制限**: シミュレータの URL は「サーバーから接続しに行く先」になるので、既定では **localhost と LAN のプライベートアドレス（10.x / 172.16–31.x / 192.168.x）だけ**を受け付けます。ホスト名で指定したい場合は `config.json` の `ml.simRl.allowedHosts` に書いてください
+- **公式実装との違い**: シミュレータの状態は単位がばらばら（角度・力・位置）なので、初期データの平均/標準偏差で入力を正規化して固定しています（3方式とも同じ正規化）。失敗などで早く終わったエピソードは、終端のあとを吸収状態（終端フラグ=1・報酬 0）で埋めてホライズン分の系列を作ります
+- **ジョブ**: 強化学習の学習ジョブと同じ枠で1つずつ動きます。キャンセルしても、それまでのチェックポイント（既定 2万ステップごと）と書き終えたエピソードの経験ログは残ります
+- 依存は PyTorch と numpy だけです（`tune_requirements.txt` と同じ環境で動きます）。GPU があれば自動で使います
 
 ### 🔧 外部API: ツール対応モード (エージェント機能)
 通常の外部APIは llama-server を直接公開する「素のLLM」モードですが、**ツール対応モード** ではWebチャットと同じツール群を外部プログラムからも使えます。
@@ -1168,7 +1232,7 @@ nssm start OpenGeekLLMChat
 ### 自己署名証明書で試す（Linux/macOS）
 
 ```bash
-./generate-cert.sh localhost 192.168.1.100 your-hostname.local
+./tools/generate-cert.sh localhost 192.168.1.100 your-hostname.local
 npm start
 # → 起動バナーが https:// に変わる
 ```
@@ -1176,8 +1240,8 @@ npm start
 ### 自己署名証明書（Windows）
 
 ```powershell
-# Git Bash で generate-cert.sh を実行（推奨）
-bash generate-cert.sh localhost 192.168.1.100
+# Git Bash で tools/generate-cert.sh を実行（推奨）
+bash tools/generate-cert.sh localhost 192.168.1.100
 
 # または PowerShell で OpenSSL を使用（要OpenSSLインストール）
 openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes `
@@ -1235,42 +1299,65 @@ HTTPS化すると、マイク・音声合成・クリップボード等のブラ
 
 ```
 opengeek-llm-chat/
-├── server.js                   # Express + WebSocket、llama-serverプロセス管理
-├── generate-cert.sh            # 自己署名SSL証明書生成スクリプト
-├── hashpass.py                 # パスワードハッシュ生成ツール
+├── server.js                   # Express + WebSocket、llama-serverプロセス管理 (起動の入口)
+├── tools/                      # 利用者が手で使う道具 (server.js からは呼ばれない)
+│   ├── generate-cert.sh        # 自己署名SSL証明書生成 (cert.pem / key.pem をリポジトリ直下に作る)
+│   └── hashpass.py             # パスワードハッシュ生成 (config.json の password 用)
 ├── config.json                 # 全設定（tuning セクション含む）
 ├── package.json                # express + ws のみ
 ├── opengeek-llm-chat.service   # systemdサービステンプレート
-├── transcribe-server.py        # Gemma4 E2B音声認識サーバー（参考実装・非推奨）
 ├── TRANSCRIBE.md               # 音声認識セットアップガイド（参考）
 ├── cert.pem / key.pem          # SSL証明書（配置時にHTTPSモード起動）
-├── tune_runner.py              # ファインチューニング実行 (TRL SFTTrainer)
-├── merge_adapter.py            # LoRAアダプタをベースモデルにマージ
-├── convert_to_gguf.py          # HF→GGUF変換＆量子化 (llama.cpp呼び出し)
 ├── tune_requirements.txt       # ファインチューニング依存パッケージ
-├── ml_runner.py                # 機械学習(ML)学習実行 (PyTorch MLP/LSTM)
-├── ml_predict.py               # 機械学習(ML)推論実行 (subprocess単発)
-├── ml_common.py                # 機械学習の共通前処理ロジック (学習・推論で共有)
-├── rl_runner.py                # 強化学習(RL)オフライン学習 (DuckDB→PyTorch DQN/DDQN/CQL/BC)
-├── rl_online_server.py         # 強化学習(RL)オンライン常駐ワーカー (act/learn HTTP API)
-├── rl_common.py                # 強化学習の共通ロジック (Qネット構築・状態エンコード・損失計算)
-├── vjepa2_common.py            # V-JEPA 2 凍結エンコーダの共通層 (クリップ読込・プーリング・埋め込みキャッシュ)
-├── vjepa2_encode.py            # V-JEPA 2 埋め込みの事前生成/環境チェック CLI (--probe / --stat)
-├── vjepa2_server.py            # V-JEPA 2 常駐エンコーダ + CEM 計画 (/embed /plan、:11601)
-├── vjepa2_ac_common.py         # 世界モデル(V-JEPA 2-AC)の共通層 (predictor構築・CEM・行動符号化)
-├── vjepa2_ac_runner.py         # 世界モデルの学習・評価・計画 CLI (経験ログ→predictor)
-├── agent_proxy.js              # 外部API用ツール対応モード (OpenAI互換 + エージェントループ)
-├── harness.js                  # エージェントハーネス (Claude型の制御層: 権限モード/フック/System-1規則/リマインダー/コンパクション、依存なし)
-├── harness_test.js             # ハーネスのスモークテスト (node harness_test.js、LLM不要)
-│                               #   ※ ブラウザ側ゲートは public/js/harness_client.js (通常チャット用)
-├── google_drive.js             # Google Drive 連携 (OAuth2/サービスアカウント + Drive API v3、依存なし)
 ├── gdrive_token.json           # Driveのリフレッシュトークン (自動生成・gitignore済み・chmod600)
-├── llm_pool.js                 # マルチLLMワーカープール (複数llama-server同時起動・VRAM自動判定)
 ├── gguf_info.js                # GGUFのVRAM見積り診断ツール (node gguf_info.js で全モデル診断)
-├── orchestrator.js             # マルチLLMオーケストレーション実行エンジン (ワークフローDAG実行)
-├── ocr.js                      # PDF OCR パイプライン (pdftoppm + Vision LLM + ジョブキュー、依存なし)
-├── html_rag.js                 # HTML / RAG登録パイプライン (HtmlRAGクリーニング + Markdown変換、依存なし)
-├── rag_tune.js                 # 永続RAG → 教師データ生成 (パッセージ化 + Q&A生成/検証 + ジョブキュー、依存なし)
+├── system/                     # 内部システム (server.js から呼ばれる部品。機能ごとのフォルダ)
+│   ├── agent/                  # エージェント制御
+│   │   ├── agent_proxy.js      # 外部API用ツール対応モード (OpenAI互換 + エージェントループ)
+│   │   ├── harness.js          # エージェントハーネス (Claude型の制御層: 権限モード/フック/System-1規則/リマインダー/コンパクション、依存なし)
+│   │   ├── harness_test.js     # ハーネスのスモークテスト (node system/agent/harness_test.js、LLM不要)
+│   │   │                       #   ※ ブラウザ側ゲートは public/js/harness_client.js (通常チャット用)
+│   │   └── orchestrator.js     # マルチLLMオーケストレーション実行エンジン (ワークフローDAG実行)
+│   ├── llm/                    # LLM の実行
+│   │   ├── llm_pool.js         # マルチLLMワーカープール (複数llama-server同時起動・VRAM自動判定)
+│   │   └── cloud_llm.js        # 外部LLMフォールバック (各社API → OpenAI互換SSE、依存なし)
+│   ├── rag/                    # 永続RAGへの取り込み
+│   │   ├── ocr.js              # PDF OCR パイプライン (pdftoppm + Vision LLM + ジョブキュー、依存なし)
+│   │   └── html_rag.js         # HTML / RAG登録パイプライン (HtmlRAGクリーニング + Markdown変換、依存なし)
+│   ├── gdrive/
+│   │   └── google_drive.js     # Google Drive 連携 (OAuth2/サービスアカウント + Drive API v3、依存なし)
+│   ├── tuning/                 # ファインチューニング
+│   │   ├── tune_runner.py      # ファインチューニング実行 (TRL SFTTrainer)
+│   │   ├── merge_adapter.py    # LoRAアダプタをベースモデルにマージ
+│   │   ├── convert_to_gguf.py  # HF→GGUF変換＆量子化 (llama.cpp呼び出し)
+│   │   └── rag_tune.js         # 永続RAG → 教師データ生成 (パッセージ化 + Q&A生成/検証 + ジョブキュー、依存なし)
+│   ├── ml/                     # 機械学習 (表データ)
+│   │   ├── ml_runner.py        # 学習実行 (PyTorch MLP/LSTM)
+│   │   ├── ml_predict.py       # 推論実行 (subprocess単発)
+│   │   └── ml_common.py        # 共通前処理ロジック (学習・推論で共有。強化学習・世界モデルからも使う)
+│   ├── image/                  # 画像学習
+│   │   ├── image_train.py / image_detect.py                           # 物体検出 (torchvision)
+│   │   ├── image_keypoint_train.py / image_keypoint_detect.py         # 2Dキーポイント
+│   │   └── image_keypoint3d_train.py / image_keypoint3d_detect.py     # 3Dキーポイント
+│   ├── rl/                     # 強化学習
+│   │   ├── rl_runner.py        # オフライン学習 (DuckDB→PyTorch DQN/DDQN/CQL/BC)
+│   │   ├── rl_online_server.py # オンライン常駐ワーカー (act/learn HTTP API)
+│   │   └── rl_common.py        # 共通ロジック (Qネット構築・状態エンコード・損失計算)
+│   ├── worldmodel/             # 世界モデル (V-JEPA 2 / V-JEPA 2-AC)
+│   │   ├── vjepa2_common.py    # V-JEPA 2 凍結エンコーダの共通層 (クリップ読込・プーリング・埋め込みキャッシュ)
+│   │   ├── vjepa2_encode.py    # 埋め込みの事前生成/環境チェック CLI (--probe / --stat)
+│   │   ├── vjepa2_server.py    # 常駐エンコーダ + CEM 計画 (/embed /plan、:11601)
+│   │   ├── vjepa2_ac_common.py # V-JEPA 2-AC の共通層 (predictor構築・CEM・行動符号化)
+│   │   └── vjepa2_ac_runner.py # V-JEPA 2-AC の学習・評価・計画 CLI (経験ログ→predictor)
+│   ├── sim/                    # シミュレータ連携 (TD-MPC2 / PETS / SAC)
+│   │   ├── sim_http.py         # HTTP プロトコル定義とクライアント (/info /reset /step)
+│   │   ├── sim_rl_common.py    # モデル (TD-MPC2 5M / PETS / SAC)・バッファ・計画器
+│   │   ├── sim_rl_runner.py    # 学習・評価ジョブ (試行→学習→未知条件・計算時間の評価)
+│   │   ├── sim_dummy_server.py # 見本のシミュレータ (油圧遅れ・レバー遊び・土の抵抗つき2関節アーム、標準ライブラリのみ)
+│   │   └── sim_rl_test.py      # スモークテスト (python3 system/sim/sim_rl_test.py)
+│   └── voice/                  # 音声 (別プロセスで起動する補助サーバー)
+│       ├── transcribe-server.py          # Gemma4 E2B音声認識サーバー（参考実装・非推奨）
+│       └── irodori_voicedesign_server.py # Irodori-TTS VoiceDesign の HTTP ラッパー (Irodori-TTS 側に置いて使う)
 ├── public/
 │   ├── index.html              # React SPA（チャットUI）
 │   ├── styles.css              # メインスタイルシート (CSS変数, レイアウト, コンポーネント)
@@ -1650,6 +1737,7 @@ opengeek-llm-chat/
 | `ml.vjepa2.batchSize` | エンコード時のバッチサイズ、デフォルト 4。VRAM が厳しければ下げる |
 | `ml.vjepa2Port` | 常駐エンコーダ (`vjepa2_server.py`) の localhost ポート、デフォルト 11601 |
 | `ml.vjepa2IdleMs` | 常駐エンコーダのアイドル自動停止時間 (ms)、デフォルト 600000 (10分)。0 で停止しない |
+| `ml.simRl.allowedHosts` | 🔌 シミュレータ連携で接続してよいホスト名の追加リスト。既定は localhost と LAN のプライベートアドレスのみ |
 | `ml.vjepa2TimeoutMs` | エンコーダへのリクエストタイムアウト、デフォルト 600000ms (初回はモデルDLを含むため長め) |
 | `ml.vjepa2Device` | 常駐エンコーダのデバイス (`cuda` / `cpu`)。省略時は自動 |
 | `ml.apiTokens[].name` | API トークンの名前 (識別用) |
@@ -1799,7 +1887,7 @@ LLMへの指示文を `config.json` の `systemPrompts` キーで完全カスタ
 
 ```bash
 # MD5ハッシュ生成
-python3 hashpass.py mysecret
+python3 tools/hashpass.py mysecret
 # → "098f6bcd..."
 ```
 
@@ -2652,7 +2740,7 @@ embedding を有効化するには `config.json` の `embeddingModel.path` に G
 
 `command` キーで外部コマンドのフック（stdin に JSON、exit 2 で拒否）も書けますが、任意コマンド実行になるため `allowCommandHooks: true` を明示した時だけ有効です。
 
-このほか、外部データを含むツール結果への `<system-reminder>` 注入（プロンプトインジェクション緩和）、残りターン警告、同一ツール連打を止めるリピートガード、トークン予算超過時の履歴自動圧縮（コンパクション）が働きます。応答 JSON の `x_harness` と `GET /health` で動作状況を確認できます。設計の詳細は [DESIGN.md](./DESIGN.md) の「エージェントハーネス」を、動作確認は `node harness_test.js`（LLM 不要のスモークテスト）を参照してください。
+このほか、外部データを含むツール結果への `<system-reminder>` 注入（プロンプトインジェクション緩和）、残りターン警告、同一ツール連打を止めるリピートガード、トークン予算超過時の履歴自動圧縮（コンパクション）が働きます。応答 JSON の `x_harness` と `GET /health` で動作状況を確認できます。設計の詳細は [DESIGN.md](./DESIGN.md) の「エージェントハーネス」を、動作確認は `node system/agent/harness_test.js`（LLM 不要のスモークテスト）を参照してください。
 
 ### curl での確認
 
@@ -3370,15 +3458,15 @@ sudo systemctl restart opengeek-llm-chat
 
 ### VoiceDesign（テキストで声を指定）をチャットで使う
 
-参照音声を用意せず、**テキストの説明（キャプション）だけで声を作りたい**場合は、Irodori-TTS の **VoiceDesign モデル**（`Aratako/Irodori-TTS-600M-v3-VoiceDesign` 等）を使う。ただし公式 `irodori_openai_tts` は VoiceDesign 非対応なので、本リポジトリ同梱の簡易ラッパー [`irodori_voicedesign_server.py`](./irodori_voicedesign_server.py) を使う（VoiceDesign の `infer.py` をリクエスト毎に呼び、`instructions`/`irodori.caption` を声のキャプションとして渡す。モデルを毎回ロードするため1回あたり数秒〜十数秒かかる簡易方式）。
+参照音声を用意せず、**テキストの説明（キャプション）だけで声を作りたい**場合は、Irodori-TTS の **VoiceDesign モデル**（`Aratako/Irodori-TTS-600M-v3-VoiceDesign` 等）を使う。ただし公式 `irodori_openai_tts` は VoiceDesign 非対応なので、本リポジトリ同梱の簡易ラッパー [`irodori_voicedesign_server.py`](./system/voice/irodori_voicedesign_server.py) を使う（VoiceDesign の `infer.py` をリクエスト毎に呼び、`instructions`/`irodori.caption` を声のキャプションとして渡す。モデルを毎回ロードするため1回あたり数秒〜十数秒かかる簡易方式）。
 
 **セットアップ**
 ```bash
 # 1. Irodori-TTS 本体(core, infer.py を含む)を取得
 cd ~ && git clone https://github.com/Aratako/Irodori-TTS.git
 
-# 2. ラッパーを infer.py と同じ場所へ置く（このリポジトリの irodori_voicedesign_server.py）
-cp /path/OpenGeekLLMChat/irodori_voicedesign_server.py ~/Irodori-TTS/
+# 2. ラッパーを infer.py と同じ場所へ置く（このリポジトリの system/voice/irodori_voicedesign_server.py）
+cp /path/OpenGeekLLMChat/system/voice/irodori_voicedesign_server.py ~/Irodori-TTS/
 
 # 3. 依存入り venv で起動（Irodori-TTS-Server の venv を再利用可。fastapi/uvicorn/soundfile/torch/irodori-tts が必要）
 cd ~/Irodori-TTS

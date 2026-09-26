@@ -308,7 +308,8 @@ function estimateModelVramMB(model) {
 // llama-server は起動時に確保したバッファサイズをログに出すので、
 // 一度ロードできたモデルについてはその実測値を使う（推定より常に正確）。
 
-const MEASURED_FILE = path.join(__dirname, 'vram-measured.json');
+// 実測VRAMはリポジトリ直下に置く (このファイルは system/llm/ にある)
+const MEASURED_FILE = path.join(__dirname, '..', '..', 'vram-measured.json');
 
 /** llama-server の出力から確保サイズ(MiB)を拾う正規表現 */
 const MEASURE_PATTERNS = [

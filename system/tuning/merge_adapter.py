@@ -3,7 +3,7 @@
 merge_adapter.py - LoRAアダプタをベースモデルにマージ
 
 実行:
-    python merge_adapter.py <job_dir>
+    python system/tuning/merge_adapter.py <job_dir>
 
 入力:
     <job_dir>/config.json      - baseModel を読み取る
@@ -25,7 +25,7 @@ def log(msg):
 
 def main():
     if len(sys.argv) < 2:
-        log("使い方: python merge_adapter.py <job_dir>")
+        log("使い方: python system/tuning/merge_adapter.py <job_dir>")
         sys.exit(1)
 
     job_dir = Path(sys.argv[1]).resolve()

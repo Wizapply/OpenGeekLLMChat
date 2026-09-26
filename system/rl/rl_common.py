@@ -12,6 +12,12 @@ import os
 import sys
 
 # 前処理の dtype 判定を ml_runner と共有
+# 内部システムは system/<機能>/ に分かれている。同じ機能のモジュールに加え、
+# 共通部品 (system/ml) も import できるようにする
+_SYSTEM_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_DIR = os.path.dirname(_SYSTEM_DIR)   # リポジトリ直下 (ml/ や public/ の基点)
+for _d in ('ml',):
+    sys.path.insert(0, os.path.join(_SYSTEM_DIR, _d))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ml_common import classify_dtype
 

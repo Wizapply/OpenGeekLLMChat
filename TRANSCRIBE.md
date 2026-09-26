@@ -65,13 +65,13 @@ hf auth login  # 旧: huggingface-cli login (パッケージ更新で hf に統�
 ```bash
 # フォアグラウンド
 source .venv-transcribe/bin/activate
-python3 transcribe-server.py
+python3 system/voice/transcribe-server.py
 
 # ポート変更
-python3 transcribe-server.py 12000
+python3 system/voice/transcribe-server.py 12000
 
 # CPU強制
-TRANSCRIBE_DEVICE=cpu python3 transcribe-server.py
+TRANSCRIBE_DEVICE=cpu python3 system/voice/transcribe-server.py
 ```
 
 初回起動時にモデルがダウンロードされます（約5GB）。起動後は常駐し、VRAMを約9.5GB占有します。
@@ -88,7 +88,7 @@ After=network.target
 Type=simple
 User=$USER
 WorkingDirectory=$(pwd)
-ExecStart=$(pwd)/.venv-transcribe/bin/python3 $(pwd)/transcribe-server.py
+ExecStart=$(pwd)/.venv-transcribe/bin/python3 $(pwd)/system/voice/transcribe-server.py
 Restart=always
 RestartSec=10
 
@@ -152,7 +152,7 @@ torch.cuda.OutOfMemoryError
 → llama-serverが大きなモデルを常駐させている場合があります。以下を試してください:
 - `config.json` に `"llamaServer": { "idleUnloadMs": 600000 }` を設定してアイドル時に自動アンロード
 - より小さいチャットモデルを使う
-- CPUに移行: `TRANSCRIBE_DEVICE=cpu python3 transcribe-server.py`（ただし遅い）
+- CPUに移行: `TRANSCRIBE_DEVICE=cpu python3 system/voice/transcribe-server.py`（ただし遅い）
 
 ### transformersでaudio入力が未対応エラー
 

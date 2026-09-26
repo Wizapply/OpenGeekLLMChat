@@ -12,7 +12,7 @@ localhost HTTP で提供する。狙いは「毎回 1.3GB のモデルを読み�
 Node.js (server.js) から localhost 経由で呼ばれる想定。
 
 使い方:
-    python3 vjepa2_server.py [PORT]
+    python3 system/worldmodel/vjepa2_server.py [PORT]
 デフォルトポート: 11601
 
 環境変数:
@@ -52,7 +52,8 @@ import vjepa2_common as vj
 import vjepa2_ac_common as ac
 
 DEFAULT_PORT = 11601
-_REPO = os.path.dirname(os.path.abspath(__file__))
+# このファイルは system/worldmodel/ にあるので、2つ上がリポジトリ直下
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CACHE_DIR = os.environ.get('VJEPA2_CACHE_DIR', os.path.join(_REPO, 'ml', 'vjepa2_cache'))
 BASE_DIR = os.environ.get('VJEPA2_BASE_DIR', os.path.join(_REPO, 'public', 'uploads'))
 DEVICE = os.environ.get('VJEPA2_DEVICE') or None

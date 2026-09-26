@@ -11,17 +11,17 @@ rl_runner.py は学習時に未キャッシュ分を自動でエンコードす�
 
 使い方:
   # 環境チェック (重みは落とすが1クリップだけ流す)
-  python3 vjepa2_encode.py --probe
+  python3 system/worldmodel/vjepa2_encode.py --probe
 
   # DuckDB のテーブルの列に入っているパスを全部エンコードしてキャッシュ
-  python3 vjepa2_encode.py --db ml/ml.duckdb --table demos \
+  python3 system/worldmodel/vjepa2_encode.py --db ml/ml.duckdb --table demos \
       --column frames --column next_frames --base-dir public/uploads
 
   # パス一覧ファイルからエンコード (1行1パス)
-  python3 vjepa2_encode.py --paths clips.txt --base-dir public/uploads
+  python3 system/worldmodel/vjepa2_encode.py --paths clips.txt --base-dir public/uploads
 
   # キャッシュの状況
-  python3 vjepa2_encode.py --stat
+  python3 system/worldmodel/vjepa2_encode.py --stat
 
 標準出力の最後に RESULT_JSON:<json> 行を出力する (Node.js が結果を拾う)。
 """
@@ -32,10 +32,16 @@ import sys
 import time
 import traceback
 
+# 内部システムは system/<機能>/ に分かれている。同じ機能のモジュールに加え、
+# 共通部品 (system/ml) も import できるようにする
+_SYSTEM_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_DIR = os.path.dirname(_SYSTEM_DIR)   # リポジトリ直下 (ml/ や public/ の基点)
+for _d in ('ml',):
+    sys.path.insert(0, os.path.join(_SYSTEM_DIR, _d))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vjepa2_common as vj
 
-DEFAULT_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ml', 'vjepa2_cache')
+DEFAULT_CACHE_DIR = os.path.join(REPO_DIR, 'ml', 'vjepa2_cache')
 
 
 def log(msg):

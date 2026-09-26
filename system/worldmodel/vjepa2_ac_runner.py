@@ -10,7 +10,7 @@ vjepa2_ac_runner.py — V-JEPA 2-AC (世界モデル) の学習・評価・計�
 「ゴール画像に近づく行動系列」をデモ無しで探索できる (vjepa2_server.py の /plan)。
 
 使い方:
-  python vjepa2_ac_runner.py <config.json>
+  python system/worldmodel/vjepa2_ac_runner.py <config.json>
 
 config.json (mode 別):
   train : { "mode":"train", "name", "tableName", "dbPath", "outputDir",
@@ -44,11 +44,17 @@ import time
 import traceback
 from pathlib import Path
 
+# 内部システムは system/<機能>/ に分かれている。同じ機能のモジュールに加え、
+# 共通部品 (system/ml) も import できるようにする
+_SYSTEM_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_DIR = os.path.dirname(_SYSTEM_DIR)   # リポジトリ直下 (ml/ や public/ の基点)
+for _d in ('ml',):
+    sys.path.insert(0, os.path.join(_SYSTEM_DIR, _d))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vjepa2_ac_common as ac
 import vjepa2_common as vj
 
-DEFAULT_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ml', 'vjepa2_cache')
+DEFAULT_CACHE_DIR = os.path.join(REPO_DIR, 'ml', 'vjepa2_cache')
 
 
 def log(msg):

@@ -11,7 +11,7 @@ Node.js (server.js) から localhost 上の HTTP で呼び出される常駐サ�
 (Flask 不要・DuckDB 不要)。依存は torch + numpy のみ。
 
 使い方:
-    python3 rl_online_server.py [PORT]
+    python3 system/rl/rl_online_server.py [PORT]
 デフォルトポート: 11600
 
 環境変数:
@@ -45,13 +45,19 @@ import threading
 import collections
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# 内部システムは system/<機能>/ に分かれている。同じ機能のモジュールに加え、
+# 共通部品 (system/ml, system/worldmodel) も import できるようにする
+_SYSTEM_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_DIR = os.path.dirname(_SYSTEM_DIR)   # リポジトリ直下 (ml/ や public/ の基点)
+for _d in ('ml', 'worldmodel',):
+    sys.path.insert(0, os.path.join(_SYSTEM_DIR, _d))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rl_common import build_qnet, encode_state_dict, compute_loss
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 11600
 RL_MODELS_DIR = os.environ.get(
     'RL_MODELS_DIR',
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ml', 'rl_models'),
+    os.path.join(REPO_DIR, 'ml', 'rl_models'),
 )
 DEVICE = os.environ.get('RL_ONLINE_DEVICE', 'cpu')
 

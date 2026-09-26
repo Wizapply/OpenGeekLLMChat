@@ -45,20 +45,22 @@
 
 ## 📁 ファイル構成と役割
 
+内部システム（server.js から呼ばれる部品）は `system/<機能>/` に機能ごとに分けて置いています（agent / llm / rag / gdrive / tuning / ml / image / rl / worldmodel / sim / voice）。利用者が手で使う道具は `tools/` にあります。
+
 | ファイル | 役割 | 依存 |
 |:--|:--|:--|
 | `server.js` | メインサーバー（Express+WS、llama-server管理） | `express`, `ws` |
-| `harness.js` | エージェントハーネス（権限モード・フック・System-1規則・リマインダー・コンパクション） | Node標準のみ |
+| `system/agent/harness.js` | エージェントハーネス（権限モード・フック・System-1規則・リマインダー・コンパクション） | Node標準のみ |
 | `public/js/harness_client.js` | ハーネスのブラウザ側ゲート（通常チャット用。harness.js と同じ判定規則） | なし（素のJS） |
-| `harness_test.js` | ハーネスのスモークテスト（`node harness_test.js`、LLM不要。ブラウザ側ゲートも検証） | Node標準のみ |
+| `system/agent/harness_test.js` | ハーネスのスモークテスト（`node system/agent/harness_test.js`、LLM不要。ブラウザ側ゲートも検証） | Node標準のみ |
 | `public/index.html` | React SPA単一ファイル | CDN経由（react, marked, highlight.js, katex, three.js） |
 | `config.json` | 全設定 | - |
-| `hashpass.py` | パスワードハッシュ生成 | Python標準 |
-| `generate-cert.sh` | 自己署名SSL生成 | openssl |
-| `transcribe-server.py` | Gemma4音声認識（参考実装） | transformers, torch |
-| `google_drive.js` | Google Drive 連携（OAuth2/JWT + Drive API v3） | Node標準のみ（`https`, `crypto`） |
-| `ocr.js` | PDF OCR パイプライン（ジョブキュー + Vision LLM + ページキャッシュ） | Node標準のみ + `pdftoppm`/`pdfinfo` |
-| `rag_tune.js` | 永続RAG → 教師データ生成（パッセージ化 + Q&A生成/検証 + ジョブキュー） | Node標準のみ |
+| `tools/hashpass.py` | パスワードハッシュ生成 | Python標準 |
+| `tools/generate-cert.sh` | 自己署名SSL生成 | openssl |
+| `system/voice/transcribe-server.py` | Gemma4音声認識（参考実装） | transformers, torch |
+| `system/gdrive/google_drive.js` | Google Drive 連携（OAuth2/JWT + Drive API v3） | Node標準のみ（`https`, `crypto`） |
+| `system/rag/ocr.js` | PDF OCR パイプライン（ジョブキュー + Vision LLM + ページキャッシュ） | Node標準のみ + `pdftoppm`/`pdfinfo` |
+| `system/tuning/rag_tune.js` | 永続RAG → 教師データ生成（パッセージ化 + Q&A生成/検証 + ジョブキュー） | Node標準のみ |
 | `opengeek-llm-chat.service` | systemdテンプレート | - |
 
 ---
@@ -439,7 +441,7 @@ agent_proxy は `/v1` プロキシ (systemMessageCompat) を経由せず llama-s
 
 ### テスト
 
-`node harness_test.js` で LLM・依存パッケージなしのスモークテストが走る
+`node system/agent/harness_test.js` で LLM・依存パッケージなしのスモークテストが走る
 (chat をモックして権限・フック・ルール・ガード・コンパクションを検証し、
 ブラウザ側ゲート harness_client.js の判定一致も確認する。68項目)。
 
@@ -1555,11 +1557,11 @@ const passphrase = process.env.SSL_PASSPHRASE || appConfig.sslPassphrase;
 if (passphrase) sslOptions.passphrase = passphrase;
 ```
 
-### 自己署名証明書生成 (`generate-cert.sh`)
+### 自己署名証明書生成 (`tools/generate-cert.sh`)
 
 複数ホスト/IP対応:
 ```bash
-./generate-cert.sh localhost 192.168.1.100 my-server.example.com
+./tools/generate-cert.sh localhost 192.168.1.100 my-server.example.com
 ```
 
 SAN (Subject Alternative Name) に全ホストを含めて生成。

@@ -2,14 +2,18 @@
 # OpenGeekLLMChat - 自己署名証明書生成スクリプト
 #
 # 使い方:
-#   ./generate-cert.sh                                            # localhostのみ
-#   ./generate-cert.sh llm.example.com                            # ホスト名1つ
-#   ./generate-cert.sh 192.168.10.201 llm.example.com             # 複数指定（スペース区切り）
-#   ./generate-cert.sh llm.example.com 192.168.10.201 10.0.0.5    # 3つ以上もOK
+#   ./tools/generate-cert.sh                                            # localhostのみ
+#   ./tools/generate-cert.sh llm.example.com                            # ホスト名1つ
+#   ./tools/generate-cert.sh 192.168.10.201 llm.example.com             # 複数指定（スペース区切り）
+#   ./tools/generate-cert.sh llm.example.com 192.168.10.201 10.0.0.5    # 3つ以上もOK
 #
-# cert.pem / key.pem が生成されます。再起動で自動的にHTTPSモードになります。
+# cert.pem / key.pem がリポジトリ直下 (server.js と同じ場所) に生成されます。
+# どこから実行しても同じ場所に出ます。再起動で自動的にHTTPSモードになります。
 
 set -e
+
+# このスクリプトは tools/ にあるので、1つ上がリポジトリ直下
+cd "$(dirname "$0")/.."
 
 DAYS=365
 

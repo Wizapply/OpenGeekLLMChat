@@ -6,7 +6,7 @@ Gemma 4 E2B 音声認識サーバー for OpenGeekLLMChat
 Node.jsサーバーから HTTP POST で呼び出される常駐サーバー。
 
 使い方:
-    python3 transcribe-server.py [PORT]
+    python3 system/voice/transcribe-server.py [PORT]
 
 デフォルトポート: 11500
 

@@ -3,8 +3,8 @@
 OpenGeekLLMChat — パスワードハッシュ生成ツール
 
 使い方:
-  python3 hashpass.py
-  python3 hashpass.py mypassword
+  python3 tools/hashpass.py
+  python3 tools/hashpass.py mypassword
 
 生成されたMD5ハッシュを config.json の "password" に設定してください。
 """

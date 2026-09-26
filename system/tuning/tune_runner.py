@@ -11,7 +11,7 @@ tune_runner.py - LoRA SFT トレーニング実行スクリプト
 - 学習後の自動マージ機能
 
 実行:
-    python tune_runner.py /path/to/job_dir
+    python system/tuning/tune_runner.py /path/to/job_dir
 
 ジョブディレクトリ構成（入力）:
     config.json   - 学習設定
@@ -83,7 +83,7 @@ def to_messages(sample, default_system):
 def main():
     if len(sys.argv) < 2:
         log("ERROR: ジョブディレクトリが指定されていません")
-        log("使い方: python tune_runner.py <job_dir>")
+        log("使い方: python system/tuning/tune_runner.py <job_dir>")
         sys.exit(1)
 
     job_dir = Path(sys.argv[1]).resolve()

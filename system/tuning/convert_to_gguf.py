@@ -13,7 +13,7 @@ llama.cpp の convert_hf_to_gguf.py で GGUF 形式に変換し、
 - llama-quantize バイナリが ~/llama.cpp/build/bin/llama-quantize にある
 
 実行:
-    python convert_to_gguf.py <merged_dir> <out_dir> [--quant Q4_K_M] [--no-quantize]
+    python system/tuning/convert_to_gguf.py <merged_dir> <out_dir> [--quant Q4_K_M] [--no-quantize]
 
 ナレッジ:
 - 小さいモデル（0.5B〜1.5B）はQ8_0またはF16推奨
