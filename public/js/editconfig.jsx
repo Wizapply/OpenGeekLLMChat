@@ -979,7 +979,14 @@ function App() {
           clearInterval(dlPollRef.current);
           dlPollRef.current = null;
           if (data.status === 'done') {
-            setSuccess(`✓ モデル「${data.modelName}」をダウンロードして config.json に登録しました。本体を再起動すると使用できます。`);
+            if (data.mmprojOnly) {
+              // mmproj は補助ファイルなので chatModels には登録していない。
+              // extraArgs に書く値をそのまま案内する
+              setSuccess(`✓ mmproj「${data.fileName}」を保存しました（config.json には登録していません）。`
+                + `使うモデルの extraArgs に ["--mmproj", "${data.savedPath}"] を追加して本体を再起動してください。`);
+            } else {
+              setSuccess(`✓ モデル「${data.modelName}」をダウンロードして config.json に登録しました。本体を再起動すると使用できます。`);
+            }
             setDlUrl(''); setDlName(''); setDlCtx(''); setDlNgl(''); setDlMmproj('');
             await loadConfig();   // エディタに最新のconfig.jsonを反映
             await loadBackups();
@@ -1232,6 +1239,7 @@ function App() {
             )}
             <div className="empty-hint" style={{ marginTop: 8 }}>
               GGUF の「resolve」または「blob」URL に対応。登録後は本体を再起動すると選択できます。
+              mmproj (Vision用) の URL を貼った場合は保存のみで、chatModels には登録しません。
             </div>
           </div>
 

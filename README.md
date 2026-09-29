@@ -2336,7 +2336,7 @@ curl -s http://localhost:3000/cloud-llm/status -b cookie.txt     # 設定状態�
 | `GET` | `/orchestra/pool` | ✓ | LLMワーカープールの状態 |
 | `POST` | `/orchestra/pool/unload` | ✓ | 全ワーカーをアンロード（VRAM解放） |
 | `POST` | `/orchestra/run` | ✓ | ワークフロー実行（SSEでノード単位の進捗を配信） |
-| `GET` | `/tuning/samples` | ✓ | 学習サンプル一覧 |
+| `GET` | `/tuning/samples` | ✓ | 学習サンプル一覧（`?offset=&limit=` で範囲取得。画面は100件ずつ無限スクロールで読む。省略時は全件） |
 | `POST/PUT/DELETE` | `/tuning/samples` | ✓ | サンプル追加/更新/削除 |
 | `POST` | `/tuning/samples/import` | ✓ | CSV/JSONL 一括インポート |
 | `GET` | `/tuning/samples/export` | ✓ | JSONL ダウンロード |
@@ -4068,6 +4068,7 @@ llama_model_load: error loading model: unable to allocate ROCm0 buffer
 
 - **保存先**: 既存モデルと同じディレクトリを自動検出（`chatModels[].path` → `embeddingModel.path` のフォルダ → なければ `models/`）。`.part` 一時ファイルに書き込み、完了時にリネーム
 - **詳細オプション（任意）**: 表示名 / `ctx` / `ngl` / **mmproj URL**（Vision用、`extraArgs` に `--mmproj` で登録）/ **HFトークン**（gated・非公開モデル用。`huggingface.co` 宛のみ送信、CDNには付与しない）
+- **mmproj 単体のダウンロード**: 本体欄に `mmproj-*.gguf` の URL を貼ると**保存のみ**で `chatModels` には登録しない（mmproj は単体では起動できない補助ファイルのため）。完了メッセージに保存先パスが出るので、使うモデルの `extraArgs` に `["--mmproj", "<保存先>"]` を書いて再起動する
 - **安全策**: `huggingface.co` ドメイン・`.gguf` 拡張子のみ許可。HFの `resolve` → CDN署名URL へのリダイレクトを自動追従。書き込み前に config.json を自動バックアップ（最新10件保持）。同名/同パスは上書き
 - **進捗の復帰**: 大容量ダウンロード中にページを再読込しても、進行中ジョブがあれば進捗表示を自動復帰
 - **エンドポイント**: `POST /config/model-download`（開始）/ `GET /config/model-download/status`（進捗ポーリング）

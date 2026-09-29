@@ -1,10 +1,17 @@
 const { useState, useEffect, useRef } = React;
 
+// 学習データ一覧の1回あたりの読み込み件数。数千件を一度に描画すると
+// ブラウザが重くなるので、末尾までスクロールしたら次の PAGE 件を取りに行く
+const SAMPLES_PAGE = 100;
+
 function App() {
   const [authenticated, setAuthenticated] = useState(false);
   const [authRequired, setAuthRequired] = useState(false);
   const [tab, setTab] = useState('samples');
-  const [samples, setSamples] = useState([]);
+  const [samples, setSamples] = useState([]);        // 読み込み済みの先頭 N 件
+  const [sampleTotal, setSampleTotal] = useState(0);  // サーバー上の全件数
+  const [samplesLoading, setSamplesLoading] = useState(false);
+  const samplesRef = useRef([]);                      // 非同期処理から現在の件数を見るため
   const [jobs, setJobs] = useState([]);
   const [currentJobId, setCurrentJobId] = useState(null);
   // 実行中の後処理 (マージ→GGUF→量子化) { jobId, step }
@@ -40,14 +47,43 @@ function App() {
     setTimeout(() => setToast(null), 3000);
   }
 
+  function applySamples(list, total) {
+    samplesRef.current = list;
+    setSamples(list);
+    setSampleTotal(total);
+  }
+
+  // 先頭から読み直す。追加/削除の後に呼ぶ。すでに 300 件表示していたなら
+  // 300 件ぶん取り直して、スクロール位置と表示範囲が変わらないようにする
   async function loadSamples() {
+    const limit = Math.max(SAMPLES_PAGE, samplesRef.current.length);
+    setSamplesLoading(true);
     try {
-      const r = await fetch('/tuning/samples');
+      const r = await fetch(`/tuning/samples?offset=0&limit=${limit}`);
       if (r.ok) {
         const data = await r.json();
-        setSamples(data.samples || []);
+        applySamples(data.samples || [], data.count || 0);
       }
     } catch {}
+    finally { setSamplesLoading(false); }
+  }
+
+  // 末尾に達したら次の PAGE 件を継ぎ足す (無限スクロール)
+  async function loadMoreSamples() {
+    if (samplesLoading) return;
+    const offset = samplesRef.current.length;
+    setSamplesLoading(true);
+    try {
+      const r = await fetch(`/tuning/samples?offset=${offset}&limit=${SAMPLES_PAGE}`);
+      if (r.ok) {
+        const data = await r.json();
+        // 読み込み中に削除等で先頭が変わっていたら二重表示になるので id で重複を除く
+        const seen = new Set(samplesRef.current.map(s => s.id));
+        const add = (data.samples || []).filter(s => !seen.has(s.id));
+        applySamples(samplesRef.current.concat(add), data.count || 0);
+      }
+    } catch {}
+    finally { setSamplesLoading(false); }
   }
 
   async function loadJobs() {
@@ -94,7 +130,7 @@ function App() {
           <div className="section-title">統計</div>
           <div className="stats-card">
             <div className="stats-card-label">学習サンプル</div>
-            <div className="stats-card-value accent">{samples.length}</div>
+            <div className="stats-card-value accent">{sampleTotal}</div>
           </div>
           <div className="stats-card">
             <div className="stats-card-label">ジョブ履歴</div>
@@ -126,7 +162,7 @@ function App() {
         <div className="tab-bar">
           <button className={`tab ${tab === 'samples' ? 'active' : ''}`} onClick={() => setTab('samples')}>
             📚 学習データ
-            {samples.length > 0 && <span className="tab-badge">{samples.length}</span>}
+            {sampleTotal > 0 && <span className="tab-badge">{sampleTotal}</span>}
           </button>
           <button className={`tab ${tab === 'raggen' ? 'active' : ''}`} onClick={() => setTab('raggen')}>
             🧬 RAGから生成
@@ -146,13 +182,15 @@ function App() {
             （条件分岐レンダリングだと React がコンポーネントを unmount するため state が消える）
           */}
           <div style={{ display: tab === 'samples' ? 'block' : 'none' }}>
-            <SamplesView samples={samples} reload={loadSamples} showToast={showToast} />
+            <SamplesView samples={samples} total={sampleTotal} loading={samplesLoading}
+              hasMore={samples.length < sampleTotal} loadMore={loadMoreSamples}
+              reload={loadSamples} showToast={showToast} />
           </div>
           <div style={{ display: tab === 'raggen' ? 'block' : 'none' }}>
             <RagGenView showToast={showToast} reloadSamples={loadSamples} />
           </div>
           <div style={{ display: tab === 'training' ? 'block' : 'none' }}>
-            <TrainingView samples={samples} currentJobId={currentJobId}
+            <TrainingView sampleCount={sampleTotal} currentJobId={currentJobId}
               onStarted={(jid) => { setTab('jobs'); loadJobs(); showToast(`学習ジョブ開始: ${jid}`, 'success'); }}
               showToast={showToast} />
           </div>
@@ -205,10 +243,24 @@ function LoginView({ onSuccess }) {
   );
 }
 
-function SamplesView({ samples, reload, showToast }) {
+function SamplesView({ samples, total, loading, hasMore, loadMore, reload, showToast }) {
   const [showAdd, setShowAdd] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [editing, setEditing] = useState(null);
+  // 一覧末尾の番兵要素。画面に入ったら次のページを読む
+  const sentinelRef = useRef(null);
+  const loadMoreRef = useRef(loadMore);
+  loadMoreRef.current = loadMore;
+
+  useEffect(() => {
+    const el = sentinelRef.current;
+    if (!el || !hasMore || loading) return;
+    const io = new IntersectionObserver((entries) => {
+      if (entries.some(e => e.isIntersecting)) loadMoreRef.current();
+    }, { rootMargin: '400px 0px' });   // 末尾の少し手前で先読みして途切れ感を減らす
+    io.observe(el);
+    return () => io.disconnect();
+  }, [hasMore, loading, samples.length]);
 
   async function handleDelete(id) {
     if (!confirm('このサンプルを削除しますか?')) return;
@@ -217,7 +269,7 @@ function SamplesView({ samples, reload, showToast }) {
   }
 
   async function handleDeleteAll() {
-    if (!confirm(`全 ${samples.length} 件のサンプルを削除しますか?この操作は取り消せません。`)) return;
+    if (!confirm(`全 ${total} 件のサンプルを削除しますか?この操作は取り消せません。`)) return;
     const r = await fetch('/tuning/samples', { method: 'DELETE' });
     if (r.ok) { reload(); showToast('全削除しました', 'success'); }
   }
@@ -234,12 +286,12 @@ function SamplesView({ samples, reload, showToast }) {
       <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
         <button className="btn primary" onClick={() => setShowAdd(true)}>＋ 追加</button>
         <button className="btn" onClick={() => setShowImport(true)}>📥 CSV/JSONL インポート</button>
-        <button className="btn" onClick={handleExport} disabled={samples.length === 0}>📤 JSONL エクスポート</button>
-        <button className="btn danger" onClick={handleDeleteAll} disabled={samples.length === 0}
+        <button className="btn" onClick={handleExport} disabled={total === 0}>📤 JSONL エクスポート</button>
+        <button className="btn danger" onClick={handleDeleteAll} disabled={total === 0}
           style={{ marginLeft: 'auto' }}>🗑 全削除</button>
       </div>
 
-      {samples.length === 0 ? (
+      {total === 0 && !loading ? (
         <div className="empty-state">
           <div className="empty-icon">📝</div>
           <div className="empty-title">学習サンプルがありません</div>
@@ -290,6 +342,16 @@ function SamplesView({ samples, reload, showToast }) {
               )}
             </div>
           ))}
+          {/* 無限スクロール: この要素が見えたら次の100件。IntersectionObserver が
+              効かない環境向けにボタンも置く */}
+          <div ref={sentinelRef} className="field-hint" style={{ textAlign: 'center', padding: '12px 0' }}>
+            {loading ? '読み込み中...'
+              : hasMore ? (
+                <button className="btn" onClick={loadMore}>
+                  さらに読み込む ({samples.length} / {total} 件)
+                </button>
+              ) : `${samples.length} 件すべて表示しています`}
+          </div>
         </div>
       )}
 
@@ -450,7 +512,7 @@ const DEFAULT_PRESETS = [
   { value: 'Qwen/Qwen2.5-7B-Instruct',   size: '7B',   vramLora: '~22GB', desc: '本命・推奨',       epochs: 3, lr: 0.0002, batch: 1, accum: 16, r: 32, alpha: 64, maxLen: 2048 },
 ];
 
-function TrainingView({ samples, currentJobId, onStarted, showToast }) {
+function TrainingView({ sampleCount, currentJobId, onStarted, showToast }) {
   const [presets, setPresets] = useState(DEFAULT_PRESETS);
   const [baseModel, setBaseModel] = useState('');
   const [outputName, setOutputName] = useState('');
@@ -507,9 +569,9 @@ function TrainingView({ samples, currentJobId, onStarted, showToast }) {
 
   async function handleStart() {
     if (currentJobId) { alert('既にジョブが実行中です'); return; }
-    if (samples.length === 0) { alert('学習サンプルを追加してください'); return; }
+    if (sampleCount === 0) { alert('学習サンプルを追加してください'); return; }
     if (!baseModel.trim()) { alert('ベースモデルを指定してください'); return; }
-    if (!confirm(`学習を開始します:\nベースモデル: ${baseModel}\nサンプル数: ${samples.length}\n手法: ${method.toUpperCase()}\nエポック: ${epochs}\n\n時間がかかります。続行しますか?`)) return;
+    if (!confirm(`学習を開始します:\nベースモデル: ${baseModel}\nサンプル数: ${sampleCount}\n手法: ${method.toUpperCase()}\nエポック: ${epochs}\n\n時間がかかります。続行しますか?`)) return;
     setBusy(true);
     try {
       const r = await fetch('/tuning/jobs', {
@@ -638,14 +700,14 @@ function TrainingView({ samples, currentJobId, onStarted, showToast }) {
       </div>
 
       <div className="info-box" style={{ marginTop: 20 }}>
-        <strong>📋 サマリー</strong>: サンプル数 <strong>{samples.length}</strong>
+        <strong>📋 サマリー</strong>: サンプル数 <strong>{sampleCount}</strong>
         / 実効バッチ <strong>{batchSize * gradAccumSteps}</strong> (batch×accum)
-        / 推定ステップ数 <strong>{Math.ceil(samples.length * epochs / (batchSize * gradAccumSteps))}</strong>
+        / 推定ステップ数 <strong>{Math.ceil(sampleCount * epochs / (batchSize * gradAccumSteps))}</strong>
       </div>
 
       <div style={{ marginTop: 20, display: 'flex', gap: 8 }}>
         <button className="btn primary" style={{ padding: '10px 24px', fontSize: 14 }}
-          onClick={handleStart} disabled={busy || currentJobId || samples.length === 0}>
+          onClick={handleStart} disabled={busy || currentJobId || sampleCount === 0}>
           {busy ? '起動中...' : currentJobId ? '⚙️ 別ジョブ実行中' : '🚀 学習開始'}
         </button>
       </div>

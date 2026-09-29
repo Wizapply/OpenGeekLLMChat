@@ -3831,6 +3831,8 @@ UX的に「設定」へのアクセスは目立ちすぎず・隠しすぎず難
    │  3. downloadToFile(): リダイレクト追従 + 進捗コールバック、.part に書いて完了時 rename
    │  4. (任意) mmproj も同様にダウンロード
    │  5. addModelToConfig(): config.json をバックアップ後、chatModels に追記/上書き
+   │     ※ 本体欄のファイル名が mmproj-*.gguf のときは 5 を飛ばす (mmprojOnly)。
+   │       mmproj 単体では llama-server を起動できず、登録すると壊れたエントリになるため
    ▼
 [フロント: 完了検知 → loadConfig() でエディタ更新 → 「本体を再起動」で反映]
 ```

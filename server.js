@@ -3072,10 +3072,27 @@ app.get('/tuning/presets', requireAuth, (req, res) => {
   res.json({ presets });
 });
 
-// 全サンプル取得
+// サンプル一覧取得
+// ?offset=&limit= を付けるとその範囲だけ返す (tuning.html の無限スクロール用。
+// 数千件を一度に返すと JSON もレンダリングも重いので 100 件ずつ取りに来る)。
+// 省略時は従来どおり全件。count は常に全体の件数
 app.get('/tuning/samples', requireAuth, (req, res) => {
-  const samples = loadAllSamples();
-  res.json({ samples, count: samples.length });
+  const all = loadAllSamples();
+  const hasRange = req.query.offset !== undefined || req.query.limit !== undefined;
+  if (!hasRange) {
+    return res.json({ samples: all, count: all.length });
+  }
+  const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+  const limitRaw = parseInt(req.query.limit, 10);
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 1000) : 100;
+  const samples = all.slice(offset, offset + limit);
+  res.json({
+    samples,
+    count: all.length,
+    offset,
+    limit,
+    hasMore: offset + samples.length < all.length,
+  });
 });
 
 // サンプル追加（1件）
@@ -4540,7 +4557,9 @@ app.post('/config/restore', requireAuth, jsonParser, (req, res) => {
 // 進捗は modelDownloadJob にキャッシュし、/config/model-download/status で取得。
 let modelDownloadJob = null;
 // { id, status:'downloading'|'done'|'error', phase, fileName, modelName,
-//   downloadedBytes, totalBytes, percent, error, addedModel, startedAt, finishedAt }
+//   downloadedBytes, totalBytes, percent, error, addedModel, mmprojOnly, savedPath,
+//   startedAt, finishedAt }
+// mmprojOnly: 本体欄に mmproj の URL が貼られたとき true。保存のみで chatModels には登録しない
 
 // 新規モデルの保存先ディレクトリを決定（既存モデルと同じ場所を優先）
 function getModelsDir() {
@@ -4626,6 +4645,12 @@ function downloadToFile(urlStr, destPath, opts, redirectCount) {
   });
 }
 
+// mmproj (Vision プロジェクタ) のファイル名か。llama.cpp 系の配布は
+// "mmproj-<model>-f16.gguf" / "mmproj-F16.gguf" / "<model>.mmproj-f16.gguf" のいずれか
+function isMmprojFileName(fileName) {
+  return /(^|[-_.])mmproj([-_.]|$)/i.test(String(fileName || ''));
+}
+
 // config.json の chatModels にモデルを追記（同名/同パスは上書き）し、バックアップも作成
 function addModelToConfig(info) {
   const raw = fs.readFileSync(CONFIG_FILE, 'utf-8');
@@ -4685,6 +4710,15 @@ app.post('/config/model-download', requireAuth, jsonParser, (req, res) => {
     return res.status(400).json({ error: 'GGUFファイル(.gguf)のURLを指定してください' });
   }
 
+  // 本体欄に mmproj (Vision プロジェクタ) の URL が貼られた場合は「保存のみ」。
+  // mmproj は単体では llama-server を起動できない補助ファイルなので、
+  // chatModels に登録すると壊れたエントリができる。ダウンロードだけ行い、
+  // 使いたいモデルの extraArgs に --mmproj <path> を書いてもらう
+  const mmprojOnly = isMmprojFileName(fileName);
+  if (mmprojOnly && body.mmprojUrl && String(body.mmprojUrl).trim()) {
+    return res.status(400).json({ error: '本体欄に mmproj を指定した場合は、mmproj URL 欄は空にしてください' });
+  }
+
   // mmproj（Vision用、任意）
   let mmprojNorm = null, mmprojFile = null;
   if (body.mmprojUrl && String(body.mmprojUrl).trim()) {
@@ -4714,12 +4748,14 @@ app.post('/config/model-download', requireAuth, jsonParser, (req, res) => {
     percent: 0,
     error: null,
     addedModel: null,
+    mmprojOnly,          // true なら chatModels には登録しない (保存のみ)
+    savedPath: null,     // 保存先フルパス (mmprojOnly のとき extraArgs に書く値)
     startedAt: Date.now(),
     finishedAt: null,
   };
   modelDownloadJob = job;
-  log(ip, `MODEL DOWNLOAD START: ${modelName} <- ${url}`);
-  res.json({ ok: true, jobId: job.id, fileName, modelName, modelsDir });
+  log(ip, `MODEL DOWNLOAD START: ${modelName} <- ${url}${mmprojOnly ? ' (mmproj: 保存のみ)' : ''}`);
+  res.json({ ok: true, jobId: job.id, fileName, modelName, modelsDir, mmprojOnly });
 
   // バックグラウンド実行
   (async () => {
@@ -4730,6 +4766,16 @@ app.post('/config/model-download', requireAuth, jsonParser, (req, res) => {
         job.percent = t ? Math.floor((d / t) * 100) : 0;
       };
       await downloadToFile(url, destPath, { token, onProgress });
+      job.savedPath = destPath;
+
+      if (mmprojOnly) {
+        // 補助ファイルなので config.json には触らない
+        job.status = 'done';
+        job.percent = 100;
+        job.finishedAt = Date.now();
+        log(ip, `MODEL DOWNLOAD DONE: ${fileName} -> ${destPath} (mmproj のため chatModels には登録せず)`);
+        return;
+      }
 
       if (mmprojNorm) {
         job.phase = 'mmproj';
