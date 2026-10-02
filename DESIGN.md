@@ -7009,6 +7009,6 @@ data: {"type":"progress","pageNo":42,"total":258,"done":42,"elapsed":91234,
 | `pdfToImageCmd` / `pdfInfoCmd` | `pdftoppm` / `pdfinfo` | poppler-utils のコマンド |
 | `autoRegisterToRag` | `true` | 完了後に自動でRAG登録 |
 | `keepPdf` | `true` | 完了後も元PDFを残す |
-| `prompt` | (書籍スキャン向け) | 表→Markdownテーブル、数式→LaTeX、図→`[図: 説明]` |
+| `prompt` | (書籍スキャン向け) | 表→Markdownテーブル（GFM パイプ表・全セル転記・結合セルは値を繰り返す）、数式→LaTeX、図→`[図: 説明]` |
 
 ---

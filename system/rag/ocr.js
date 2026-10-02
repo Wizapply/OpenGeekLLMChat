@@ -320,6 +320,139 @@ function receiveMultipartToFile(req, { maxBytes, destPath }) {
   });
 }
 
+// ─── 表の正規化 ──────────────────────────────────────────
+//
+// OCR 結果は .md として保存し、そのまま RAG のチャンクになる。表がパイプ表として
+// 成立していないと、埋め込み検索でセルの値が拾えず「表の中身が読めていない」状態になる。
+// VLM の典型的な崩れ方をここで吸収する:
+//   - <table> タグで返す              → html_rag の変換器でパイプ表にする
+//   - 全角の「｜」で区切る             → 半角に直す
+//   - 見出し行の下の区切り行 (|---|) が無い / 列数が合っていない → 作り直す
+//   - 行ごとにセル数が違う             → 最大列数に合わせて空セルで埋める
+//   - 表の前後に空行が無い             → 入れる (無いと Markdown として表にならない)
+
+/**
+ * VLM の暴走検出。図や写真を表として描こうとして「| | | |」のような同じ行を
+ * 生成上限まで繰り返す個体がある (Qwen2.5-VL で確認)。こうなるとその後の本文・
+ * キャプション・注が全部落ちるので、検出してリトライに回す。
+ * @returns {{ reason: string, index: number } | null} index は暴走が始まる文字位置
+ */
+function detectRunaway(text, minRun = 12) {
+  const lines = String(text || '').split('\n');
+  let runStart = 0, runLen = 0, offset = 0, runOffset = 0;
+  let prev = null;
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (t && t === prev) {
+      runLen++;
+    } else {
+      prev = t; runStart = i; runLen = 1; runOffset = offset;
+    }
+    if (t && runLen >= minRun) {
+      return { reason: `同じ行「${t.slice(0, 40)}」が${runLen}回以上連続`, index: runOffset };
+    }
+    offset += lines[i].length + 1;
+  }
+  return null;
+}
+
+/** HTML の <table> ブロックをパイプ表に変換する (html_rag の変換器を流用) */
+function convertHtmlTables(md) {
+  if (!/<table[\s>]/i.test(md)) return md;
+  let processHtml = null;
+  try { ({ processHtml } = require('./html_rag')); } catch { return md; }
+  return md.replace(/<table[\s>][\s\S]*?<\/table>/gi, (block) => {
+    try {
+      const out = processHtml(block).markdown.trim();
+      return out ? `\n\n${out}\n\n` : block;
+    } catch { return block; }
+  });
+}
+
+/** 1行をセル配列にする (先頭末尾のパイプは捨て、\| はエスケープとして残す) */
+function splitTableRow(line) {
+  let t = line.trim();
+  if (t.startsWith('|')) t = t.slice(1);
+  if (t.endsWith('|') && !t.endsWith('\\|')) t = t.slice(0, -1);
+  return t.split(/(?<!\\)\|/).map(c => c.trim());
+}
+
+/** 表の行らしい行か。数式の |x| を表と誤認しないよう、$ を含む行は先頭がパイプの時だけ認める */
+function looksLikeTableRow(line) {
+  const t = line.trim();
+  if (!t || t.length > 4000) return false;
+  const pipes = (t.match(/(?<!\\)\|/g) || []).length;
+  if (pipes < 2) return false;
+  if (t.startsWith('|')) return true;
+  // 先頭にパイプが無い書き方 (a | b | c) は「空白 | 空白」の区切りが 2 つ以上ある時だけ。
+  // 本文中の |a| と |b| のような絶対値記号を表にしないため
+  return !t.includes('$') && (t.match(/\s\|\s/g) || []).length >= 2;
+}
+
+function isSeparatorRow(cells) {
+  return cells.length > 0 && cells.every(c => /^:?-+:?$/.test(c) || c === '');
+}
+
+/** パイプ表の並びを GFM として成立する形に組み直す */
+function normalizeMarkdownTables(md) {
+  let s = convertHtmlTables(md);
+  const lines = s.split('\n');
+  const out = [];
+  let inFence = false;
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^\s*(```|~~~)/.test(line)) { inFence = !inFence; out.push(line); i++; continue; }
+    if (inFence) { out.push(line); i++; continue; }
+
+    // 全角パイプの表 (日本語 OCR で出やすい) は半角に直してから判定する
+    const fixed = (line.match(/｜/g) || []).length >= 2 ? line.replace(/｜/g, '|') : line;
+    if (!looksLikeTableRow(fixed)) { out.push(line); i++; continue; }
+
+    // 連続する表行をひとかたまりとして集める
+    const block = [];
+    let j = i;
+    while (j < lines.length) {
+      const l = lines[j];
+      const f = (l.match(/｜/g) || []).length >= 2 ? l.replace(/｜/g, '|') : l;
+      if (/^\s*(```|~~~)/.test(f) || !looksLikeTableRow(f)) break;
+      block.push(f);
+      j++;
+    }
+    let rows = block.map(splitTableRow).filter(r => !isSeparatorRow(r));
+    // 全セル空の行は情報が無いので捨てる (図を表として描こうとした残骸に多い)
+    rows = rows.filter(r => r.some(c => c !== ''));
+    // 同じ行が 10 回以上続くのは暴走の名残なので 1 行に畳む
+    const dedup = [];
+    let rep = 0;
+    for (const r of rows) {
+      const last = dedup[dedup.length - 1];
+      if (last && last.join('\u0000') === r.join('\u0000')) { rep++; if (rep >= 10) continue; }
+      else rep = 1;
+      dedup.push(r);
+    }
+    rows = dedup;
+    // 中身が無い表は丸ごと落とす
+    if (rows.length === 0) { i = j; continue; }
+    // 1行だけの「表」は表ではない可能性が高いのでそのまま残す
+    if (rows.length < 2) { for (let k = i; k < j; k++) out.push(lines[k]); i = j; continue; }
+
+    const cols = Math.max(...rows.map(r => r.length));
+    const pad = (r) => { const c = r.slice(); while (c.length < cols) c.push(''); return c; };
+    const render = (r) => `| ${pad(r).join(' | ')} |`;
+    // 表の直前が本文行なら空行を挟む (GFM は段落に続けて書かれた表を表と見なさない)
+    if (out.length && out[out.length - 1].trim() !== '') out.push('');
+    out.push(render(rows[0]));
+    out.push(`|${' --- |'.repeat(cols)}`);
+    for (const r of rows.slice(1)) out.push(render(r));
+    // 表の直後も空行で区切る
+    if (j < lines.length && lines[j].trim() !== '') out.push('');
+    i = j;
+  }
+  // <table> 変換や空行挿入で増えた連続空行は 1 つにまとめる
+  return out.join('\n').replace(/\n{3,}/g, '\n\n');
+}
+
 /**
  * OCR マネージャを作る。
  *
@@ -657,25 +790,36 @@ function createOcrManager({
   }
 
   /** Vision LLM に1ページ投げて Markdown を得る (vlm は acquireVlm() の戻り値) */
-  async function ocrImage(pngPath, ctl, vlm, mime = 'image/png') {
+  async function ocrImage(pngPath, ctl, vlm, mime = 'image/png', { attempt = 0 } = {}) {
     const c = cfg();
     // processJob は未処理ページがある時しか確保しないので、ここに来て null は
     // 呼び出し順の壊れ。TypeError で潰れるより何が起きたか分かる形で落とす
     if (!vlm) throw new Error('Vision LLM が確保されていません (内部エラー)');
     const endpoint = vlm.endpoint;
     const b64 = fs.readFileSync(pngPath).toString('base64');
+    let promptText = c.prompt || '';
     const payload = {
       model: vlm.model,
       messages: [{
         role: 'user',
         content: [
-          { type: 'text', text: c.prompt || '' },
+          { type: 'text', text: promptText },
           { type: 'image_url', image_url: { url: `data:${mime};base64,${b64}` } },
         ],
       }],
       max_tokens: parseInt(c.maxTokens) || 6144,
       temperature: typeof c.temperature === 'number' ? c.temperature : 0.1,
     };
+    if (attempt > 0) {
+      // 暴走 (同じ行の繰り返し) や失敗の後の再試行。図を表にしない指示を足し、
+      // 繰り返しペナルティで同じ行を続けにくくする (llama-server は repeat_penalty、
+      // 他の OpenAI 互換サーバーは frequency_penalty を見る。知らない方は無視される)
+      promptText += '\n\n重要: 図・写真・イラストは表や罫線で描き起こさず [図: 説明] の1行だけにしてください。'
+        + '同じ行を繰り返さないでください。画像に表が無い場合はテーブルを出力しないでください。';
+      payload.messages[0].content[0].text = promptText;
+      payload.frequency_penalty = 0.4;
+      payload.repeat_penalty = 1.15;
+    }
 
     const controller = new AbortController();
     if (ctl) ctl.abort = controller;
@@ -699,7 +843,25 @@ function createOcrManager({
         content = content.map(p => (typeof p === 'string' ? p : (p?.text || ''))).join('');
       }
       if (typeof content !== 'string') throw new Error('Vision LLM のレスポンス形式が不正です');
-      return cleanupMarkdown(content);
+      const finish = data?.choices?.[0]?.finish_reason || '';
+      const runaway = detectRunaway(content);
+      if (runaway) {
+        // 暴走の手前までは正しい本文なので捨てない。リトライで直らなければ
+        // 呼び出し側がこの partial に注意書きを付けて保存する
+        const partial = cleanupMarkdown(content.slice(0, runaway.index));
+        const err = new Error(`出力が暴走しました (${runaway.reason})`);
+        err.runaway = true;
+        err.partial = partial;
+        throw err;
+      }
+      let md = cleanupMarkdown(content);
+      if (finish === 'length') {
+        // 上限に当たったページは末尾が欠けている可能性がある。黙って保存すると
+        // 検索で「書いていない」ように見えるので、ログと本文に印を残す
+        log('-', `[OCR] 生成上限 (ocr.maxTokens=${payload.max_tokens}) に達しました。ページ末尾が欠けている可能性があります`);
+        md += '\n\n[OCR注意: 生成上限に達したため、このページの末尾が欠けている可能性があります]';
+      }
+      return md;
     } catch (e) {
       if (e.name === 'AbortError') {
         throw new Error(ctl && ctl.cancelled ? 'キャンセルされました' : `OCRタイムアウト (${timeoutMs / 1000}秒)`);
@@ -719,6 +881,9 @@ function createOcrManager({
     // 全体が1つのコードフェンスで包まれている場合だけ剥がす (本文中のコードブロックは残す)
     const fence = s.match(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```$/i);
     if (fence) s = fence[1].trim();
+    // 表は RAG で検索できる形 (GFM のパイプ表) に揃える。プロンプトで指示しても
+    // VLM は <table> を返したり、区切り行を落としたり、列数が行ごとに違ったりする
+    s = normalizeMarkdownTables(s);
     return s;
   }
 
@@ -804,12 +969,19 @@ function createOcrManager({
           try {
             // 画像ソースは元ファイルをそのまま VLM に渡す (変換不要・削除もしない)
             const png = isImage ? srcPath : await renderPage(srcPath, page, imgPrefix, ctl);
-            md = await ocrImage(png, ctl, vlm, isImage ? imageSourceMime(job.filename) : 'image/png');
+            md = await ocrImage(png, ctl, vlm, isImage ? imageSourceMime(job.filename) : 'image/png', { attempt });
             if (!isImage) { try { fs.unlinkSync(png); } catch {} }
             break;
           } catch (e) {
             if (ctl.cancelled) throw new Error('__CANCELLED__');
             lastErr = e;
+            if (e.runaway && attempt >= retries) {
+              // リトライしても暴走が止まらない。暴走の手前までの本文は正しいので、
+              // ページ全体を [OCR失敗] にするより残して注意書きを付ける
+              md = `${e.partial || ''}\n\n[OCR注意: このページは途中から出力が崩れたため、以降の本文が欠けています。「🔄 再OCR」でページ指定して引き直してください]`.trim();
+              log('-', `[OCR] p${page} 暴走が収まらないため、崩れる手前までを保存します (${e.message})`);
+              break;
+            }
             if (attempt < retries) {
               log('-', `[OCR] p${page} 失敗 (${e.message})。リトライします`);
               await new Promise(r => setTimeout(r, 1000));
@@ -937,6 +1109,9 @@ function createOcrManager({
     for (let page = 1; page <= job.totalPages; page++) {
       let body = '';
       try { body = fs.readFileSync(path.join(cacheDir, pageCacheName(page)), 'utf-8'); } catch {}
+      // 表の正規化が入る前に引いたページキャッシュにも効かせる (冪等なので二重にかけても崩れない)。
+      // 既存ジョブは「🔄 再OCR」をページ指定なしで押すだけ (VLM を起動せず結合し直す) で反映される
+      body = normalizeMarkdownTables(body);
       const failed = (job.failedPages || []).includes(page);
       parts.push(`\n\n\n---\n<!-- page=${page}${failed ? ' failed=1' : ''} -->\n\n${body.trim()}\n`);
     }
@@ -1441,6 +1616,8 @@ function createOcrManager({
 }
 
 module.exports = {
+  normalizeMarkdownTables,   // テスト用に公開
+  detectRunaway,
   createOcrManager,
   sanitizePdfName,
   sanitizeSourceName,
