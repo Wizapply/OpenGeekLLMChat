@@ -1,6 +1,6 @@
 {
   "name": "opengeek-llm-chat",
-  "version": "2.0.0",
+  "version": "1.1.0",
   "description": "OpenGeekLLMChat - A geek-oriented browser-based chat app for local LLMs (llama.cpp backend) with built-in fine-tuning and machine learning (ML)",
   "main": "server.js",
   "scripts": {
