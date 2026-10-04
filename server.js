@@ -5538,10 +5538,25 @@ app.get('/settings', requireAuth, (req, res) => {
   }
 });
 
+// 保存内容 (フロントが送るグローバル設定):
+//   chatModel    : 前回選択していたチャットモデル名 (起動時の初期モデルにも使う)
+//   orchWorkflow : 前回選択していたマルチLLMワークフローID ('' = 単一モデル)
+//   toggles      : チャット欄トグルの最後の状態 { webSearch, persistentRagCategory, gdrive }
+//                  (新規チャット / トグル未保存チャットの初期値。🌩️外部LLMは課金のため対象外)
+// 既存ファイルにマージして書くので、片方のキーだけ送っても他のキーは消えない
 app.post('/settings', requireAuth, jsonParser, (req, res) => {
   const ip = getIP(req);
   try {
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(req.body, null, 2), 'utf-8');
+    const incoming = (req.body && typeof req.body === 'object' && !Array.isArray(req.body)) ? req.body : {};
+    let current = {};
+    try {
+      if (fs.existsSync(SETTINGS_FILE)) {
+        const parsed = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) current = parsed;
+      }
+    } catch {}   // 壊れた settings.json は今回の内容で作り直す
+    const merged = { ...current, ...incoming };
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(merged, null, 2), 'utf-8');
     log(ip, `SETTINGS SAVE`);
     res.json({ ok: true });
   } catch (e) {

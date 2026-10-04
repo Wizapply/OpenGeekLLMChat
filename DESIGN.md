@@ -726,6 +726,36 @@ log('-', 'Embeddingモデル: 最初のリクエスト時にロード');
 
 優先順位: settings.json (`chatModel`) → config.json (`defaultModel`) → `chatModels[0]`
 
+#### settings.json の内容とチャット欄トグルの保存
+
+`settings.json` はフロントが `POST /settings` で自動保存するグローバル設定（ユーザー単位・チャット横断）。
+サーバー側は既存ファイルにマージして書き込む（送られなかったキーは消えない）。
+
+```json
+{
+  "chatModel": "Gemma4 31B",          // 前回選択モデル（起動時の初期モデルにも使う）
+  "orchWorkflow": "",                 // 前回のマルチLLMワークフローID（'' = 単一モデル）
+  "toggles": {                        // チャット欄トグルの「最後に使った状態」
+    "webSearch": true,                //   🌐 Web検索 ON/OFF
+    "persistentRagCategory": "off",   //   📚 登録資料: 'off' / 'all' / '' (未分類) / カテゴリ名
+    "gdrive": true                    //   Google Drive ツール提供 ON/OFF
+  }
+}
+```
+
+トグル状態は従来から `chats/<id>.json` の `toggles` にチャット単位でも保存している。
+2つの保存先の使い分け:
+
+- **チャット側 (`chats/<id>.json`)**: そのチャットを開き直したときの状態。保存があれば常にこちらが優先
+- **グローバル側 (`settings.json`)**: 新規チャット / トグル未保存の旧チャット / 再読込時の初期値。
+  `useEffect([chatModel, orchWorkflowId, webSearchEnabled, persistentRagCategory, gdriveEnabled])`
+  で 500ms デバウンス保存するので、チャット切替でトグルが変わった場合もその値が「最後の状態」になる
+- `settings.json` に `toggles` が無いときだけ `config.webSearch` / `config.ragEnabledByDefault` の既定値を使う
+  （フロントの `getDefaultToggles()` がこの優先順位を一元化）
+- 🌩️ 外部LLM (`cloudLlm`) は課金が絡むため **グローバル保存の対象外**。新規チャットでは常に OFF
+- 起動シーケンスは「`/settings` 取得 → `toggles` を `savedTogglesRef` に保持 → URL にチャットIDがあれば
+  `loadChat()`」の順に固定し、旧チャットの未保存項目の初期値に前回状態が確実に入るようにしている
+
 `/models` レスポンスに `firstLoadPending: true` を追加し、フロントで「初回ロード待ち」と「アイドル復帰」を区別。
 
 ### モデル自動アンロード（idleUnloadMs）

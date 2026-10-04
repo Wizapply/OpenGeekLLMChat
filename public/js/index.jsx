@@ -2271,6 +2271,26 @@ function App() {
   //   'all' = すべての資料 / '' = 未分類のみ / その他 = カテゴリ名
   const [persistentRagCategory, setPersistentRagCategory] = useState('off');
   const persistentRagEnabled = persistentRagCategory !== 'off';
+  // チャット欄トグル (🌐 Web検索 / 📚 登録資料カテゴリ / Drive) の「最後に使った状態」。
+  // チャットモデルと同じく settings.json (グローバル設定) に保存し、
+  // ブラウザ再読込・サーバー再起動・新規チャットでも前回の状態から始められるようにする。
+  //   null = settings.json に未保存 (初回起動や旧バージョンからの移行) → config の既定値を使う
+  // トグル状態はチャットごと (chats/<id>.json の toggles) にも保存されており、
+  // そちらが有る場合はチャット側が優先される (この値は「保存が無い時の初期値」)。
+  // 🌩️ 外部LLM (課金) は誤課金防止のため対象外で、新規チャットでは常に OFF から始める。
+  const savedTogglesRef = useRef(null);
+  // 新規チャット・トグル未保存チャットの初期トグル値を返す
+  //   優先順位: settings.json の前回状態 → config.json の既定値
+  const getDefaultToggles = (cfg = appConfig) => {
+    const t = savedTogglesRef.current || {};
+    return {
+      webSearch: t.webSearch !== undefined ? !!t.webSearch : (cfg.webSearch !== false),
+      persistentRagCategory: t.persistentRagCategory !== undefined
+        ? String(t.persistentRagCategory)
+        : (cfg.ragEnabledByDefault === true ? 'all' : 'off'),
+      gdrive: t.gdrive !== undefined ? !!t.gdrive : true,
+    };
+  };
   // 選択中カテゴリの範囲に入るドキュメント。ツール定義・判断プロンプト・件数表示は
   // この範囲で数える (カテゴリを絞っているのに全資料名を並べるとモデルが混乱する)
   const ragDocsInScope = (persistentRagCategory === 'all' || persistentRagCategory === 'off')
@@ -8457,13 +8477,15 @@ function App() {
       setDocuments(data.documents || []);
       // チャット欄トグルの復元。保存されていない古いチャットは既定値に戻す
       // (残したままだと直前に開いていたチャットの状態を引き継いでしまう)
+      // 保存が無い項目は settings.json の前回状態 (無ければ config の既定値) に戻す
       const tg = data.toggles || {};
-      setWebSearchEnabled(tg.webSearch !== undefined ? !!tg.webSearch : (appConfig.webSearch !== false));
+      const dflt = getDefaultToggles();
+      setWebSearchEnabled(tg.webSearch !== undefined ? !!tg.webSearch : dflt.webSearch);
       // 永続RAG: 新形式 (カテゴリ) を優先し、旧形式 (ON/OFF) は 'all'/'off' に読み替える
       if (tg.persistentRagCategory !== undefined) setPersistentRagCategory(String(tg.persistentRagCategory));
       else if (tg.persistentRag !== undefined) setPersistentRagCategory(tg.persistentRag ? 'all' : 'off');
-      else setPersistentRagCategory(appConfig.ragEnabledByDefault === true ? 'all' : 'off');
-      setGdriveEnabled(tg.gdrive !== undefined ? !!tg.gdrive : true);
+      else setPersistentRagCategory(dflt.persistentRagCategory);
+      setGdriveEnabled(tg.gdrive !== undefined ? !!tg.gdrive : dflt.gdrive);
       setCloudLlmEnabled(!!tg.cloudLlm);   // 課金が絡むので保存が無ければ OFF
       messagesDirtyRef.current = false;  // ロードしただけでは dirty にしない
     } finally {
@@ -8482,11 +8504,13 @@ function App() {
     setMessages([]);
     setDocuments([]);
     setChatTextFiles([]);  // 送信前のインライン添付も破棄
-    // チャット欄トグルは既定値に戻す (トグル状態はチャットごとに保存されるため、
-    // 新規チャットに前のチャットの状態を引き継がない)
-    setPersistentRagCategory(appConfig.ragEnabledByDefault === true ? 'all' : 'off');
-    setWebSearchEnabled(appConfig.webSearch !== false);
-    setGdriveEnabled(true);
+    // チャット欄トグルは「最後に使った状態」(settings.json) に戻す。
+    // settings.json に保存が無い (初回起動) 場合は config の既定値。
+    // 新規チャットでも前回の 🌐/📚 の使い方をそのまま引き継ぐ (チャットモデルと同じ扱い)
+    const dflt = getDefaultToggles();
+    setPersistentRagCategory(dflt.persistentRagCategory);
+    setWebSearchEnabled(dflt.webSearch);
+    setGdriveEnabled(dflt.gdrive);
     messagesDirtyRef.current = false;  // 新規チャット時もクリア
   }
 
@@ -8550,15 +8574,12 @@ function App() {
       loadPersistentRagInfo(embeddingAvailable);
     });
     // URLに chat ID があればそのチャットを読み込み（失敗したらルートへリダイレクト）
+    // 実際の読み込みは下の settings.json 取得後に行う (トグル未保存のチャットの初期値に
+    // settings.json の前回トグル状態を使うため、順序を固定する)
     const urlId = getChatIdFromUrl();
     if (urlId) {
       // chatLoading=true で表示を待たせる
       setChatLoading(true);
-      loadChat(urlId)
-        .catch(() => {
-          // チャットが存在しない → ルートへリダイレクト（完全リロード）
-          window.location.replace('/');
-        });
     }
     (async () => {
       try {
@@ -8572,10 +8593,29 @@ function App() {
           // 前回マルチLLMワークフローを選んでいたら復元する
           // （存在しないIDだった場合は fetchOrchInfo 側で解除される）
           if (s.orchWorkflow) setOrchWorkflowId(s.orchWorkflow);
+          // チャット欄トグル (🌐 Web検索 / 📚 登録資料 / Drive) の前回状態を復元する。
+          // URL で既存チャットを開いている場合はそのチャットに保存された toggles が
+          // 優先されるので、ここで上書きしない (loadChat 側で未保存項目の初期値として使う)
+          if (s.toggles && typeof s.toggles === 'object') {
+            savedTogglesRef.current = s.toggles;
+            if (!urlId) {
+              const dflt = getDefaultToggles(cfg || appConfig);
+              setWebSearchEnabled(dflt.webSearch);
+              setPersistentRagCategory(dflt.persistentRagCategory);
+              setGdriveEnabled(dflt.gdrive);
+            }
+          }
         } else if (cfg?.defaultModel) {
           setChatModel(cfg.defaultModel);
         }
       } catch {}
+      if (urlId) {
+        loadChat(urlId)
+          .catch(() => {
+            // チャットが存在しない → ルートへリダイレクト（完全リロード）
+            window.location.replace('/');
+          });
+      }
       // 設定読み込み完了後にフラグを立てる（自動保存を有効にする）
       setTimeout(() => { settingsLoadedRef.current = true; }, 1000);
     })();
@@ -8658,19 +8698,29 @@ function App() {
   }, [authenticated, chatId]);
 
   // グローバル設定の自動保存（変更時、設定読み込み完了後のみ）
+  // チャットモデル・ワークフローに加えて、チャット欄トグル (🌐 Web検索 / 📚 登録資料カテゴリ /
+  // Drive) の「最後に使った状態」も保存する。チャットを切り替えてトグルが変わった場合も
+  // その状態が「最後に使った状態」として残る (次の新規チャットの初期値になる)。
+  // 🌩️ 外部LLM (課金) は新規チャットで常に OFF にする方針のため保存しない。
   useEffect(() => {
     if (!settingsLoadedRef.current) return;
+    const toggles = {
+      webSearch: webSearchEnabled,
+      persistentRagCategory,
+      gdrive: gdriveEnabled,
+    };
+    savedTogglesRef.current = toggles;
     const t = setTimeout(async () => {
       try {
         await fetch('/settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chatModel, orchWorkflow: orchWorkflowId }),
+          body: JSON.stringify({ chatModel, orchWorkflow: orchWorkflowId, toggles }),
         });
       } catch {}
     }, 500);
     return () => clearTimeout(t);
-  }, [chatModel, orchWorkflowId]);
+  }, [chatModel, orchWorkflowId, webSearchEnabled, persistentRagCategory, gdriveEnabled]);
 
   // chatModel変更時、llama-serverのチャットモデルをロード（リスタート）
   useEffect(() => {
