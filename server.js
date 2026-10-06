@@ -4305,6 +4305,17 @@ function verifyPassword(input, stored) {
   return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(stored));
 }
 
+// config.json の password に入っている文字列が「ハッシュ済み」かどうか
+// (MD5 = 32文字hex / SHA-256 = 64文字hex。それ以外は平文とみなす)
+function isPasswordHash(value) {
+  return typeof value === 'string' && /^(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{64})$/.test(value);
+}
+
+// 平文パスワード → 保存用ハッシュ (新規に作るものは SHA-256 に統一)
+function hashPassword(plain) {
+  return crypto.createHash('sha256').update(String(plain), 'utf8').digest('hex');
+}
+
 // ─── 認証ミドルウェア ───
 function requireAuth(req, res, next) {
   if (!appConfig.password) return next(); // パスワード未設定なら認証不要
@@ -4479,6 +4490,22 @@ app.post('/config/raw', requireAuth, express.text({ type: '*/*', limit: '5mb' })
     return res.status(400).json({ error: `必須キーが欠落しています: ${missing.join(', ')}` });
   }
 
+  // password の自動ハッシュ化。
+  // editconfig.html のパスワード欄は送信前にハッシュ化するが、JSONテキスト編集で
+  // 平文をそのまま書いた場合や、config.json を手で編集して保存した場合でも
+  // 平文がファイルに残らないよう、ハッシュ形式 (32/64文字hex) 以外は SHA-256 にして保存する。
+  // 空文字は「認証なし」なのでそのまま。
+  let passwordHashed = false;
+  if (typeof parsed.password === 'string' && parsed.password !== '') {
+    if (isPasswordHash(parsed.password)) {
+      // verifyPassword は小文字hexで比較するので大文字で書かれていても揃える
+      parsed.password = parsed.password.toLowerCase();
+    } else {
+      parsed.password = hashPassword(parsed.password);
+      passwordHashed = true;
+    }
+  }
+
   // バックアップ作成
   try {
     const ts = new Date().toISOString().replace(/[:.]/g, '-');
@@ -4500,11 +4527,23 @@ app.post('/config/raw', requireAuth, express.text({ type: '*/*', limit: '5mb' })
     } catch {}
     // pretty-print して保存
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(parsed, null, 2));
-    log(ip, `CONFIG SAVED: backup=${path.basename(backupPath)}`);
-    res.json({ ok: true, backup: path.basename(backupPath) });
+    log(ip, `CONFIG SAVED: backup=${path.basename(backupPath)}${passwordHashed ? ' (password を自動ハッシュ化)' : ''}`);
+    res.json({ ok: true, backup: path.basename(backupPath), passwordHashed });
   } catch (e) {
     res.status(500).json({ error: `保存失敗: ${e.message}` });
   }
+});
+
+// パスワードのハッシュ化 (editconfig.html のパスワード設定UIから呼ばれる)。
+// ブラウザ側の crypto.subtle は HTTPS か localhost でしか使えないため、
+// LAN 内の HTTP 運用でも動くようにサーバーでハッシュ化する。
+// 平文はこのリクエストにしか現れず、ログにも書かない (ログイン時の POST /auth と同じ扱い)。
+app.post('/config/hash-password', requireAuth, jsonParser, (req, res) => {
+  const { password } = req.body || {};
+  if (typeof password !== 'string' || password === '') {
+    return res.status(400).json({ error: 'パスワードが空です' });
+  }
+  res.json({ hash: hashPassword(password), algo: 'sha256' });
 });
 
 // バックアップ一覧

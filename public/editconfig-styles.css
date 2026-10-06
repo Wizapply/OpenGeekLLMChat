@@ -732,6 +732,55 @@ body {
 .tree-json-err { color: var(--red); font-size: 11px; font-family: var(--font-sans); }
 .tree-json-actions { display: flex; gap: 6px; }
 
+/* ── ログインパスワード (config.password) の専用UI ── */
+.tree-row.leaf.password-row { align-items: flex-start; }
+.pw-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  padding: 2px 0;
+}
+.pw-status-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pw-status {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 22px;
+  padding: 0 8px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+.pw-status.hash  { color: var(--green);  background: var(--green-dim); }
+.pw-status.none  { color: var(--text-secondary); background: var(--surface); border: 1px solid var(--border); }
+.pw-status.plain { color: var(--orange); background: var(--orange-dim); white-space: normal; }
+.pw-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-active);
+  border-radius: var(--radius-sm);
+  max-width: 720px;
+}
+.pw-form .pw-input { flex: 1 1 180px; max-width: 260px; color: var(--text-primary); }
+.pw-show {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.pw-msg { flex-basis: 100%; font-family: var(--font-sans); font-size: 11px; line-height: 1.5; }
+.pw-msg.err  { color: var(--red); }
+.pw-msg.note { color: var(--text-muted); }
+.pw-msg.ok   { color: var(--green); max-width: 720px; }
+
 /* ── 構文エラーでツリーが出せない時 ── */
 .tree-broken {
   max-width: 620px;

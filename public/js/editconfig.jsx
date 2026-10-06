@@ -932,8 +932,16 @@ function App() {
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || '保存失敗');
       setOriginal(content);
-      setSuccess(`保存しました（バックアップ: ${data.backup}）。設定変更は本体再起動後に反映されます。`);
-      setTimeout(() => setSuccess(''), 8000);
+      if (data.passwordHashed) {
+        // 平文の password をサーバーがハッシュ化して保存した → 保存結果を読み直して
+        // エディタ上の平文をハッシュに置き換える (平文を画面に残さない)
+        await loadConfig();
+        setSuccess(`保存しました（バックアップ: ${data.backup}）。password は平文だったため SHA-256 ハッシュに変換して保存しました。設定変更は本体再起動後に反映されます。`);
+        setTimeout(() => setSuccess(''), 12000);
+      } else {
+        setSuccess(`保存しました（バックアップ: ${data.backup}）。設定変更は本体再起動後に反映されます。`);
+        setTimeout(() => setSuccess(''), 8000);
+      }
       loadBackups();
     } catch (e) {
       setError(e.message);
@@ -1136,6 +1144,7 @@ function App() {
           <a className="nav-link" href="/">💬 チャット</a>
           <a className="nav-link" href="/tuning.html">🧠 ファインチューニング</a>
           <a className="nav-link" href="/ml.html">🤖 機械学習</a>
+          <a className="nav-link" href="/rag.html">📚 永続RAG(OCR、HTML登録)</a>
         </div>
         <div className="sidebar-section">
           <div className="section-title">ファイル</div>
@@ -1552,7 +1561,7 @@ const CONFIG_HINTS = {
   'welcomeHints': '新規チャットに並ぶ質問例',
   'accentColor': 'テーマカラー（HEX）',
   'defaultModel': '初期選択モデル名（chatModels[].name、空なら先頭）',
-  'password': 'ログインパスワードのMD5/SHA-256ハッシュ（空で認証なし）',
+  'password': 'ログインパスワード（ハッシュで保存。「変更」から平文を入力すると自動でハッシュ化。空で認証なし）',
   'pythonPath': 'Python実行コマンド（venvのパス推奨）',
   'logLevel': 'normal / quiet（quietでllama-serverのログを抑制）',
   'llamaCppDir': 'llama.cpp のディレクトリ（GGUF変換等で使用）',
@@ -2112,20 +2121,145 @@ function TreeNode({ ctx, path, label, value, depth, parentType, index, siblingCo
   }
 
   // ─── リーフ（文字列 / 数値 / 真偽 / null） ───
+  // トップレベルの password だけは専用UI (平文入力 → 自動ハッシュ化)。
+  // ハッシュ文字列を直接編集させても意味がなく、平文を書かれると困るため。
+  const isPasswordKey = path.length === 1 && path[0] === 'password' && (type === 'string' || type === 'null');
   return (
     <div className="tree-node">
-      <div className="tree-row leaf" style={indent}>
+      <div className={`tree-row leaf ${isPasswordKey ? 'password-row' : ''}`} style={indent}>
         <span className="tree-toggle" />
         {keyLabel}
         {label !== null && <span className="tree-colon">:</span>}
-        <LeafEditor
-          value={value}
-          type={type}
-          onCommit={v => ctx.update(path, v)}
-        />
-        {hint && <span className="tree-hint">{hint}</span>}
+        {isPasswordKey ? (
+          <PasswordEditor
+            value={typeof value === 'string' ? value : ''}
+            onCommit={v => ctx.update(path, v)}
+          />
+        ) : (
+          <LeafEditor
+            value={value}
+            type={type}
+            onCommit={v => ctx.update(path, v)}
+          />
+        )}
+        {hint && !isPasswordKey && <span className="tree-hint">{hint}</span>}
         {actions}
       </div>
+    </div>
+  );
+}
+
+// ─── ログインパスワードの設定UI（config.password 専用） ───
+// 値はハッシュ (MD5 32文字 / SHA-256 64文字 hex) のまま表示せず、状態だけ見せる。
+// 「変更」で平文を2回入力 → サーバー (POST /config/hash-password) で SHA-256 にして
+// ツリーの値に入れる。ファイルへの反映は通常どおり「💾 保存」→ 本体再起動。
+// (ブラウザの crypto.subtle は HTTP の LAN 運用では使えないため、サーバー側でハッシュ化する)
+function passwordState(value) {
+  if (!value) return { kind: 'none', label: '未設定（認証なし）' };
+  if (/^[0-9a-fA-F]{64}$/.test(value)) return { kind: 'hash', label: '設定済み（SHA-256）' };
+  if (/^[0-9a-fA-F]{32}$/.test(value)) return { kind: 'hash', label: '設定済み（MD5）' };
+  return { kind: 'plain', label: '⚠ 平文のまま（保存時に自動でSHA-256ハッシュ化されます）' };
+}
+
+function PasswordEditor({ value, onCommit }) {
+  const [editing, setEditing] = useState(false);
+  const [pw1, setPw1] = useState('');
+  const [pw2, setPw2] = useState('');
+  const [show, setShow] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [done, setDone] = useState('');
+
+  const st = passwordState(value);
+
+  // 値が外から変わったら (読み込み・破棄・復元) 編集フォームを閉じる
+  useEffect(() => { setEditing(false); setPw1(''); setPw2(''); setErr(''); }, [value]);
+
+  function openEditor() {
+    setEditing(true); setPw1(''); setPw2(''); setErr(''); setDone(''); setShow(false);
+  }
+  function cancel() {
+    setEditing(false); setPw1(''); setPw2(''); setErr('');
+  }
+
+  async function apply() {
+    setErr('');
+    if (!pw1) { setErr('パスワードを入力してください'); return; }
+    if (pw1 !== pw2) { setErr('確認用のパスワードが一致しません'); return; }
+    setBusy(true);
+    try {
+      const r = await fetch('/config/hash-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: pw1 }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok || !data.hash) throw new Error(data.error || `ハッシュ化に失敗しました (${r.status})`);
+      onCommit(data.hash);
+      setEditing(false); setPw1(''); setPw2('');
+      setDone('ハッシュ化しました。右上の「💾 保存」で config.json に書き込み、本体を再起動すると新しいパスワードが有効になります。');
+    } catch (e) {
+      setErr(e.message);
+    } finally { setBusy(false); }
+  }
+
+  function clearPassword() {
+    if (!confirm('パスワードを解除します（空文字 = 認証なし）。\n保存して本体を再起動すると、誰でもログインなしで使えるようになります。続行しますか？')) return;
+    onCommit('');
+    setDone('解除しました（空文字）。「💾 保存」→ 本体再起動で認証なしになります。');
+  }
+
+  return (
+    <div className="pw-editor">
+      <div className="pw-status-row">
+        <span className={`pw-status ${st.kind}`}>{st.label}</span>
+        {!editing && (
+          <>
+            <button className="tree-tool-btn primary" onClick={openEditor}>
+              🔑 {value ? 'パスワードを変更' : 'パスワードを設定'}
+            </button>
+            {value && (
+              <button className="tree-tool-btn" onClick={clearPassword} title="空文字にして認証を無効にする">解除</button>
+            )}
+          </>
+        )}
+      </div>
+      {editing && (
+        <div className="pw-form">
+          <input
+            className="tree-input str pw-input"
+            type={show ? 'text' : 'password'}
+            placeholder="新しいパスワード"
+            value={pw1}
+            autoFocus
+            autoComplete="new-password"
+            onChange={e => setPw1(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') apply(); if (e.key === 'Escape') cancel(); }}
+          />
+          <input
+            className="tree-input str pw-input"
+            type={show ? 'text' : 'password'}
+            placeholder="もう一度入力（確認）"
+            value={pw2}
+            autoComplete="new-password"
+            onChange={e => setPw2(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') apply(); if (e.key === 'Escape') cancel(); }}
+          />
+          <label className="pw-show">
+            <input type="checkbox" checked={show} onChange={e => setShow(e.target.checked)} /> 表示
+          </label>
+          <button className="tree-tool-btn primary" onClick={apply} disabled={busy || !pw1 || !pw2}>
+            {busy ? 'ハッシュ化中…' : 'ハッシュ化して設定'}
+          </button>
+          <button className="tree-tool-btn" onClick={cancel} disabled={busy}>キャンセル</button>
+          {err && <div className="pw-msg err">{err}</div>}
+          <div className="pw-msg note">
+            平文は保存されません（SHA-256 ハッシュとして config.json に書き込まれます）。
+            設定後は「💾 保存」と本体の再起動が必要です。
+          </div>
+        </div>
+      )}
+      {!editing && done && <div className="pw-msg ok">{done}</div>}
     </div>
   );
 }
