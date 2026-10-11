@@ -8,7 +8,9 @@
  *
  * 対応ツール: ml_* (5), rl_* (6), web_search, read_file, list_files,
  *             search_documents(簡易RAG), gdrive_* (Google Drive)
- * 非対応: generate_image, python実行 (セキュリティ・複雑性のため外部公開しない)
+ * 非対応: generate_image ツール, python実行 (セキュリティ・複雑性のため外部公開しない)
+ * 画像生成はツールではなく OpenAI 互換の POST /v1/images/generations として、
+ * tools に 'image' を指定した時だけ公開する (LLM が勝手に生成することはない)。
  *
  * server.js から提供される deps オブジェクト経由で内部関数を呼ぶ (循環参照回避)。
  *
@@ -21,6 +23,7 @@ const express = require('express');
 const https = require('https');
 const http = require('http');
 const fs = require('fs');
+const path = require('path');
 const { createHarness, neutralHarnessConfig, HARNESS_VERSION } = require('./harness');
 
 /**
@@ -49,6 +52,14 @@ async function startAgentServer(opts, deps) {
     gdrive,                       // Google Drive クライアント
   } = deps;
 
+  // 画像生成 (/v1/images/generations) を公開するか
+  const imageEnabled = enabledTools.includes('image') && typeof deps.generateImages === 'function';
+  // 生成画像の配信パス (response_format=url 用)。本体の /uploads と同じく認証なしで返す
+  // (OpenAI の画像URLもそのまま GET できるため、クライアントは認証ヘッダーを付けずに取りに来る)
+  const IMAGE_FILES_PATH = '/v1/images/files/';
+  // generateImages が付けるファイル名だけを許可する (uploads の他のファイルは出さない)
+  const IMAGE_FILE_RE = /^sd_\d+_[a-z0-9]+_\d+\.png$/;
+
   const app = express();
 
   // JSON ボディパーサー (上限 32MB)
@@ -71,6 +82,7 @@ async function startAgentServer(opts, deps) {
   // /health はパブリック (生存確認用、認証スキップ)
   app.use((req, res, next) => {
     if (req.path === '/health') return next();  // ヘルスチェックは認証不要
+    if (imageEnabled && req.method === 'GET' && req.path.startsWith(IMAGE_FILES_PATH)) return next();
     if (!apiKey) return next();  // キー未設定なら認証なし
     const auth = req.headers.authorization || '';
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
@@ -181,6 +193,44 @@ async function startAgentServer(opts, deps) {
     }
   });
 
+  // 画像生成 (OpenAI互換)。パースとレスポンスの形は本体の /v1/images/generations と共通
+  if (imageEnabled) {
+    app.post('/v1/images/generations', async (req, res) => {
+      const ip = req.ip || req.socket?.remoteAddress || '-';
+      const parsed = deps.parseOpenAIImageRequest(req.body);
+      if (parsed.error) {
+        return res.status(400).json({
+          error: { message: parsed.error.message, type: 'invalid_request_error', param: parsed.error.param, code: null },
+        });
+      }
+      log(ip, `[エージェントAPI] images/generations (n=${parsed.opts.batchCount}, ${parsed.opts.width}x${parsed.opts.height})`);
+      try {
+        const result = await deps.generateImages(parsed.opts, ip);
+        const origin = `${req.protocol}://${req.get('host')}`;
+        res.json(deps.buildOpenAIImageResponse(result, parsed.responseFormat,
+          img => origin + IMAGE_FILES_PATH + img.fileName));
+      } catch (e) {
+        const status = e.status || 500;
+        res.status(status).json({
+          error: { message: e.message, type: status >= 500 ? 'server_error' : 'invalid_request_error', param: null, code: null },
+        });
+      }
+    });
+
+    app.get(IMAGE_FILES_PATH + ':name', (req, res) => {
+      const name = req.params.name;
+      if (!IMAGE_FILE_RE.test(name)) {
+        return res.status(404).json({ error: { message: 'Image not found', type: 'not_found' } });
+      }
+      const abs = path.join(UPLOADS_DIR, name);
+      if (!fs.existsSync(abs)) {
+        return res.status(404).json({ error: { message: 'Image not found', type: 'not_found' } });
+      }
+      res.setHeader('Content-Type', 'image/png');
+      fs.createReadStream(abs).pipe(res);
+    });
+  }
+
   // ヘルスチェック (ハーネスの状態も返す)
   app.get('/health', (req, res) => {
     const hc = appConfig.harness || {};
@@ -200,7 +250,8 @@ async function startAgentServer(opts, deps) {
       error: {
         message: `エンドポイントが見つかりません: ${req.method} ${req.path}`,
         type: 'not_found',
-        hint: 'OpenAI互換: POST /v1/chat/completions、GET /v1/models、GET /health',
+        hint: 'OpenAI互換: POST /v1/chat/completions、GET /v1/models、GET /health'
+          + (imageEnabled ? '、POST /v1/images/generations' : ''),
       },
     });
   });

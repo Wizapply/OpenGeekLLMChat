@@ -10443,6 +10443,13 @@ function App() {
                           disabledReason: apiGdriveReason,
                           warnLabel: 'GDrive未接続のため利用不可',
                         },
+                        {
+                          id: 'image',
+                          label: '🎨 画像生成 (POST /v1/images/generations)',
+                          disabled: !(appConfig.imageGen && (appConfig.imageModels || []).length > 0),
+                          disabledReason: 'config.json の imageGen が無効、または imageModels が未定義',
+                          warnLabel: '画像生成が無効のため利用不可',
+                        },
                       ].map(t => (
                         <label key={t.id} className="api-form-checkbox-label" style={{
                           fontSize: 12,
@@ -10572,6 +10579,11 @@ function App() {
                             <div className="api-server-usage">
                               例: <code>curl {externalUrl}/chat/completions -H "Authorization: Bearer {s.apiKey.slice(0, 12)}..." -H "Content-Type: application/json" -d '{`{"model":"x","messages":[{"role":"user","content":"hi"}]}`}'</code>
                             </div>
+                            {s.agentMode && (s.tools || []).includes('image') && (
+                              <div className="api-server-usage">
+                                画像: <code>curl {externalUrl}/images/generations -H "Authorization: Bearer {s.apiKey.slice(0, 12)}..." -H "Content-Type: application/json" -d '{`{"prompt":"a cat","size":"1024x1024","response_format":"url"}`}'</code>
+                              </div>
+                            )}
                           </div>
                         );
                       })()}

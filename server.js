@@ -813,6 +813,11 @@ function buildAgentDeps() {
         convertToGoogleDoc: !!convertToGoogleDoc,
       });
     },
+    // ─── 画像生成 (/v1/images/generations、tools に 'image' がある時だけ公開) ───
+    // OpenAI形式の変換は本体の /v1/images/generations と同じ関数を使う
+    generateImages,
+    parseOpenAIImageRequest,
+    buildOpenAIImageResponse,
   };
 }
 
@@ -870,6 +875,14 @@ async function startExternalServer({ modelName, host, port, apiKey, type, https,
       if (!st.enabled || !st.connected) {
         log('-', `[外部API] Google Driveツール無効化: ${st.reason || '未接続'}`);
         enabledTools = enabledTools.filter(t => t !== 'gdrive');
+      }
+    }
+
+    // 画像生成 (/v1/images/generations) は imageGen 有効かつ imageModels 定義済みの時だけ
+    if (enabledTools.includes('image')) {
+      if (!appConfig.imageGen || !(appConfig.imageModels || []).length) {
+        log('-', '[外部API] 画像生成を無効化: imageGen が無効、または imageModels が未定義');
+        enabledTools = enabledTools.filter(t => t !== 'image');
       }
     }
 
@@ -2264,6 +2277,24 @@ function proxyToLlama(targetHost, targetPort, pathPrefix, isChatProxy) {
   };
 }
 
+// OpenAI互換 画像生成。/v1 プロキシより前に置く (実装は /image-gen の近く)
+app.post('/v1/images/generations', requireAuth, requirePermission('image:generate'), jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  if (!appConfig.imageGen) {
+    return openAIError(res, 503, '画像生成が無効です (config.json の imageGen を true にしてください)', null, 'service_unavailable');
+  }
+  const parsed = parseOpenAIImageRequest(req.body);
+  if (parsed.error) return openAIError(res, 400, parsed.error.message, parsed.error.param);
+  log(ip, `[IMAGE-GEN] /v1/images/generations (n=${parsed.opts.batchCount}, ${parsed.opts.width}x${parsed.opts.height})`);
+  try {
+    const result = await generateImages(parsed.opts, ip);
+    const origin = `${req.protocol}://${req.get('host')}`;
+    res.json(buildOpenAIImageResponse(result, parsed.responseFormat, img => origin + img.url));
+  } catch (e) {
+    openAIError(res, e.status || 500, e.message, null, (e.status || 500) >= 500 ? 'server_error' : 'invalid_request_error');
+  }
+});
+
 // チャット推論: /v1/chat/completions, /v1/completions, /v1/models 等
 app.use('/v1', requireAuth, proxyToLlama(
   appConfig.llamaServer.chatHost,
@@ -2698,28 +2729,26 @@ app.get('/image-gen/info', requireAuth, (req, res) => {
   });
 });
 
-app.post('/image-gen', requireAuth, jsonParser, async (req, res) => {
-  const ip = getIP(req);
-  const {
-    prompt,
-    negativePrompt = '',
-    model = null,             // 省略時は defaultModel または現在ロード中
-    width = 1024,
-    height = 1024,
-    steps = 20,
-    cfgScale = 7.0,
-    sampler = 'euler_a',      // sd-server のサンプラー名
-    seed = -1,                // -1 = ランダム
-    batchCount = 1,           // 同じ設定で何枚生成するか
-  } = req.body || {};
-
-  if (!prompt || typeof prompt !== 'string') {
-    return res.status(400).json({ error: 'prompt が必要です' });
-  }
+// 画像生成の本体。/image-gen (チャットUI用) と /v1/images/generations (OpenAI互換) と
+// 外部APIのツール対応モード (agent_proxy) で共用する。
+// 失敗時は err.status (HTTPステータス) 付きの Error を投げる。
+// 戻り値の images[] には保存先URL (/uploads/...) と PNG の base64 の両方を入れる
+// (OpenAI互換の response_format=b64_json で読み直さずに返すため)。
+async function generateImages({
+  prompt,
+  negativePrompt = '',
+  model = null,             // 省略時は defaultModel または現在ロード中
+  width = 1024,
+  height = 1024,
+  steps = 20,
+  cfgScale = 7.0,
+  seed = -1,                // -1 = ランダム
+  batchCount = 1,           // 同じ設定で何枚生成するか (最大4)
+} = {}, ip = '-') {
+  const fail = (status, message) => Object.assign(new Error(message), { status });
+  if (!prompt || typeof prompt !== 'string') throw fail(400, 'prompt が必要です');
   if (!appConfig.imageModels || appConfig.imageModels.length === 0) {
-    return res.status(400).json({
-      error: '画像生成モデルが設定されていません。config.json の imageModels に追加してください。',
-    });
+    throw fail(400, '画像生成モデルが設定されていません。config.json の imageModels に追加してください。');
   }
 
   // モデル決定
@@ -2738,7 +2767,7 @@ app.post('/image-gen', requireAuth, jsonParser, async (req, res) => {
       log(ip, `[IMAGE-GEN] sd-server を起動: ${targetModel}`);
       await startImageModel(targetModel);
     } catch (e) {
-      return res.status(500).json({ error: `sd-server起動失敗: ${e.message}` });
+      throw fail(500, `sd-server起動失敗: ${e.message}`);
     }
   }
 
@@ -2746,7 +2775,7 @@ app.post('/image-gen', requireAuth, jsonParser, async (req, res) => {
   const port = sdConfig.port || 7860;
 
   // 一括生成 (batchCount 回ループ)
-  const generatedUrls = [];
+  const images = [];
   const startTime = Date.now();
   for (let i = 0; i < Math.min(batchCount, 4); i++) {
     try {
@@ -2801,30 +2830,116 @@ app.post('/image-gen', requireAuth, jsonParser, async (req, res) => {
       if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
       const filePath = path.join(uploadsDir, fileName);
       fs.writeFileSync(filePath, Buffer.from(sdData.images[0], 'base64'));
-      generatedUrls.push(`/uploads/${fileName}`);
+      images.push({ url: `/uploads/${fileName}`, fileName, b64: sdData.images[0] });
     } catch (e) {
       // 部分的に成功している場合もあるので、エラーでも続行
       log(ip, `[IMAGE-GEN] error: ${e.message}`);
-      if (generatedUrls.length === 0) {
-        return res.status(500).json({ error: e.message });
-      }
+      if (images.length === 0) throw fail(500, e.message);
       break;
     }
   }
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-  log(ip, `[IMAGE-GEN] 完了: ${generatedUrls.length}枚, ${elapsed}秒, prompt="${prompt.slice(0, 60)}"`);
+  log(ip, `[IMAGE-GEN] 完了: ${images.length}枚, ${elapsed}秒, prompt="${prompt.slice(0, 60)}"`);
+  return { images, model: targetModel, elapsed: Number(elapsed) };
+}
 
-  res.json({
-    ok: true,
-    images: generatedUrls,
-    model: targetModel,
+app.post('/image-gen', requireAuth, jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  const {
     prompt,
-    negativePrompt,
-    parameters: { width, height, steps, cfgScale, sampler },
-    elapsed: Number(elapsed),
-  });
+    negativePrompt = '',
+    model = null,
+    width = 1024,
+    height = 1024,
+    steps = 20,
+    cfgScale = 7.0,
+    sampler = 'euler_a',      // sd-server のサンプラー名 (互換性のため sd-server には送らない)
+    seed = -1,
+    batchCount = 1,
+  } = req.body || {};
+
+  try {
+    const result = await generateImages(
+      { prompt, negativePrompt, model, width, height, steps, cfgScale, seed, batchCount }, ip);
+    res.json({
+      ok: true,
+      images: result.images.map(img => img.url),
+      model: result.model,
+      prompt,
+      negativePrompt,
+      parameters: { width, height, steps, cfgScale, sampler },
+      elapsed: result.elapsed,
+    });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
 });
+
+// ─── OpenAI互換 画像生成 (/v1/images/generations) ───
+// OpenAI SDK の images.generate() からそのまま呼べるようにする。ルート自体は
+// /v1 の llama-server プロキシより前に登録している (後ろだと llama-server に転送されて 404 になる)。
+// 外部APIのツール対応モード (agent_proxy) も同じ変換を使うので、パースと
+// レスポンス組み立ては parseOpenAIImageRequest / buildOpenAIImageResponse に分けている。
+const OPENAI_IMAGE_MAX_N = 4;  // generateImages の上限に合わせる
+
+function openAIError(res, status, message, param = null, type = 'invalid_request_error') {
+  return res.status(status).json({ error: { message, type, param, code: null } });
+}
+
+// OpenAI形式のボディを generateImages の引数に変換する。
+// 不正な値は { error: { message, param } } を返す。
+// model は imageModels に同名があれば使い、無ければ既定モデル
+// (クライアントは "dall-e-3" や "gpt-image-1" を送ってくるため、知らない名前でも失敗させない)。
+// OpenAI に無い拡張として negative_prompt / steps / cfg_scale / seed も受け付ける。
+function parseOpenAIImageRequest(body) {
+  const b = body || {};
+  if (!b.prompt || typeof b.prompt !== 'string') {
+    return { error: { message: 'prompt is required', param: 'prompt' } };
+  }
+  const n = b.n == null ? 1 : Number(b.n);
+  if (!Number.isInteger(n) || n < 1 || n > OPENAI_IMAGE_MAX_N) {
+    return { error: { message: `n must be an integer between 1 and ${OPENAI_IMAGE_MAX_N}`, param: 'n' } };
+  }
+  let width = 1024, height = 1024;
+  if (b.size != null && b.size !== 'auto') {
+    const m = /^(\d+)x(\d+)$/.exec(String(b.size));
+    if (!m) return { error: { message: 'size must be "WIDTHxHEIGHT" (e.g. "1024x1024") or "auto"', param: 'size' } };
+    width = Number(m[1]);
+    height = Number(m[2]);
+  }
+  const responseFormat = b.response_format == null ? null : String(b.response_format);
+  if (responseFormat && responseFormat !== 'url' && responseFormat !== 'b64_json') {
+    return { error: { message: 'response_format must be "url" or "b64_json"', param: 'response_format' } };
+  }
+  const known = (appConfig.imageModels || []).some(m => m.name === b.model);
+  const opts = {
+    prompt: b.prompt,
+    model: known ? b.model : null,
+    width, height,
+    batchCount: n,
+  };
+  if (typeof b.negative_prompt === 'string') opts.negativePrompt = b.negative_prompt;
+  if (Number.isFinite(Number(b.steps)) && b.steps != null) opts.steps = Number(b.steps);
+  if (Number.isFinite(Number(b.cfg_scale)) && b.cfg_scale != null) opts.cfgScale = Number(b.cfg_scale);
+  if (Number.isInteger(b.seed)) opts.seed = b.seed;
+  return { opts, responseFormat };
+}
+
+// response_format 未指定時は url と b64_json の両方を返す
+// (DALL-E 系クライアントは url、gpt-image-1 系クライアントは b64_json を読むため)
+function buildOpenAIImageResponse(result, responseFormat, toAbsoluteUrl) {
+  return {
+    created: Math.floor(Date.now() / 1000),
+    data: result.images.map(img => {
+      const item = {};
+      if (responseFormat !== 'b64_json') item.url = toAbsoluteUrl(img);
+      if (responseFormat !== 'url') item.b64_json = img.b64;
+      return item;
+    }),
+  };
+}
+
 
 // 手動でモデル停止
 app.post('/image-gen/unload', requireAuth, async (req, res) => {

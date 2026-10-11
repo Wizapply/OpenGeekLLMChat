@@ -608,6 +608,30 @@ config.json から HTTPサーバーや llama-server の細かな設定を調整�
 - **ライトボックス**: クリックでフルサイズプレビュー、中央下部に大きなダウンロードボタン
 - **複数枚一括生成**: `count: 4` パラメータで最大4枚同時生成
 - **3分タイムアウト**: 大きいモデル・複雑なプロンプトでも対応
+- **OpenAI互換API**: `POST /v1/images/generations` で外部プログラム (OpenAI SDK の `images.generate()` 等) からも生成可能（下記）
+
+#### OpenAI互換 画像生成API (`/v1/images/generations`)
+
+OpenAI の Images API と同じ形式で画像を生成できます。公開先は2通りです:
+
+| 公開先 | Base URL | 認証 |
+|:--|:--|:--|
+| 本体 | `https://<host>:3000/v1` | `Authorization: Bearer <ml.apiTokens のトークン>` (権限 `image:generate` または `*`) |
+| 外部APIサーバー (ツール対応モード) | `https://<host>:<port>/v1` | 外部APIサーバーのAPIキー。起動時に **🎨 画像生成** にチェックが必要 |
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="https://<host>:3000/v1", api_key="<トークン>")
+img = client.images.generate(prompt="a cat", size="1024x1024", response_format="b64_json")
+```
+
+- **対応パラメータ**: `prompt` (必須) / `n` (1〜4) / `size` (`"WIDTHxHEIGHT"` または `"auto"`、64〜2048にクランプ) / `response_format` (`url` / `b64_json`) / `model`
+- **`model`**: `imageModels[].name` と一致すればそのモデル、それ以外 (`dall-e-3`, `gpt-image-1` 等) は既定モデル
+- **`response_format` 省略時**: `url` と `b64_json` の両方を返す（DALL-E 系・gpt-image 系どちらのクライアントでも読めるように）
+- **独自拡張**: `negative_prompt` / `steps` / `cfg_scale` / `seed`
+- **非対応**: `quality` / `style` / `output_format` 等は無視（常に PNG）。`/v1/images/edits` / `/v1/images/variations` は未実装
+- 生成画像は `public/uploads/sd_*.png` に保存され、`url` は認証なしで取得できます（OpenAI の画像URLと同じ扱い）
+- `config.json` の `imageGen: true` と `imageModels[]` の定義が必要です
 
 ### 🔊 音声合成（Irodori-TTS 連携）
 チャットで「『こんにちは』を30代男性の声で作って」と頼むと、LLMが自動的に `generate_speech` ツールを呼び出して音声(WAV)を生成する。日本語特化のローカル音声合成AI [Irodori-TTS](https://github.com/Aratako/Irodori-TTS) の OpenAI互換サーバー（`/v1/audio/speech`）を内部プロセスとして管理する（画像生成 sd-server と同じ方式）。
@@ -798,7 +822,8 @@ requests.post(f"{BASE}/ml/rl/sim/train", headers=H, json={
 - **モデルロード保証**: 起動時に指定モデルを内部で自動ロード、アイドルアンロード後の再リクエストでも自動再ロード (ポーリング待機)
 - **OpenAI互換エラー応答**: JSON パースエラーや404も HTML ではなく JSON で返す
 - **`/health` はパブリック**: 認証なしでヘルスチェック可能 (ロードバランサー・監視ツール対応)
-- **非対応**: `generate_image` / Python実行 (セキュリティのため外部公開しない)
+- **非対応**: `generate_image` ツール / Python実行 (セキュリティのため外部公開しない)
+- **画像生成API (任意)**: 起動時に「🎨 画像生成」にチェックすると `POST /v1/images/generations` (OpenAI互換) を公開。LLMのツールとしては提供しない
 
 ### 📚 永続RAGドキュメント
 サーバー側に永続保存された RAG ドキュメントストア。**Webチャットと外部API両方から利用可能**。
@@ -1759,7 +1784,7 @@ opengeek-llm-chat/
 | `ml.vjepa2Device` | 常駐エンコーダのデバイス (`cuda` / `cpu`)。省略時は自動 |
 | `ml.apiTokens[].name` | API トークンの名前 (識別用) |
 | `ml.apiTokens[].token` | トークン文字列 (推奨: ml.html の「📡 API」タブから生成) |
-| `ml.apiTokens[].permissions` | 権限配列。`"ml:read"` / `"ml:write"` / `"*"` |
+| `ml.apiTokens[].permissions` | 権限配列。`"ml:read"` / `"ml:write"` / `"gdrive:read"` / `"gdrive:write"` / `"image:generate"` / `"*"` |
 | `orchestration.enabled` | マルチLLMオーケストレーション ON/OFF（デフォルト `false`） |
 | `orchestration.poolMode` | `"auto"`（空きVRAMで自動判定） / `"resident"`（全同時常駐） / `"swap"`（1つずつ載せ替え） |
 | `orchestration.gpuPlacement` | ワーカーをどのGPUに載せるか。`"spread"`（既定、llama.cpp任せで全GPUに分散） / `"auto"`（丸ごと載るGPUが1枚あればそこに固定し、無ければ分散に戻す）。GPU2枚以上でのみ意味がある |
@@ -2410,6 +2435,7 @@ curl -s http://localhost:3000/cloud-llm/status -b cookie.txt     # 設定状態�
 | `POST` | `/restart` | ✓ | 本体プロセスを終了（systemd管理下なら自動再起動） |
 | `GET` | `/image-gen/info` | ✓ | 画像生成サーバー状態（モデル、起動中フラグ） |
 | `POST` | `/image-gen` | ✓ | 画像生成（LLMの generate_image ツール用） |
+| `POST` | `/v1/images/generations` | ✓ | OpenAI互換 画像生成（APIトークンは `image:generate` 権限が必要） |
 | `POST` | `/image-gen/unload` | ✓ | sd-server を手動アンロード（VRAM解放） |
 | `GET` | `/tts/info` | ✓ | 音声合成サーバー状態（声一覧、起動中フラグ） |
 | `POST` | `/tts` | ✓ | 音声合成（LLMの generate_speech ツール用） |
@@ -3595,7 +3621,7 @@ deactivate
 | `ml.apiTokens[]` | 外部 API トークン (Python等の外部スクリプトから利用) |
 | `ml.apiTokens[].name` | トークンの名前（識別用） |
 | `ml.apiTokens[].token` | トークン文字列（推奨: `ml.html` の「📡 API」タブから「🎲 新規トークン生成」で安全に生成） |
-| `ml.apiTokens[].permissions` | 権限。`ml:read` (読み取り) / `ml:write` (書き込み) / `*` (全権限) |
+| `ml.apiTokens[].permissions` | 権限。`ml:read` (読み取り) / `ml:write` (書き込み) / `image:generate` (`/v1/images/generations`) / `*` (全権限) |
 
 トークンが空配列 (`[]`) の場合、外部 API は使えないが、ブラウザ UI と LLM ツール経由のアクセスは Cookie 認証で動作する。
 

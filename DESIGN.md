@@ -2353,6 +2353,25 @@ OpenGeekLLMChat全体をHTTPSで運用しているなら、外部APIも同じ証
 - **HTTPS起動には llama.cpp の SSL対応ビルドが必須** (`-DLLAMA_SERVER_SSL=ON`)。非対応ビルドだと llama-server は起動せず stderr に `the server is built without SSL support` を出力する。 Node.js 側の `waitForReady` は HTTPS でヘルスチェックしようとするためタイムアウトする
 - **HTTPS/HTTPバッジ表示**: 起動済みサーバーのカードに `🔒 HTTPS` または `🔓 HTTP` のバッジを表示することで、UI上で実プロトコルが一目で分かるようにしている（フォームのチェック状態と起動済みサーバーの状態の混同を防ぐ）
 
+### OpenAI互換 画像生成 (`/v1/images/generations`)
+
+素のLLMモードの外部APIは llama-server をそのまま公開しているので画像生成は足せない。
+そこで画像生成の OpenAI 互換エンドポイントは次の2か所に置く:
+
+| 置き場所 | 認証 | 有効条件 |
+|:--|:--|:--|
+| 本体 (`server.js`) | `requireAuth` + `requirePermission('image:generate')` | `imageGen: true` |
+| ツール対応モード (`agent_proxy.js`) | 外部APIサーバーのAPIキー | `tools` に `'image'` (UIの「🎨 画像生成」) |
+
+- 本体の `/image-gen` の処理を `generateImages(opts, ip)` に切り出し、`/image-gen`・本体の `/v1/images/generations`・agent_proxy で共用する。戻り値の `images[]` は `{ url, fileName, b64 }` で、`b64_json` を返すときにファイルを読み直さない
+- OpenAI形式との変換は `parseOpenAIImageRequest` / `buildOpenAIImageResponse` にまとめ、agent_proxy には deps 経由で渡す (循環参照回避)
+- 本体のルートは `app.use('/v1', proxyToLlama(...))` より **前** に登録する。後ろだと llama-server に転送されて 404 になる
+- `model` は `imageModels[].name` に一致しなければ既定モデル (クライアントは `dall-e-3` / `gpt-image-1` を送ってくるため、知らない名前で失敗させない)
+- `response_format` 省略時は `url` と `b64_json` の両方を返す。DALL-E 系クライアントは `url`、gpt-image 系は `b64_json` を読むため
+- `n` の上限は `generateImages` に合わせて 4。超えたら黙って切り詰めず 400 を返す
+- agent_proxy の `url` は自分のポートの `GET /v1/images/files/:name` を指す (本体の `/uploads` は別ポートのため)。ファイル名は `sd_<ts>_<rand>_<i>.png` の形だけ許可し、本体の `/uploads` と同じく認証なしで返す (OpenAI の画像URLもクライアントは認証ヘッダーなしで GET するため)
+- agent_proxy では画像生成を **LLMのツールにはしない**。エンドポイントとして明示的に呼ばれた時だけ生成する
+
 ---
 
 ## 🔗 共有可能なURL（チャットID反映）
