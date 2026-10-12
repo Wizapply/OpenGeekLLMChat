@@ -15,6 +15,7 @@ const { createCloudLlm } = require('./system/llm/cloud_llm');
 const { createOcrManager, sanitizeSourceName, uniqueName: uniqueUploadName } = require('./system/rag/ocr');
 const { createHtmlRagManager } = require('./system/rag/html_rag');
 const { createRagTuneManager } = require('./system/tuning/rag_tune');
+const { createModel3dManager } = require('./system/model3d/model3d');
 
 // systemd等で起動された際、カレントディレクトリをserver.jsと同じに固定する
 // これにより相対パスでアクセスされるリソース(モデルキャッシュ等)も安定動作する
@@ -80,6 +81,12 @@ const DEFAULT_CONFIG = {
   fileAccess: true,
   imageGen: false,           // 画像生成（stable-diffusion.cpp連携）。imageModels[]を定義して有効化
   ttsGen: false,             // 音声合成（Irodori-TTS連携）。irodoriTts を設定して有効化
+  model3dGen: false,         // 3Dモデル生成（画像→3D / テキスト→3D、GLB出力）。model3d を設定して有効化
+  // ─── 3Dモデル生成 (system/model3d/model3d_server.py) 設定 ───
+  // 既定値と各項目の意味は system/model3d/model3d.js の DEFAULTS を参照。
+  // command に Hunyuan3D / TRELLIS / SF3D を入れた venv の python を指定すると、
+  // sd-server と同じくオンデマンド起動・アイドル停止する。
+  model3d: {},
   // ─── 音声合成 (Irodori-TTS) 設定 ───
   // 画像生成(stable-diffusion.cpp)と同じ方式: Irodori-TTS の OpenAI互換サーバーを
   // 子プロセスで spawn し、オンデマンド起動・アイドルアンロードする。
@@ -501,7 +508,7 @@ function loadConfig() {
         delete userConfig.ocrRag;
       }
       const merged = { ...DEFAULT_CONFIG, ...userConfig };
-      ['systemPrompts', 'agentContext', 'harness', 'contextCompaction', 'transcribe', 'llamaServer', 'embeddingModel', 'ml', 'irodoriTts', 'orchestration', 'googleDrive', 'cloudLlm', 'ocr', 'htmlRag'].forEach(key => {
+      ['systemPrompts', 'agentContext', 'harness', 'contextCompaction', 'transcribe', 'llamaServer', 'embeddingModel', 'ml', 'irodoriTts', 'model3d', 'orchestration', 'googleDrive', 'cloudLlm', 'ocr', 'htmlRag'].forEach(key => {
         if (DEFAULT_CONFIG[key] && typeof DEFAULT_CONFIG[key] === 'object') {
           merged[key] = { ...DEFAULT_CONFIG[key], ...(userConfig[key] || {}) };
         }
@@ -818,6 +825,8 @@ function buildAgentDeps() {
     generateImages,
     parseOpenAIImageRequest,
     buildOpenAIImageResponse,
+    // ─── 3Dモデル生成 (Meshy互換、tools に 'model3d' がある時だけ公開) ───
+    model3d,
   };
 }
 
@@ -884,6 +893,12 @@ async function startExternalServer({ modelName, host, port, apiKey, type, https,
         log('-', '[外部API] 画像生成を無効化: imageGen が無効、または imageModels が未定義');
         enabledTools = enabledTools.filter(t => t !== 'image');
       }
+    }
+
+    // 3Dモデル生成 (Meshy互換 /openapi/...) は model3dGen 有効時だけ
+    if (enabledTools.includes('model3d') && !appConfig.model3dGen) {
+      log('-', '[外部API] 3Dモデル生成を無効化: model3dGen が無効');
+      enabledTools = enabledTools.filter(t => t !== 'model3d');
     }
 
     const handle = await startAgentServer({
@@ -1570,6 +1585,8 @@ function cleanup() {
   if (rlOnlineWorker && rlOnlineWorker.proc) try { rlOnlineWorker.proc.kill('SIGTERM'); } catch {}
   // V-JEPA 2 常駐エンコーダ (保持している状態は無いので落とすだけ)
   if (vjepa2Worker && vjepa2Worker.proc) try { vjepa2Worker.proc.kill('SIGTERM'); } catch {}
+  // 3Dモデル生成ワーカー
+  try { model3d.kill(); } catch {}
   // 外部APIサーバーも全停止
   for (const [, s] of externalServers) {
     if (s.proc && !s.proc.killed) {
@@ -4287,6 +4304,7 @@ app.post('/gpu/release', requireAuth, jsonParser, async (req, res) => {
     () => llmPool.unloadAll());
   await tryRelease(`画像生成(${sdCurrentModel})`, want('image') && sdProc, () => stopImageModel());
   await tryRelease('音声合成(TTS)', want('tts') && ttsProc, () => stopTtsServer());
+  await tryRelease('3Dモデル生成', want('model3d') && model3d.isWorkerRunning(), () => model3d.stopWorker());
 
   // 外部APIサーバーは意図して公開しているものなので、明示指定がある場合だけ止める
   if (opts.external === true) {
@@ -4324,6 +4342,7 @@ app.get('/gpu/release/targets', requireAuth, (req, res) => {
     pool: workers.map(w => w.modelName),
     image: sdProc ? (sdCurrentModel || true) : null,
     tts: !!ttsProc,
+    model3d: model3d.isWorkerRunning(),
     external: listExternalServers().filter(s => s.running).length,
   });
 });
@@ -4486,7 +4505,8 @@ app.get('/config', (req, res) => {
   // 公開しない: password, llamaServer内のbinPath, embeddingModelの実体パス, ml.apiTokens(機密),
   //             googleDrive の clientId/clientSecret/サービスアカウント鍵(機密)
   //             cloudLlm の apiKey / baseUrl / extraHeaders(機密)
-  const { password, llamaServer, embeddingModel, ml, irodoriTts, googleDrive, cloudLlm: cloudLlmCfg, ocr: ocrCfg, htmlRag: htmlRagCfg, ...rest } = appConfig;
+  // model3d は command/args/env (機密) を含むので丸ごと出さない (UI は model3dGen だけ見る)
+  const { password, llamaServer, embeddingModel, ml, irodoriTts, model3d: _model3dCfg, googleDrive, cloudLlm: cloudLlmCfg, ocr: ocrCfg, htmlRag: htmlRagCfg, ...rest } = appConfig;
   const safeConfig = {
     ...rest,
     // llamaServer情報は最小限のみ
@@ -5845,6 +5865,82 @@ app.get('/uploads/ragfiles/*', requireAuth, (req, res) => {
   res.setHeader('Content-Type', mimes[ext] || 'application/octet-stream');
   res.setHeader('Cache-Control', 'private, max-age=60');
   fs.createReadStream(abs).pipe(res);
+});
+
+// ════════════════════════════════════════════════
+// 3Dモデル生成 (画像→3D / テキスト→3D、GLB 出力)
+// ════════════════════════════════════════════════
+// アーキテクチャ (sd-server / Irodori-TTS と同じ方式):
+//   - system/model3d/model3d_server.py (Hunyuan3D-2 / TRELLIS / SF3D 等) を子プロセスで起動
+//   - タスク管理・キュー・Meshy 互換 API は system/model3d/model3d.js
+//   - テキスト→3D でバックエンドがテキスト非対応なら、generateImages (sd-server) で
+//     コンセプト画像を作ってから画像→3D にかける
+//   - 生成物は public/uploads/model3d/<taskId>/model.glb (チャットは [[gen_model:...]] で表示)
+const model3d = createModel3dManager({
+  getConfig: () => appConfig.model3d,
+  isEnabled: () => !!appConfig.model3dGen,
+  baseDir: __dirname,
+  uploadsDir: UPLOADS_DIR,
+  log: (ip, msg) => log(ip, msg),
+  spawn,
+  resolveUploadPath: safeUploadPath,
+  isPrivateHostname,
+  generateImages,
+  isImageGenAvailable: () => !!(appConfig.imageGen && (appConfig.imageModels || []).length > 0),
+  stopImageModel,
+});
+
+// API トークンごとにタスクを分ける (Meshy のアカウント単位の一覧に相当)。
+// ブラウザのセッション (Cookie) は全タスクを見られる
+const model3dOwnerOf = (req) => (req.apiToken ? `token:${req.apiToken.name || req.apiToken.token.slice(0, 8)}` : 'session');
+const model3dFileUrl = (req, id, name) => `${req.protocol}://${req.get('host')}/uploads/model3d/${id}/${encodeURIComponent(name)}`;
+
+// Meshy 互換 API: /openapi/v2/text-to-3d, /openapi/v1/image-to-3d (作成・取得・一覧・削除・SSE)
+// Meshy のクライアントは base URL を https://<host>:3000 にし、API キーに
+// ml.apiTokens のトークン (権限 model3d:generate または *) を渡せばそのまま使える
+app.use('/openapi', requireAuth, requirePermission('model3d:generate'));
+app.use(model3d.createMeshyRouter({
+  jsonParser,
+  ownerOf: model3dOwnerOf,
+  fileUrl: model3dFileUrl,
+}));
+
+// ─── チャット (generate_3d_model ツール) 用 ───
+app.get('/model3d/info', requireAuth, async (req, res) => {
+  res.json(await model3d.info());
+});
+
+// テキスト or 画像から、テクスチャ付きの3Dモデルを1回で作る。タスク ID を返すので
+// GET /model3d/tasks/:id で進捗を見る (Meshy の preview→refine の2段階を1つにまとめたもの)
+app.post('/model3d/generate', requireAuth, jsonParser, async (req, res) => {
+  const ip = getIP(req);
+  if (!appConfig.model3dGen) {
+    return res.status(400).json({ error: '3Dモデル生成が無効です。config.json の model3dGen を true にしてください。' });
+  }
+  const { prompt = '', image = null, texture = true, seed = null, targetPolycount = null } = req.body || {};
+  try {
+    const common = { seed, target_polycount: targetPolycount || undefined };
+    const t = image
+      ? await model3d.createImageTask({ image_url: image, prompt, should_texture: texture !== false, ...common }, 'session')
+      : await model3d.createTextTask({ mode: 'preview', prompt, should_texture: texture !== false, ...common }, 'session');
+    log(ip, `[MODEL3D] ${image ? '画像→3D' : 'テキスト→3D'} task=${t.id} prompt="${String(prompt).slice(0, 60)}"`);
+    res.json({ ok: true, id: t.id });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+app.get('/model3d/tasks/:id', requireAuth, (req, res) => {
+  const t = model3d.getTask(req.params.id, 'session');
+  if (!t) return res.status(404).json({ error: 'タスクが見つかりません' });
+  // チャットは同一オリジンなので相対 URL で返す
+  res.json(model3d.toPublic(t, (id, name) => `/uploads/model3d/${id}/${encodeURIComponent(name)}`));
+});
+
+app.post('/model3d/unload', requireAuth, async (req, res) => {
+  log(getIP(req), '[MODEL3D] 手動アンロード');
+  await model3d.unload();
+  res.json({ ok: true });
 });
 
 // ─── 静的ファイル配信 ───

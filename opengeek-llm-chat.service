@@ -17,6 +17,10 @@ ExecStart=/usr/bin/node /home/wizapply-ai/opengeek-llm-chat/server.js
 # クラッシュ時に systemd が自動復活させる。
 Restart=always
 RestartSec=3
+# 停止時に子プロセス (llama-server / sd-server / 3D生成ワーカー等) が終わるのを待つ上限。
+# 既定の 90 秒だと、GPU 処理中のプロセスがすぐ終われない時に再起動が長引く。
+# 超えたら SIGKILL で止める
+TimeoutStopSec=15
 
 # 環境変数（必要に応じて）
 Environment=NODE_ENV=production

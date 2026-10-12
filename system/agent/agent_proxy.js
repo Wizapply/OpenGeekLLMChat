@@ -11,6 +11,8 @@
  * 非対応: generate_image ツール, python実行 (セキュリティ・複雑性のため外部公開しない)
  * 画像生成はツールではなく OpenAI 互換の POST /v1/images/generations として、
  * tools に 'image' を指定した時だけ公開する (LLM が勝手に生成することはない)。
+ * 3Dモデル生成も同様に、Meshy 互換の /openapi/v2/text-to-3d・/openapi/v1/image-to-3d として
+ * tools に 'model3d' を指定した時だけ公開する (タスク管理は本体の system/model3d/model3d.js と共有)。
  *
  * server.js から提供される deps オブジェクト経由で内部関数を呼ぶ (循環参照回避)。
  *
@@ -60,6 +62,11 @@ async function startAgentServer(opts, deps) {
   // generateImages が付けるファイル名だけを許可する (uploads の他のファイルは出さない)
   const IMAGE_FILE_RE = /^sd_\d+_[a-z0-9]+_\d+\.png$/;
 
+  // 3Dモデル生成 (Meshy 互換) を公開するか。生成物 (GLB/サムネイル) は認証なしで返す
+  // (Meshy の model_urls もクライアントは認証ヘッダーなしで GET するため。タスク ID は推測不能な UUID)
+  const model3dEnabled = enabledTools.includes('model3d') && !!deps.model3d;
+  const MODEL3D_FILES_PATH = '/openapi/files/';
+
   const app = express();
 
   // JSON ボディパーサー (上限 32MB)
@@ -83,6 +90,7 @@ async function startAgentServer(opts, deps) {
   app.use((req, res, next) => {
     if (req.path === '/health') return next();  // ヘルスチェックは認証不要
     if (imageEnabled && req.method === 'GET' && req.path.startsWith(IMAGE_FILES_PATH)) return next();
+    if (model3dEnabled && req.method === 'GET' && req.path.startsWith(MODEL3D_FILES_PATH)) return next();
     if (!apiKey) return next();  // キー未設定なら認証なし
     const auth = req.headers.authorization || '';
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
@@ -231,6 +239,16 @@ async function startAgentServer(opts, deps) {
     });
   }
 
+  // 3Dモデル生成 (Meshy互換)。作成・取得・一覧・削除・SSE は本体と同じルーター。
+  // タスクは外部APIサーバー (ポート) ごとに分ける。本体のブラウザからは全部見える
+  if (model3dEnabled) {
+    app.get(MODEL3D_FILES_PATH + ':id/:name', (req, res) => deps.model3d.sendFile(req, res));
+    app.use(deps.model3d.createMeshyRouter({
+      ownerOf: () => `agent:${port}`,
+      fileUrl: (req, id, name) => `${req.protocol}://${req.get('host')}${MODEL3D_FILES_PATH}${id}/${encodeURIComponent(name)}`,
+    }));
+  }
+
   // ヘルスチェック (ハーネスの状態も返す)
   app.get('/health', (req, res) => {
     const hc = appConfig.harness || {};
@@ -251,7 +269,8 @@ async function startAgentServer(opts, deps) {
         message: `エンドポイントが見つかりません: ${req.method} ${req.path}`,
         type: 'not_found',
         hint: 'OpenAI互換: POST /v1/chat/completions、GET /v1/models、GET /health'
-          + (imageEnabled ? '、POST /v1/images/generations' : ''),
+          + (imageEnabled ? '、POST /v1/images/generations' : '')
+          + (model3dEnabled ? '、POST /openapi/v2/text-to-3d、POST /openapi/v1/image-to-3d' : ''),
       },
     });
   });

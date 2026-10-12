@@ -61,6 +61,8 @@
 | `system/gdrive/google_drive.js` | Google Drive 連携（OAuth2/JWT + Drive API v3） | Node標準のみ（`https`, `crypto`） |
 | `system/rag/ocr.js` | PDF OCR パイプライン（ジョブキュー + Vision LLM + ページキャッシュ） | Node標準のみ + `pdftoppm`/`pdfinfo` |
 | `system/tuning/rag_tune.js` | 永続RAG → 教師データ生成（パッセージ化 + Q&A生成/検証 + ジョブキュー） | Node標準のみ |
+| `system/model3d/model3d.js` | 3Dモデル生成のタスク管理・キュー・ワーカー管理・Meshy互換API | `express`（Router）+ Node標準 |
+| `system/model3d/model3d_server.py` | 3Dモデル生成ワーカー（画像/テキスト → GLB） | Python標準のみ（バックエンドごとに hy3dgen / trellis / sf3d） |
 | `opengeek-llm-chat.service` | systemdテンプレート | - |
 
 ---
@@ -2371,6 +2373,32 @@ OpenGeekLLMChat全体をHTTPSで運用しているなら、外部APIも同じ証
 - `n` の上限は `generateImages` に合わせて 4。超えたら黙って切り詰めず 400 を返す
 - agent_proxy の `url` は自分のポートの `GET /v1/images/files/:name` を指す (本体の `/uploads` は別ポートのため)。ファイル名は `sd_<ts>_<rand>_<i>.png` の形だけ許可し、本体の `/uploads` と同じく認証なしで返す (OpenAI の画像URLもクライアントは認証ヘッダーなしで GET するため)
 - agent_proxy では画像生成を **LLMのツールにはしない**。エンドポイントとして明示的に呼ばれた時だけ生成する
+
+### 3Dモデル生成 (Meshy互換 `/openapi/...`、チャットの `generate_3d_model`)
+
+画像生成・音声合成と同じく「重い推論は別プロセスのワーカー、Node は管理と配線だけ」の構成。
+
+```
+チャット (generate_3d_model) ─ POST /model3d/generate ─┐
+Meshy互換 POST /openapi/v2/text-to-3d ────────────────┼→ model3d.js: タスク作成 → キュー (1件ずつ)
+Meshy互換 POST /openapi/v1/image-to-3d ───────────────┘        │
+                                                               ├ テキスト→3D (バックエンドがテキスト非対応):
+                                                               │   generateImages (sd-server) でコンセプト画像 → 画像→3D
+                                                               └→ model3d_server.py: POST /generate → GLB
+                                                                  (進捗は GET /status をポーリングしてタスクに写す)
+```
+
+- **責務の分け方**: ワーカー (`model3d_server.py`) は「1件を同期で GLB にする」ことだけ。タスクID・状態・キュー・永続化・Meshy の形は Node 側 (`model3d.js`)。ワーカーを差し替えても API は変わらない
+- **ワーカーは stdlib の http.server**: Hunyuan3D / TRELLIS / SF3D の venv にそのまま置けるよう、FastAPI 等を足さない (vjepa2_server.py と同じ方針)。モデルは最初の生成で読み込むので、起動自体は速い。バックエンドは `capabilities` (`text` / `image` / `texture` / `retexture` / `textured`) を `/health` で申告し、Node はそれを見てテキスト→3D を直接か SD 経由か決める
+- **Meshy の preview / refine の対応**: preview はテクスチャ無しで形状だけ (`texture=false`)。refine は preview の GLB に `/texture` で色を塗る (`retexture` 対応の hunyuan3d)。形状と同時に色が付くバックエンド (TRELLIS / SF3D) は preview の時点で色付きなので、refine は preview の成果物をコピーする。チャットは2段階を待たせたくないので `should_texture: true` (独自拡張) で一度に作る
+- **出力先**: `public/uploads/model3d/<uuid>/model.glb`。`/uploads` は既存どおり認証なしの静的配信 (Meshy の `model_urls` もクライアントは認証ヘッダーなしで GET する)。UUID なので推測されない。外部APIサーバーは別ポートで `/uploads` を持たないため `GET /openapi/files/:id/:name` を認証なしで出す (ID は UUID、ファイル名は `[A-Za-z0-9_.-]` のみ、タスクのフォルダ内だけ)
+- **タスクの持ち主**: Meshy はアカウント単位で一覧が分かれるので、API トークン名 (`token:<name>`) / 外部APIサーバーのポート (`agent:<port>`) で分ける。ブラウザのセッションは管理者なので全件見える
+- **永続化**: `model3d_tasks.json` に保存。再起動時に PENDING / IN_PROGRESS のものは FAILED (「再起動で中断」) にする。記録が `maxTasks` を超えたら古い完了済みから記録だけ消す (チャット履歴が GLB を参照しているのでファイルは消さない)。DELETE はファイルごと消す。実行中の DELETE はワーカーを止められないので、終わってから消す
+- **入力画像**: data URI / `/uploads` のパス (`safeUploadPath` で解決。隠しファイル・RAG管理フォルダ・uploads 外は拒否) / http(s) URL。URL 取得は SSRF 対策で LAN 内アドレスとそこへのリダイレクトを既定で拒否 (`isPrivateHostname`)。自分の `/uploads` を指す localhost の URL はファイルとして読む
+- **VRAM**: GPU 1枚を想定し直列実行。`exclusiveGpu: true` なら、コンセプト画像の前にワーカーへ `/unload`、3D生成の前に sd-server を停止する。ワーカーはアイドル停止と「VRAM強制解放」の対象
+- **3D化する画像の解決 (チャット)**: LLM が渡す `image` は当てにしない。直前に生成した画像を `"attached"` と呼んだり、`sd_<ts>_<rand>_0.png` を書き崩したりするため。LLM の値は HEAD で実在 (Content-Type が image/*。存在しないパスも SPA のフォールバックが 200 の HTML を返すので ok だけでは判定できない) を確かめられた時だけ使い、それ以外は「このターンの添付画像 → このターンに生成した画像 (`generatedImages`) → 画像を指す依頼なら会話の直近の画像 (`[[gen_image:]]` か添付)」の順に実在する画像を選ぶ。失敗理由はツール欄にも原文で出す (LLM が「失敗しました」と丸めて理由が消えるため)
+- **チャットのビューア**: `[[gen_model:URL|encodedPrompt|thumbUrl]]` マーカー (画像・音声と同じ扱いで、LLM が書き崩しても `fixGenMarkers` が実URLで上書き)。Three.js はコードプレビューと同じ r128 を、3Dモデルを初めて表示する時だけ読み込む。WebGL コンテキストには上限があるので、画面に入ったものだけ起動し、同時4つを超えたらサムネイル表示にしてクリックで起動する
+- **OpenAI に3D生成APIは無い**ので、外部向けは Meshy 互換にした (要望もそれ)。パスもエラー形式 (`{message}`) も Meshy に合わせ、独自の値は `stage` / `mesh` / `concept_image_url` に追加するだけにして Meshy のクライアントを壊さない
 
 ---
 

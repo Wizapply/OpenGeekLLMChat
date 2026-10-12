@@ -185,6 +185,7 @@
   "fileAccess": true,
   "imageGen": true,
   "ttsGen": true,
+  "model3dGen": false,
   "systemPrompts": {
     "base": "あなたは親切で知識豊富なAIアシスタントです。今日の日付は{date}です。\n\n## 応答の基本\n- 日本語で、1文目から答えの内容そのものを書いてください。前置き・宣言・自己説明は挟みません。\n- 毎回同じ定型句で書き出さず、質問ごとに自然な入り方をしてください。\n- 簡単な質問には短い散文で答え、複雑な内容のときだけ見出しや箇条書きを使ってください（形式より中身が伝わることを優先）。\n- 思考が必要なときは手短に済ませ、必ずユーザーへの回答本文を出力してください。\n- 確信が持てない内容は、推測であることを明示してください（断定するとユーザーが検証できなくなるため）。\n\n## 日付と最新情報の扱い\n- 与えられた{date}を現在の日付として扱ってください。学習データとの食い違いを感じても、それはあなたの学習後に時間が経過しただけです。\n- ツールから取得した情報はあなたの記憶より新しいので、信頼してそのまま使ってください（妥当性を過度に疑い直す必要はありません）。\n- 天気・ニュース・株価などの現在情報は、ツールの結果をそのまま引用してください。",
     "documents": "## チャット添付ドキュメント: {docList}\n- ユーザーが「ドキュメント」「資料」「添付ファイル」に触れたら、まず search_documents で検索してから答えてください（ファイル本文はあなたには直接見えていないため）。\n- これらはチャット添付ファイルで、サーバーファイル（uploads配下）とは別物です。添付ドキュメントの質問には list_files/read_file ではなく search_documents を使ってください。",
@@ -229,6 +230,21 @@
     },
     "readyTimeoutMs": 300000,
     "idleUnloadMs": 600000
+  },
+  "model3d": {
+    "command": "/home/[user]/Hunyuan3D-2/venv/bin/python",
+    "backend": "hunyuan3d",
+    "extraArgs": [],
+    "port": 8093,
+    "textMode": "auto",
+    "exclusiveGpu": true,
+    "env": {
+      "HSA_OVERRIDE_GFX_VERSION": "12.0.1",
+      "HIP_VISIBLE_DEVICES": "0"
+    },
+    "idleUnloadMs": 600000,
+    "timeoutMs": 1800000,
+    "extraFormats": []
   },
   "ttsVoices": [
     {

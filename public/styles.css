@@ -667,7 +667,8 @@
   .right-sidebar {
     position: fixed;
     top: 0; right: 0; bottom: 0;
-    width: 414px;
+    width: 476px;         /* 414px の約1.15倍 (ファイル名・API の URL が折り返さないよう広げた) */
+    max-width: 100vw;     /* 狭い画面で画面外にはみ出さないように */
     background: var(--bg-secondary);
     border-left: 1px solid var(--border);
     z-index: 100;
@@ -3440,6 +3441,73 @@
     flex-wrap: wrap;
   }
 
+  /* ── 生成3Dモデル (GLB) ビューア ── */
+  .gen-model-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 8px 0;
+    padding: 8px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    width: 100%;
+    max-width: 480px;
+    box-sizing: border-box;
+  }
+  .gen-model-stage {
+    position: relative;
+    width: 100%;
+    height: 320px;
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    background: radial-gradient(ellipse at 50% 40%, var(--bg-hover), var(--bg-secondary));
+    cursor: grab;
+    touch-action: none;
+  }
+  .gen-model-stage:active { cursor: grabbing; }
+  .gen-model-stage canvas { display: block; width: 100% !important; height: 100% !important; }
+  .gen-model-poster {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    pointer-events: none;
+  }
+  .gen-model-poster img {
+    max-width: 70%;
+    max-height: 70%;
+    object-fit: contain;
+    opacity: 0.55;
+    border-radius: var(--radius-sm);
+  }
+  .gen-model-poster-label {
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: center;
+    padding: 0 12px;
+    pointer-events: auto;
+  }
+  .gen-model-stats {
+    font-size: 10.5px;
+    color: var(--text-muted);
+    align-self: center;
+    margin-left: auto;
+    white-space: nowrap;
+  }
+  .gen-model-card .gen-image-btn:disabled { opacity: 0.45; cursor: default; }
+  /* 全画面表示: カード全体を画面いっぱいに広げ、ビューアを伸ばす */
+  .gen-model-card:fullscreen {
+    max-width: none;
+    margin: 0;
+    border-radius: 0;
+    background: var(--bg-primary);
+  }
+  .gen-model-card:fullscreen .gen-model-stage { flex: 1; height: auto; }
+
   /* ライトボックス（フルサイズプレビュー） */
   .gen-image-lightbox {
     position: fixed;
@@ -3503,6 +3571,7 @@
   @media (max-width: 768px) {
     .gen-image-card { max-width: 240px; }
     .gen-image-thumb { max-width: 220px; max-height: 220px; }
+    .gen-model-stage { height: 260px; }
   }
 
   .generated-image-label {

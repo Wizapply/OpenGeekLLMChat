@@ -633,6 +633,121 @@ img = client.images.generate(prompt="a cat", size="1024x1024", response_format="
 - 生成画像は `public/uploads/sd_*.png` に保存され、`url` は認証なしで取得できます（OpenAI の画像URLと同じ扱い）
 - `config.json` の `imageGen: true` と `imageModels[]` の定義が必要です
 
+### 🧊 3Dモデル生成（画像→3D / テキスト→3D、GLB出力）
+チャットで「この画像を3Dモデルにして」（画像を添付）や「木の椅子の3Dモデルを作って」と頼むと、LLMが `generate_3d_model` ツールを呼び出して **GLB ファイル** を生成し、チャット内の3Dビューアで表示する。生成はすべてローカルで、外部サービスには何も送らない。
+
+- **画像→3D**: 添付画像、または `uploads` の画像（`generate_image` で作った画像も可）から3D化
+- **テキスト→3D**: バックエンドがテキスト非対応なら、stable-diffusion.cpp で「コンセプト画像」を作ってから3D化する2段階方式（`imageGen` が必要）。TRELLIS の text モデルのようにテキスト対応なら直接生成
+- **チャット内プレビュー**: ドラッグで回転・ホイールでズーム・自動回転・ワイヤーフレーム・全画面、面数/頂点数表示、💾 GLB ダウンロード（Three.js r128 + GLTFLoader を初回表示時だけ読み込む）
+- **Meshy互換API**: Meshy の Text to 3D / Image to 3D API と同じ形（下記）。Meshy の SDK やサンプルコードの base URL とキーを差し替えるだけで使える
+- **オンデマンド起動・アイドル停止**: sd-server / Irodori-TTS と同じ方式でワーカーを子プロセス管理。GPU のVRAM解放ボタンの対象にも入る
+- **キュー**: GPU は1件ずつ。複数依頼は順番待ちになり、待ち件数と進捗%がチャットに出る
+
+#### バックエンド（`system/model3d/model3d_server.py`）
+
+| `backend` | 内容 | テキスト | テクスチャ | 目安 |
+|:--|:--|:--:|:--:|:--|
+| `hunyuan3d` | [Hunyuan3D-2](https://github.com/Tencent/Hunyuan3D-2) (`hy3dgen`)。形状 + Paint でテクスチャ。refine (後からテクスチャ) にも対応 | SD経由 | ✓ | 形状 6GB〜 / テクスチャ込み 16GB〜 |
+| `trellis` | [TRELLIS](https://github.com/microsoft/TRELLIS)。`--trellis-text` でテキスト→3D も | ✓ (`--trellis-text`) | ✓ | 16GB〜 |
+| `sf3d` | [Stable Fast 3D](https://github.com/Stability-AI/stable-fast-3d)。高速・省VRAM | SD経由 | ✓ | 6GB〜 |
+| `dummy` | 依存なし。入力画像の色で塗った多面体を返す（配線確認・テスト用） | ✓ | ✓ | なし |
+| `<module>:<Class>` | 独自バックエンド（`model3d_server.py` の `Backend` と同じメソッドを持つクラス） | | | |
+
+#### セットアップ例（Hunyuan3D-2）
+
+**1. Hunyuan3D-2 を専用の venv に入れる**（Python 3.10〜3.12）
+
+```bash
+cd ~
+git clone https://github.com/Tencent/Hunyuan3D-2.git
+cd Hunyuan3D-2
+python3 -m venv venv
+
+# PyTorch を先に入れる。GPU に合ったビルドを選ぶこと
+#   NVIDIA: https://pytorch.org の CUDA 版
+#   AMD   : ROCm 版。RDNA4 (gfx1201 / RX 9000 系) は ROCm 7 系が必要。
+#           既に動いている venv (Irodori-TTS 等) があれば同じ入れ方にするのが確実:
+#           <その venv>/bin/pip freeze | grep -i -E "^torch"
+./venv/bin/pip install torch torchvision --index-url <GPU に合った PyTorch の index URL>
+
+./venv/bin/pip install -r requirements.txt
+./venv/bin/pip install -e .
+# transformers 5.18 以降は DINOv2 の重み名が変わり、Hunyuan3D-2 のモデルを読み込めない
+# (「Missing key(s) in state_dict: ...attention.q_proj.weight」) ので固定する
+./venv/bin/pip install "transformers<5.18"
+
+# 確認: GPU が見えていて (True)、hy3dgen が読めること
+HSA_OVERRIDE_GFX_VERSION=12.0.1 ./venv/bin/python -c "import torch, hy3dgen; print(torch.cuda.is_available(), torch.version.hip or torch.version.cuda)"
+```
+
+- `requirements.txt` で PyTorch が CUDA 版に入れ替わることがあるので、最後の確認で `torch.version.hip`（AMD）/ `torch.version.cuda`（NVIDIA）が出ることを確かめる。入れ替わっていたら PyTorch だけ入れ直す
+- **テクスチャ（色付け）** を使う場合だけ、`hy3dgen/texgen/custom_rasterizer` と `hy3dgen/texgen/differentiable_renderer` で `../../../venv/bin/python setup.py install` を実行する。これは **CUDA（nvcc）が必要** で、ROCm ではビルドできないことが多い。ビルドしなくても形状（グレーのモデル）は作れ、色を頼まれた時は形状だけ出して理由を返す。最初から色付けを使わないなら `extraArgs` に `"--no-texture"`
+
+**2. `config.json` に設定して `model3dGen` を `true` にする**
+
+```json
+"model3dGen": true,
+"model3d": {
+  "command": "/home/you/Hunyuan3D-2/venv/bin/python",
+  "cwd": "/home/you/Hunyuan3D-2",
+  "backend": "hunyuan3d",
+  "extraArgs": ["--model", "tencent/Hunyuan3D-2mini", "--subfolder", "hunyuan3d-dit-v2-mini", "--no-texture"],
+  "exclusiveGpu": true,
+  "env": {
+    "HSA_OVERRIDE_GFX_VERSION": "12.0.1",
+    "HIP_VISIBLE_DEVICES": "0"
+  }
+}
+```
+
+**3. OpenGeekLLMChat を再起動する**（`config.json` と `system/model3d/*` の変更は再起動で反映）
+
+- `command` に venv の python を指定すると、`system/model3d/model3d_server.py --backend <backend> --port <port>` を自動で起動する（`args` を書けば起動引数を丸ごと指定できる）。`command` を省くと「外部で起動済み」とみなして `host:port` に繋ぐだけ
+- モデルの重み（Hunyuan3D-2mini で数GB）は最初の生成時に Hugging Face から取得・ロードされる（初回は数分かかる）。保存先は通常どおりホーム以下（`~/.cache/huggingface`・`~/.cache/hy3dgen`・`~/.rembg` 等）
+- systemd の `ProtectHome=read-only` でホームに書けない時は、ワーカーが Hugging Face / Hunyuan3D / rembg / PyTorch / MIOpen 等の保存先を自動で `<OpenGeekLLMChat>/models/model3d_cache/` に向ける（`ReadWritePaths` に入っているので書ける）。`HF_HOME` 等を `model3d.env` で指定すればそちらが優先。場所を固定したい時は `extraArgs` に `"--cache-dir", "/path"`
+- まず `"backend": "dummy"`, `"command": "python3"` で配線を確認するのがおすすめ（依存なしで GLB が返る）
+- `cwd` に clone したフォルダを指定すると、そのフォルダのパッケージ（`hy3dgen` 等）を `pip install -e .` せずに読み込める
+- 「必要なパッケージ hy3dgen が見つかりません (python: ...)」と出たら、エラーに出ている python が venv の python になっているか（`command`）、`pip install -e .` 済みか `cwd` が clone したフォルダか、を確認する
+- 手で起動すると読み込みエラーをその場で確認できる: `cd ~/Hunyuan3D-2 && ./venv/bin/python <OpenGeekLLMChat>/system/model3d/model3d_server.py --backend hunyuan3d --port 8099 --preload`
+- GPU が1枚でVRAMが厳しい場合は `exclusiveGpu: true`（画像生成と3D生成のVRAMを交互に空ける）
+
+#### Meshy互換API
+
+| メソッド | パス | 内容 |
+|:--|:--|:--|
+| `POST` | `/openapi/v2/text-to-3d` | テキスト→3D。`mode: "preview"`（形状）/ `"refine"`（`preview_task_id` の形状にテクスチャ） → `{"result": "<task_id>"}` |
+| `GET` | `/openapi/v2/text-to-3d/:id` | タスク取得 |
+| `GET` | `/openapi/v2/text-to-3d/:id/stream` | SSE。状態が変わるたびに `event: message` でタスクを送り、終了状態で閉じる |
+| `GET` | `/openapi/v2/text-to-3d?page_num=&page_size=&sort_by=` | 一覧（`sort_by`: `-created_at` 既定 / `+created_at`） |
+| `DELETE` | `/openapi/v2/text-to-3d/:id` | 削除（生成物も消す） |
+| `POST` | `/openapi/v1/image-to-3d` | 画像→3D。`image_url` は data URI / http(s) URL / `/uploads/...` |
+| `GET` / `DELETE` | `/openapi/v1/image-to-3d/:id`（`/stream`、一覧も同様） | |
+
+公開先は2通り（画像生成APIと同じ）:
+
+| 公開先 | Base URL | 認証 |
+|:--|:--|:--|
+| 本体 | `https://<host>:3000` | `Authorization: Bearer <ml.apiTokens のトークン>`（権限 `model3d:generate` または `*`） |
+| 外部APIサーバー（ツール対応モード） | `https://<host>:<port>` | 外部APIサーバーのAPIキー。起動時に **🧊 3Dモデル生成** にチェックが必要 |
+
+```python
+import requests, time
+BASE, H = "https://<host>:3000", {"Authorization": "Bearer <トークン>"}
+task_id = requests.post(f"{BASE}/openapi/v2/text-to-3d", headers=H,
+                        json={"mode": "preview", "prompt": "a wooden chair"}).json()["result"]
+while (t := requests.get(f"{BASE}/openapi/v2/text-to-3d/{task_id}", headers=H).json())["status"] in ("PENDING", "IN_PROGRESS"):
+    time.sleep(3)
+open("chair.glb", "wb").write(requests.get(t["model_urls"]["glb"]).content)
+```
+
+- **タスクオブジェクト**: `id` / `type` / `status`（`PENDING` / `IN_PROGRESS` / `SUCCEEDED` / `FAILED` / `CANCELED`）/ `progress` / `model_urls.glb` / `thumbnail_url` / `preceding_tasks` / `task_error.message` / `created_at` 等（ミリ秒）。エラー応答は Meshy と同じく `{"message": "..."}`
+- **対応パラメータ**: `prompt` / `mode` / `preview_task_id` / `art_style`（`realistic` / `sculpture`）/ `negative_prompt` / `seed` / `target_polycount`（面数の上限。バックエンドが対応する範囲で減らす）/ `should_texture`（image-to-3d、既定 true）/ `texture_image_url`（refine の参照画像）
+- **独自拡張**: `should_texture: true` を text-to-3d の preview に付けると一度でテクスチャまで付ける / `target_formats: ["obj","stl","ply"]`（ワーカーに trimesh が必要）/ 応答の `stage`（処理段階）・`mesh`（面数・頂点数・テクスチャ有無）・`concept_image_url`（テキスト→3D のコンセプト画像）
+- **無視するもの**: `ai_model` / `topology`（常に三角形）/ `enable_pbr` / `texture_prompt` / `symmetry_mode` 等。`model_urls` は GLB（と `target_formats` で指定した形式）のみで、FBX / USDZ は出さない
+- **URL**: `model_urls` / `thumbnail_url` は認証なしで取得できる（Meshy と同じ。タスクIDは推測不能な UUID）。生成物は `public/uploads/model3d/<task_id>/`、タスク記録は `model3d_tasks.json`（再起動後も一覧・取得できる）
+- **タスクの見え方**: APIトークンごと・外部APIサーバーごとに分かれる。ブラウザのログインセッションからは全部見える
+- `image_url` に http(s) URL を渡すとサーバーが取りに行く。LAN 内アドレスは既定で拒否（`model3d.allowPrivateNetwork`）
+
 ### 🔊 音声合成（Irodori-TTS 連携）
 チャットで「『こんにちは』を30代男性の声で作って」と頼むと、LLMが自動的に `generate_speech` ツールを呼び出して音声(WAV)を生成する。日本語特化のローカル音声合成AI [Irodori-TTS](https://github.com/Aratako/Irodori-TTS) の OpenAI互換サーバー（`/v1/audio/speech`）を内部プロセスとして管理する（画像生成 sd-server と同じ方式）。
 
@@ -824,6 +939,7 @@ requests.post(f"{BASE}/ml/rl/sim/train", headers=H, json={
 - **`/health` はパブリック**: 認証なしでヘルスチェック可能 (ロードバランサー・監視ツール対応)
 - **非対応**: `generate_image` ツール / Python実行 (セキュリティのため外部公開しない)
 - **画像生成API (任意)**: 起動時に「🎨 画像生成」にチェックすると `POST /v1/images/generations` (OpenAI互換) を公開。LLMのツールとしては提供しない
+- **3Dモデル生成API (任意)**: 起動時に「🧊 3Dモデル生成」にチェックすると Meshy互換の `/openapi/v2/text-to-3d`・`/openapi/v1/image-to-3d` を公開。生成物は `GET /openapi/files/<task_id>/<file>` で配信。LLMのツールとしては提供しない
 
 ### 📚 永続RAGドキュメント
 サーバー側に永続保存された RAG ドキュメントストア。**Webチャットと外部API両方から利用可能**。
@@ -1391,6 +1507,9 @@ opengeek-llm-chat/
 │   │   ├── vjepa2_server.py    # 常駐エンコーダ + CEM 計画 (/embed /plan、:11601)
 │   │   ├── vjepa2_ac_common.py # V-JEPA 2-AC の共通層 (predictor構築・CEM・行動符号化)
 │   │   └── vjepa2_ac_runner.py # V-JEPA 2-AC の学習・評価・計画 CLI (経験ログ→predictor)
+│   ├── model3d/                # 3Dモデル生成 (画像→3D / テキスト→3D、GLB出力)
+│   │   ├── model3d.js          # タスク管理・キュー・ワーカー管理・Meshy互換API
+│   │   └── model3d_server.py   # 生成ワーカー (Hunyuan3D-2 / TRELLIS / SF3D / dummy、標準ライブラリのHTTP)
 │   ├── sim/                    # シミュレータ連携 (TD-MPC2 / PETS / SAC)
 │   │   ├── sim_http.py         # HTTP プロトコル定義とクライアント (/info /reset /step)
 │   │   ├── sim_rl_common.py    # モデル (TD-MPC2 5M / PETS / SAC)・バッファ・計画器
@@ -1768,6 +1887,17 @@ opengeek-llm-chat/
 | `ttsVoices[].name` | 声プリセット名（LLMがこの名前で指定可能） |
 | `ttsVoices[].voiceId` | サーバーの voice ID（リファレンス音声ファイル名）にマッピング |
 | `ttsVoices[].instructions` | 声のテキスト記述（VoiceDesign のキャプション） |
+| `model3dGen` | 3Dモデル生成 ON/OFF。`model3d` を設定した上で `true` にして有効化 |
+| `model3d.command` / `args` / `extraArgs` / `cwd` / `env` | ワーカー自動起動の spawn 設定。`command` は Hunyuan3D 等を入れた venv の python。`args` 省略時は `model3d_server.py --backend <backend>` を起動。`command` を省くと外部起動済みとみなす |
+| `model3d.backend` | `dummy` / `hunyuan3d` / `trellis` / `sf3d` / `<module>:<Class>`（既定 `dummy`） |
+| `model3d.host` / `port` | ワーカーの待受（既定 127.0.0.1:8093） |
+| `model3d.textMode` | `auto`（既定。バックエンドがテキスト対応なら直接、無ければ画像生成を経由）/ `image` / `native` |
+| `model3d.conceptPromptSuffix` / `conceptNegativePrompt` / `conceptSize` / `conceptSteps` | テキスト→3D で作るコンセプト画像のプロンプト追記・ネガティブ・サイズ・ステップ数 |
+| `model3d.exclusiveGpu` | `true` で画像生成と3D生成のVRAMを交互に空ける（既定 false） |
+| `model3d.readyTimeoutMs` / `timeoutMs` / `idleUnloadMs` | 起動待ち（既定 120000）/ 1件の上限（既定 1800000）/ アイドル停止（既定 600000、0で無効） |
+| `model3d.maxQueue` | 順番待ちの上限（既定 10、超えると 429） |
+| `model3d.allowImageUrlFetch` / `allowPrivateNetwork` / `maxImageMB` | `image_url` の URL 取得を許すか / LAN 内アドレスを許すか / 画像サイズ上限 |
+| `model3d.extraFormats` | GLB に加えて書き出す形式（`obj` / `stl` / `ply`） |
 | `ml.enabled` | 機械学習機能 ON/OFF。`true` で `/ml.html` UI と LLMツール (ml_*) を有効化、要 `npm install duckdb` |
 | `ml.onlinePort` | 強化学習(RL)オンライン常駐ワーカー (`rl_online_server.py`) の localhost ポート、デフォルト 11600 |
 | `ml.onlineIdleMs` | オンラインワーカーのアイドル自動停止時間 (ms)、0 で常駐 (停止しない) |
@@ -1784,7 +1914,7 @@ opengeek-llm-chat/
 | `ml.vjepa2Device` | 常駐エンコーダのデバイス (`cuda` / `cpu`)。省略時は自動 |
 | `ml.apiTokens[].name` | API トークンの名前 (識別用) |
 | `ml.apiTokens[].token` | トークン文字列 (推奨: ml.html の「📡 API」タブから生成) |
-| `ml.apiTokens[].permissions` | 権限配列。`"ml:read"` / `"ml:write"` / `"gdrive:read"` / `"gdrive:write"` / `"image:generate"` / `"*"` |
+| `ml.apiTokens[].permissions` | 権限配列。`"ml:read"` / `"ml:write"` / `"gdrive:read"` / `"gdrive:write"` / `"image:generate"` / `"model3d:generate"` / `"*"` |
 | `orchestration.enabled` | マルチLLMオーケストレーション ON/OFF（デフォルト `false`） |
 | `orchestration.poolMode` | `"auto"`（空きVRAMで自動判定） / `"resident"`（全同時常駐） / `"swap"`（1つずつ載せ替え） |
 | `orchestration.gpuPlacement` | ワーカーをどのGPUに載せるか。`"spread"`（既定、llama.cpp任せで全GPUに分散） / `"auto"`（丸ごと載るGPUが1枚あればそこに固定し、無ければ分散に戻す）。GPU2枚以上でのみ意味がある |
@@ -2440,6 +2570,11 @@ curl -s http://localhost:3000/cloud-llm/status -b cookie.txt     # 設定状態�
 | `GET` | `/tts/info` | ✓ | 音声合成サーバー状態（声一覧、起動中フラグ） |
 | `POST` | `/tts` | ✓ | 音声合成（LLMの generate_speech ツール用） |
 | `POST` | `/tts/unload` | ✓ | Irodori-TTS サーバーを手動アンロード（VRAM解放） |
+| `GET` | `/model3d/info` | ✓ | 3Dモデル生成ワーカーの状態（バックエンド、対応機能、キュー） |
+| `POST` | `/model3d/generate` | ✓ | 3Dモデル生成（LLMの generate_3d_model ツール用）。タスクIDを返す |
+| `GET` | `/model3d/tasks/:id` | ✓ | 3D生成タスクの状態（Meshy形式、URLは相対） |
+| `POST` | `/model3d/unload` | ✓ | 3D生成ワーカーを手動停止（VRAM解放） |
+| `POST/GET/DELETE` | `/openapi/v2/text-to-3d`・`/openapi/v1/image-to-3d` | ✓ | Meshy互換 3Dモデル生成（APIトークンは `model3d:generate` 権限が必要） |
 | `POST` | `/auth` | — | ログイン（Cookie発行・24h TTL） |
 | `GET` | `/sse/gpu` | ✓ | GPU監視 SSE |
 | `GET/POST` | `/settings` | ✓ | ユーザー設定 |
@@ -3621,7 +3756,7 @@ deactivate
 | `ml.apiTokens[]` | 外部 API トークン (Python等の外部スクリプトから利用) |
 | `ml.apiTokens[].name` | トークンの名前（識別用） |
 | `ml.apiTokens[].token` | トークン文字列（推奨: `ml.html` の「📡 API」タブから「🎲 新規トークン生成」で安全に生成） |
-| `ml.apiTokens[].permissions` | 権限。`ml:read` (読み取り) / `ml:write` (書き込み) / `image:generate` (`/v1/images/generations`) / `*` (全権限) |
+| `ml.apiTokens[].permissions` | 権限。`ml:read` (読み取り) / `ml:write` (書き込み) / `image:generate` (`/v1/images/generations`) / `model3d:generate` (Meshy互換 `/openapi/...`) / `*` (全権限) |
 
 トークンが空配列 (`[]`) の場合、外部 API は使えないが、ブラウザ UI と LLM ツール経由のアクセスは Cookie 認証で動作する。
 

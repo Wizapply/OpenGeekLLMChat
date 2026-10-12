@@ -151,6 +151,7 @@ const FAST_DOC_HINT_RE = /資料|ドキュメント|添付|アップロード/;
 const FAST_GDRIVE_HINT_RE = /ドライブ|drive|クラウド/i;
 const FAST_TTS_HINT_RE = /音声|読み上げ|しゃべ|喋|の声で/;
 const FAST_IMGGEN_HINT_RE = /描いて|イラスト|画像を(作|生成|描)|絵を(作|生成|描)/;
+const FAST_MODEL3D_HINT_RE = /3\s*D|３Ｄ|立体|モデリング|glb|メッシュ|フィギュア/i;
 
 // ─── チャット直接添付されたテキストファイルの展開 ───
 // 数KBのソースコード・config等は、RAG (ドキュメント登録→embedding→検索) を経由せず
@@ -1125,16 +1126,25 @@ const MarkdownContent = React.memo(function MarkdownContent({ content, mathSourc
   // 高速パス: マーカーが含まれていなければ分割せず単純レンダリング
   const segments = React.useMemo(() => {
     if (!content) return [];
-    if (!content.includes('[[gen_image:') && !content.includes('[[gen_audio:')) {
+    if (!content.includes('[[gen_image:') && !content.includes('[[gen_audio:') && !content.includes('[[gen_model:')) {
       return [{ type: 'text', value: content }];
     }
     const result = [];
-    const regex = /\[\[gen_(image|audio):([^|\]]+)(?:\|([^\]]*))?\]\]/g;
+    const regex = /\[\[gen_(image|audio|model):([^|\]]+)(?:\|([^\]]*))?\]\]/g;
     let lastIndex = 0;
     let match;
     while ((match = regex.exec(content)) !== null) {
       if (match.index > lastIndex) {
         result.push({ type: 'text', value: content.slice(lastIndex, match.index) });
+      }
+      if (match[1] === 'model') {
+        // [[gen_model:GLB_URL|encodedPrompt|thumbUrl]] (encodeURIComponent は | を %7C にするので split で安全に分けられる)
+        const [encPrompt = '', thumb = ''] = (match[3] || '').split('|');
+        let prompt = '';
+        try { prompt = decodeURIComponent(encPrompt); } catch { prompt = encPrompt; }
+        result.push({ type: 'gen_model', url: match[2], prompt, thumb });
+        lastIndex = regex.lastIndex;
+        continue;
       }
       let metaText = '';
       try { metaText = decodeURIComponent(match[3] || ''); } catch { metaText = match[3] || ''; }
@@ -1151,7 +1161,7 @@ const MarkdownContent = React.memo(function MarkdownContent({ content, mathSourc
     return result;
   }, [content]);
 
-  const hasMarkers = segments.some(s => s.type === 'gen_image' || s.type === 'gen_audio');
+  const hasMarkers = segments.some(s => s.type === 'gen_image' || s.type === 'gen_audio' || s.type === 'gen_model');
 
   // マーカー無し: dangerouslySetInnerHTML でシンプルにレンダリング
   // React.memo で contentが変わらない限りこの関数自体が呼ばれないので、
@@ -1178,6 +1188,9 @@ const MarkdownContent = React.memo(function MarkdownContent({ content, mathSourc
         }
         if (seg.type === 'gen_audio') {
           return <GeneratedAudio key={i} url={seg.url} text={seg.text} />;
+        }
+        if (seg.type === 'gen_model') {
+          return <GeneratedModel key={i} url={seg.url} prompt={seg.prompt} thumb={seg.thumb} />;
         }
         return null;
       })}
@@ -1317,6 +1330,293 @@ function GeneratedAudio({ url, text }) {
         <button className="gen-image-btn" onClick={downloadAudio} title="音声をダウンロード">
           💾 保存
         </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── 生成3Dモデル (GLB) ビューア ───
+// [[gen_model:GLB_URL|encodedPrompt|thumbUrl]] マーカーから描く。
+// Three.js (r128、コードプレビューと同じ版) と GLTFLoader / OrbitControls を
+// 最初に3Dモデルを表示する時だけ読み込む (通常のチャットでは読まない)。
+const MODEL_VIEWER_LIBS = {
+  three: 'https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js',
+  gltf: 'https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js',
+  orbit: 'https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js',
+};
+// WebGL コンテキストはブラウザごとに上限 (16前後) があるので、同時に動かすビューアを絞る。
+// 上限を超えた分はサムネイル表示にして、クリックで起動する
+const MODEL_VIEWER_MAX_ACTIVE = 4;
+let modelViewerActive = 0;
+let threeLibsPromise = null;
+
+function modelMarker(m) {
+  return `[[gen_model:${m.url}|${encodeURIComponent(m.prompt || '')}|${m.thumb || ''}]]`;
+}
+
+function loadThreeForModelViewer() {
+  const T = window.THREE;
+  if (T && T.GLTFLoader && T.OrbitControls) return Promise.resolve(T);
+  if (!threeLibsPromise) {
+    const add = (src) => new Promise((resolve, reject) => {
+      const el = document.createElement('script');
+      el.src = src;
+      el.onload = resolve;
+      el.onerror = () => reject(new Error(`ライブラリを読み込めません: ${src}`));
+      document.head.appendChild(el);
+    });
+    threeLibsPromise = (window.THREE ? Promise.resolve() : add(MODEL_VIEWER_LIBS.three))
+      .then(() => Promise.all([
+        window.THREE.GLTFLoader ? null : add(MODEL_VIEWER_LIBS.gltf),
+        window.THREE.OrbitControls ? null : add(MODEL_VIEWER_LIBS.orbit),
+      ]))
+      .then(() => window.THREE)
+      .catch((e) => { threeLibsPromise = null; throw e; });
+  }
+  return threeLibsPromise;
+}
+
+function GeneratedModel({ url, prompt, thumb }) {
+  const stageRef = useRef(null);
+  const cardRef = useRef(null);
+  const viewRef = useRef(null);       // { controls, wireframe(on), dispose }
+  const [phase, setPhase] = useState('idle');  // idle | waiting | loading | ready | error
+  const [err, setErr] = useState(null);
+  const [stats, setStats] = useState(null);
+  const [autoRotate, setAutoRotate] = useState(true);
+  const [wire, setWire] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [wantStart, setWantStart] = useState(false);
+  const [force, setForce] = useState(false);   // 同時表示数の上限を超えていても、クリックされたら起動する
+
+  // 画面に入ったら起動 (履歴に3Dモデルが多くても、見えていないものは WebGL を作らない)
+  useEffect(() => {
+    const el = cardRef.current;
+    if (!el || wantStart) return;
+    if (typeof IntersectionObserver === 'undefined') { setWantStart(true); return; }
+    const io = new IntersectionObserver((entries) => {
+      if (entries.some(e => e.isIntersecting)) { setWantStart(true); io.disconnect(); }
+    }, { rootMargin: '200px' });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [wantStart]);
+
+  useEffect(() => {
+    if (!wantStart) return;
+    if (!force && modelViewerActive >= MODEL_VIEWER_MAX_ACTIVE) { setPhase('waiting'); return; }
+    let disposed = false;
+    let raf = 0;
+    let renderer = null;
+    let ro = null;
+    let counted = true;
+    modelViewerActive++;
+    setPhase('loading');
+    setErr(null);
+
+    loadThreeForModelViewer().then((THREE) => {
+      if (disposed) return;
+      const stage = stageRef.current;
+      if (!stage) return;
+      const w = stage.clientWidth || 320;
+      const h = stage.clientHeight || 300;
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: false });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.setSize(w, h);
+      renderer.outputEncoding = THREE.sRGBEncoding;
+      renderer.setClearColor(0x000000, 0);
+      stage.appendChild(renderer.domElement);
+
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(40, w / h, 0.01, 1000);
+      scene.add(new THREE.HemisphereLight(0xffffff, 0x444455, 1.1));
+      const key = new THREE.DirectionalLight(0xffffff, 1.0);
+      key.position.set(3, 5, 4);
+      scene.add(key);
+      const fill = new THREE.DirectionalLight(0xffffff, 0.45);
+      fill.position.set(-4, 2, -3);
+      scene.add(fill);
+      // 環境マップが無いと metallic の高い素材が真っ黒になるので、カメラに追従する補助光を足す
+      const camLight = new THREE.PointLight(0xffffff, 0.35);
+      camera.add(camLight);
+      scene.add(camera);
+
+      const controls = new THREE.OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.08;
+      controls.autoRotate = true;
+      controls.autoRotateSpeed = 1.6;
+
+      const materials = [];
+      const loader = new THREE.GLTFLoader();
+      loader.load(url, (gltf) => {
+        if (disposed) return;
+        const root = gltf.scene;
+        let verts = 0;
+        let faces = 0;
+        root.traverse((o) => {
+          if (!o.isMesh) return;
+          const g = o.geometry;
+          const n = g.attributes.position ? g.attributes.position.count : 0;
+          verts += n;
+          faces += g.index ? g.index.count / 3 : n / 3;
+          for (const m of (Array.isArray(o.material) ? o.material : [o.material])) {
+            if (!m) continue;
+            // 頂点カラーだけで色が付いているモデル (テクスチャ無し) もそのまま見えるように
+            if (g.attributes.color && !m.map) m.vertexColors = true;
+            if (m.metalness != null && m.metalness > 0.6 && !m.envMap) m.metalness = 0.6;
+            m.side = THREE.DoubleSide;
+            materials.push(m);
+          }
+        });
+        // 原点中心・視野に収まるように配置
+        const box = new THREE.Box3().setFromObject(root);
+        const size = box.getSize(new THREE.Vector3());
+        const center = box.getCenter(new THREE.Vector3());
+        root.position.sub(center);
+        scene.add(root);
+        const radius = Math.max(size.x, size.y, size.z) * 0.5 || 1;
+        const dist = radius / Math.sin((camera.fov * Math.PI / 180) / 2) * 1.05;
+        camera.position.set(dist * 0.55, dist * 0.35, dist * 0.75);
+        camera.near = dist / 100;
+        camera.far = dist * 100;
+        camera.updateProjectionMatrix();
+        controls.target.set(0, 0, 0);
+        controls.minDistance = radius * 0.3;
+        controls.maxDistance = dist * 4;
+        controls.update();
+        setStats({ verts, faces: Math.round(faces) });
+        setPhase('ready');
+      }, undefined, (e) => {
+        if (disposed) return;
+        setErr(e?.message || 'GLB を読み込めませんでした');
+        setPhase('error');
+      });
+
+      const tick = () => {
+        raf = requestAnimationFrame(tick);
+        controls.update();
+        renderer.render(scene, camera);
+      };
+      tick();
+
+      ro = new ResizeObserver(() => {
+        const cw = stage.clientWidth;
+        const ch = stage.clientHeight;
+        if (!cw || !ch) return;
+        renderer.setSize(cw, ch);
+        camera.aspect = cw / ch;
+        camera.updateProjectionMatrix();
+      });
+      ro.observe(stage);
+
+      viewRef.current = {
+        controls,
+        setWire: (on) => materials.forEach(m => { m.wireframe = on; }),
+        dispose: () => {
+          scene.traverse((o) => {
+            if (o.geometry) o.geometry.dispose();
+            const mats = o.material ? (Array.isArray(o.material) ? o.material : [o.material]) : [];
+            for (const m of mats) {
+              for (const k of ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'emissiveMap', 'aoMap']) {
+                if (m[k]) m[k].dispose();
+              }
+              m.dispose();
+            }
+          });
+          controls.dispose();
+        },
+      };
+    }).catch((e) => {
+      if (disposed) return;
+      setErr(e.message);
+      setPhase('error');
+    });
+
+    return () => {
+      disposed = true;
+      if (counted) { modelViewerActive--; counted = false; }
+      cancelAnimationFrame(raf);
+      if (ro) ro.disconnect();
+      if (viewRef.current) { try { viewRef.current.dispose(); } catch {} viewRef.current = null; }
+      if (renderer) {
+        renderer.dispose();
+        try { renderer.forceContextLoss(); } catch {}
+        if (renderer.domElement.parentNode) renderer.domElement.parentNode.removeChild(renderer.domElement);
+      }
+    };
+    // phase は依存に入れない (loading への遷移で自分を作り直さないため)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [url, wantStart, force]);
+
+  useEffect(() => { if (viewRef.current) viewRef.current.controls.autoRotate = autoRotate; }, [autoRotate, phase]);
+  useEffect(() => { if (viewRef.current) viewRef.current.setWire(wire); }, [wire, phase]);
+
+  function download() {
+    const a = document.createElement('a');
+    a.href = url;
+    const parts = url.split('/');
+    const id = parts.length >= 2 ? parts[parts.length - 2] : '';
+    a.download = /^[0-9a-f-]{36}$/.test(id) ? `model_${id.slice(0, 8)}.glb` : (parts.pop() || 'model.glb');
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
+
+  function toggleFullscreen() {
+    const el = cardRef.current;
+    if (!el) return;
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    else if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+  }
+
+  async function copyPrompt() {
+    try {
+      await navigator.clipboard.writeText(prompt || '');
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {}
+  }
+
+  const showPoster = phase !== 'ready';
+  return (
+    <div className="gen-model-card" ref={cardRef}>
+      <div className="gen-model-stage" ref={stageRef}>
+        {showPoster && (
+          <div className="gen-model-poster">
+            {thumb && <img src={thumb} alt={prompt || '3Dモデル'} loading="lazy" />}
+            <div className="gen-model-poster-label">
+              {phase === 'error' ? `表示できません: ${err}`
+                : phase === 'waiting' ? (
+                  <button className="gen-image-btn" onClick={() => setForce(true)}>
+                    ▶ 3Dで表示
+                  </button>
+                )
+                : '3Dモデルを読み込み中…'}
+            </div>
+          </div>
+        )}
+      </div>
+      <div className="gen-image-actions">
+        {prompt && (
+          <div className="gen-image-prompt" title={prompt}>
+            <span className="gen-image-prompt-label">🧊</span>
+            <span className="gen-image-prompt-text">{prompt}</span>
+          </div>
+        )}
+        <div className="gen-image-buttons">
+          <button className="gen-image-btn" onClick={download} title="GLB ファイルをダウンロード">💾 GLB</button>
+          <button className="gen-image-btn" onClick={() => setAutoRotate(v => !v)} disabled={phase !== 'ready'}
+            title="自動回転の ON/OFF">{autoRotate ? '⏸ 回転停止' : '🔄 自動回転'}</button>
+          <button className="gen-image-btn" onClick={() => setWire(v => !v)} disabled={phase !== 'ready'}
+            title="ワイヤーフレーム表示">{wire ? '■ 面表示' : '◇ ワイヤー'}</button>
+          <button className="gen-image-btn" onClick={toggleFullscreen} title="全画面表示">⛶ 全画面</button>
+          {prompt && (
+            <button className="gen-image-btn" onClick={copyPrompt} title="プロンプトをコピー">
+              {copied ? '✓ コピー済' : '📋 プロンプト'}
+            </button>
+          )}
+          {stats && <span className="gen-model-stats">{stats.faces.toLocaleString()} 面 / {stats.verts.toLocaleString()} 頂点</span>}
+        </div>
       </div>
     </div>
   );
@@ -1583,7 +1883,8 @@ function cleanSampleText(text, { citations = true, markers = true } = {}) {
   s = s.replace(/<think>[\s\S]*?<\/think>/gi, '');     // 思考タグ (表示上は別欄だが念のため)
   if (markers) {
     // 画像/音声の埋め込みマーカーは画面描画用。学習データに入れても意味がない
-    s = s.replace(/\[\[gen_image:[^\]]*\]\]/g, '').replace(/\[\[gen_audio:[^\]]*\]\]/g, '');
+    s = s.replace(/\[\[gen_image:[^\]]*\]\]/g, '').replace(/\[\[gen_audio:[^\]]*\]\]/g, '')
+      .replace(/\[\[gen_model:[^\]]*\]\]/g, '');
   }
   if (citations) s = s.replace(CHAT_CITATION_RE, '');
   return s.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
@@ -2620,6 +2921,7 @@ function App() {
     if ((t.pool || []).length) items.push(`マルチLLMワーカー ${t.pool.length}台（${t.pool.join(', ')}）`);
     if (t.image) items.push(`画像生成${typeof t.image === 'string' ? `「${t.image}」` : ''}`);
     if (t.tts) items.push('音声合成(TTS)');
+    if (t.model3d) items.push('3Dモデル生成');
     if (items.length === 0) {
       setError('解放できるモデルがありません（すでに全てアンロード済みです）');
       return;
@@ -3399,7 +3701,7 @@ function App() {
       // Web検索も画像生成も切った「資料を読むだけ」の構成で
       // search_persistent_documents に一生たどり着けない
       const useAgentic = appConfig.ragMode === 'agentic'
-        && (documents.length > 0 || webSearchActive || appConfig.imageGen || appConfig.ttsGen || gdriveActive
+        && (documents.length > 0 || webSearchActive || appConfig.imageGen || appConfig.ttsGen || appConfig.model3dGen || gdriveActive
             || persistentRagActive);
 
       if (useAgentic) {
@@ -3738,6 +4040,39 @@ function App() {
                   count: { type: 'number', description: '生成枚数 (デフォルト 1、最大 4)' },
                 },
                 required: ['prompt']
+              }
+            }
+          });
+        }
+
+        // 3Dモデル生成ツール: model3dGen が有効ならツール提供
+        // 「3Dモデルにして」「立体化して」「フィギュアを作って」等を検出して使用
+        if (appConfig.model3dGen) {
+          tools.push({
+            type: 'function',
+            function: {
+              name: 'generate_3d_model',
+              description: '3Dモデル (GLBファイル) をローカルAIで生成する。ユーザーが「3Dモデルにして」「3Dで作って」「立体化して」「フィギュアを作って」「GLBを作って」等を依頼した場合に使用する。'
+                + 'テキストから作る場合は prompt に作る物の英語の説明を入れる。'
+                + '画像から作る場合は image に "attached" (ユーザーが添付した画像) か、サーバーの画像パス ("/uploads/sd_xxx.png" など。generate_image で作った画像も使える) を入れる。'
+                + '生成には数分かかる。',
+              parameters: {
+                type: 'object',
+                properties: {
+                  prompt: {
+                    type: 'string',
+                    description: '作る物の説明。英語推奨。1つの物体を具体的に。例: "a cute ceramic owl figurine, smooth glossy surface"',
+                  },
+                  image: {
+                    type: 'string',
+                    description: '画像から作る時だけ指定: "attached" (添付画像) または "/uploads/..." の画像パス。テキストから作る時は省略',
+                  },
+                  texture: {
+                    type: 'boolean',
+                    description: '色 (テクスチャ) を付けるか。既定 true。形だけで良い・速さ優先なら false',
+                  },
+                },
+                required: [],
               }
             }
           });
@@ -4177,6 +4512,7 @@ function App() {
         // ことがあるため、最終応答でこの実URLでマーカーを確定させる。
         const generatedAudios = [];   // { url, text }
         const generatedImages = [];   // { url, prompt }
+        const generatedModels = [];   // { url, prompt, thumb }
 
         // アシスタントメッセージを先に追加
         setMessages(prev => [...prev, { role: 'assistant', content: '', thinking: '', contexts: null, agentStatus: 'ツール判断中...', searchQueries: [] }]);
@@ -4234,6 +4570,10 @@ function App() {
         }
         if (appConfig.ml?.enabled && (hasImages || wantsImageModels)) {
           toolListLines.push('- image_list_models: 画像学習の学習済みカスタムモデル一覧（「どんな画像モデルがある」「検出モデル一覧」等で使う）');
+        }
+        if (appConfig.model3dGen) {
+          toolListLines.push('- generate_3d_model: 3Dモデル(GLB)を生成（「3Dモデルにして」「立体化して」「3Dで作って」「フィギュアにして」等で使う。'
+            + (hasImages ? '添付画像を3D化する時は image に "attached"' : 'テキストから作る時は prompt に英語の説明') + '）');
         }
         if (appConfig.ttsGen) {
           toolListLines.push('- generate_speech: テキストを音声(WAV)に合成（「音声にして」「しゃべって」「読み上げて」「〇〇の声で作って」等で使う。声の特徴はテキストで指定可）');
@@ -4343,6 +4683,7 @@ function App() {
             gdrive: gdriveActive && !!text && FAST_GDRIVE_HINT_RE.test(text),
             tts: !!appConfig.ttsGen && !!text && FAST_TTS_HINT_RE.test(text),
             imageGen: !!appConfig.imageGen && !!text && FAST_IMGGEN_HINT_RE.test(text),
+            model3d: !!appConfig.model3dGen && !!text && FAST_MODEL3D_HINT_RE.test(text),
             // 画像添付時は detect_objects の可能性があるので判断LLMに回す (安全側)
             detect: hasImages && !!appConfig.ml?.enabled,
             serverFile: appConfig.fileAccess !== false && wantsServerFileOps,
@@ -5420,6 +5761,131 @@ function App() {
                   return copy;
                 });
               }
+            } else if (fnName === 'generate_3d_model') {
+              const prompt = String(fnArgs.prompt || '').trim();
+              const imgArg = String(fnArgs.image || '').trim();
+              const texture = fnArgs.texture !== false && fnArgs.texture !== 'false';
+              const toDataUrl = (img) => (img.base64.startsWith('data:') ? img.base64 : `data:image/png;base64,${img.base64}`);
+              // ─── 3D化する画像の解決 ───
+              // LLM が書く image は当てにならない: 直前に generate_image で作った画像を "attached" と
+              // 呼んだり、ファイル名 (sd_<ts>_<rand>_0.png) を書き崩したりする (gen_image マーカーと同じ問題)。
+              // そこで LLM の値は「実在を確かめられた時だけ」使い、それ以外は実際に存在する画像を
+              // 次の順で選ぶ: このターンの添付画像 → このターンに生成した画像 → (画像を指す依頼なら) 会話の直近の画像
+              const IMG_PATH_RE = /\/?uploads\/[^\s|\]\)"'<>]+?\.(?:png|jpe?g|webp)/i;
+              const wantsAttached = /^(attached|attachment|添付|user|uploaded|generated|生成|true)/i.test(imgArg);
+              const refersToImage = !!imgArg
+                || /(この|その|あの|さっき|先ほど|先程|上の|前の|今の|生成した|作った|描いた)(画像|絵|イラスト|写真)|(画像|絵|イラスト|写真)を(立体|3D|３Ｄ)/i.test(text || '');
+              // 存在しないパスも SPA のフォールバックが index.html を 200 で返すので、画像の Content-Type で確かめる
+              const uploadExists = async (url) => {
+                try {
+                  const r = await fetch(url, { method: 'HEAD', signal: controller.signal });
+                  return r.ok && /^image\//i.test(r.headers.get('content-type') || '');
+                } catch { return false; }
+              };
+              const lastHistoryImage = () => {
+                for (let mi = messages.length - 1; mi >= 0; mi--) {
+                  const m = messages[mi];
+                  if (m.role === 'assistant') {
+                    const found = [...String(m.content || '').matchAll(/\[\[gen_image:([^|\]]+)/g)];
+                    if (found.length) return found[found.length - 1][1];
+                  } else if (m.role === 'user' && m.images && m.images.length) {
+                    return toDataUrl(m.images[m.images.length - 1]);
+                  }
+                }
+                return null;
+              };
+              let image = null;
+              if (imgArg && !wantsAttached) {
+                if (/^data:image\//i.test(imgArg)) {
+                  image = imgArg;
+                } else if (/^https?:\/\//i.test(imgArg) && !IMG_PATH_RE.test(new URL(imgArg, location.href).pathname)) {
+                  image = imgArg;  // 外部の画像URL はサーバーが取りに行く
+                } else {
+                  const m = imgArg.match(IMG_PATH_RE);
+                  const p = m ? (m[0].startsWith('/') ? m[0] : `/${m[0]}`)
+                    : (/^[\w.-]+\.(png|jpe?g|webp)$/i.test(imgArg) ? `/uploads/${imgArg}` : null);
+                  if (p && await uploadExists(p)) image = p;
+                }
+              }
+              if (!image && pendingImages?.length) image = toDataUrl(pendingImages[0]);
+              if (!image && generatedImages.length) image = generatedImages[generatedImages.length - 1].url;
+              if (!image && refersToImage) image = lastHistoryImage();
+              if (imgArg && !image) {
+                apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: `3D化する画像が見つかりません (指定: ${imgArg.slice(0, 120)})。`
+                  + '画像から作る場合は画像を添付してもらってください。テキストから作る場合は image を省いて prompt だけで呼び直してください。' });
+                continue;
+              }
+              if (!prompt && !image) {
+                apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: 'prompt (作る物の説明) か image (画像) のどちらかを指定してください。' });
+                continue;
+              }
+
+              const label = prompt || (image ? '画像から生成' : '');
+              searchQueries.push({ query: `3Dモデル生成: ${label.slice(0, 50)}`, resultCount: null, type: 'model3d' });
+              const setStatus = (status) => setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: status, searchQueries: [...searchQueries] };
+                return copy;
+              });
+              setStatus(`🧊 3Dモデル生成を開始: "${label.slice(0, 40)}"（数分かかります）`);
+
+              try {
+                const res = await fetch('/model3d/generate', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ prompt, image, texture }),
+                  signal: controller.signal,
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+
+                // 生成はサーバーのキューで進むので、タスクをポーリングして進捗を出す
+                const deadline = Date.now() + 60 * 60 * 1000;
+                let task = null;
+                for (;;) {
+                  await new Promise(r => setTimeout(r, 2000));
+                  if (controller.signal.aborted) throw new DOMException('aborted', 'AbortError');
+                  const tr = await fetch(`/model3d/tasks/${data.id}`, { signal: controller.signal });
+                  task = await tr.json();
+                  if (!tr.ok) throw new Error(task.error || `HTTP ${tr.status}`);
+                  if (task.status === 'SUCCEEDED') break;
+                  if (task.status === 'FAILED' || task.status === 'CANCELED') {
+                    throw new Error(task.task_error?.message || '3Dモデルの生成に失敗しました');
+                  }
+                  if (Date.now() > deadline) throw new Error('タイムアウト（60分超過）');
+                  const note = task.status === 'PENDING'
+                    ? `順番待ち${task.preceding_tasks > 0 ? ` (前に${task.preceding_tasks}件)` : ''}`
+                    : (task.stage || '処理中');
+                  setStatus(`🧊 3Dモデル生成中 ${task.progress || 0}%: ${note}`);
+                }
+
+                const model = { url: task.model_urls?.glb, prompt: label, thumb: task.thumbnail_url || '' };
+                if (!model.url) throw new Error('GLB が返されませんでした');
+                generatedModels.push(model);
+                searchQueries[searchQueries.length - 1].resultCount = 1;
+                const faces = task.mesh?.faces;
+                const stats = faces ? `（${faces.toLocaleString()}面${task.mesh?.textured ? '・テクスチャ付き' : '・テクスチャなし'}）` : '';
+                // 色を頼まれたのに付けられなかった理由 (テクスチャ部品が無い等)。ユーザーに伝えるよう渡す
+                const note = task.mesh?.warning ? `\n注意: 色 (テクスチャ) は付けられませんでした: ${task.mesh.warning}` : '';
+                const elapsed = task.finished_at && task.started_at ? `、${Math.round((task.finished_at - task.started_at) / 1000)}秒` : '';
+                const summary = `3Dモデル (GLB) を生成しました${stats}${elapsed}。${note}\n\n${modelMarker(model)}\n\n`
+                  + '重要: 上記の [[gen_model:...]] マーカーを、必ずそのまま改変せずに最終応答にコピーして含めてください。これは3Dビューアを表示するためのタグです。'
+                  + 'あなたは「〇〇の3Dモデルを作りました。ドラッグで回転できます。」のような1〜2文のコメントを添えるだけで結構です。';
+                apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: summary });
+              } catch (e) {
+                if (e.name === 'AbortError') throw e;
+                console.error('[generate_3d_model] エラー:', e);
+                // 失敗理由は LLM の言い換えで消えがちなので、ツール欄にも原文で出す
+                searchQueries[searchQueries.length - 1].query = `3Dモデル生成失敗: ${e.message.slice(0, 120)}`;
+                searchQueries[searchQueries.length - 1].resultCount = 0;
+                apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: `3Dモデル生成失敗: ${e.message}\n\nユーザーには、上の失敗理由（「3Dモデル生成失敗:」の後ろの文）をそのまま引用して伝えてください。` });
+              } finally {
+                setMessages(prev => {
+                  const copy = [...prev];
+                  copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: null, searchQueries: [...searchQueries] };
+                  return copy;
+                });
+              }
             } else if (fnName === 'generate_speech') {
               const ttsText = (fnArgs.text || '').trim();
               const ttsVoice = fnArgs.voice || fnArgs.instructions || '';
@@ -5796,7 +6262,7 @@ function App() {
             : [{ role: 'system', content: buildCloudSystemPrompt() }, ...finalMessages.filter(m => m.role !== 'system' || finalMessages.indexOf(m) !== 0)];
           await runCloudAnswer({
             idx: cloudIdx, requestMessages: cloudMessages, reason: 'toggle', controller,
-            genMedia: { audios: generatedAudios, images: generatedImages },
+            genMedia: { audios: generatedAudios, images: generatedImages, models: generatedModels },
           });
           return;
         }
@@ -5822,7 +6288,7 @@ function App() {
         });
 
         if (!finalRes.ok) throw new Error(`API Error: ${finalRes.status}`);
-        await streamResponse(finalRes, contextInfo, searchQueries, { audios: generatedAudios, images: generatedImages }, finalMessages);
+        await streamResponse(finalRes, contextInfo, searchQueries, { audios: generatedAudios, images: generatedImages, models: generatedModels }, finalMessages);
 
         // ─── 思考のみ応答の救済 ───
         // 思考型モデルが思考だけで max_tokens を使い切り回答に到達しなかった場合、
@@ -5837,7 +6303,7 @@ function App() {
               baseMessages: finalMessages,
               contextInfo,
               searchQueries,
-              genMedia: { audios: generatedAudios, images: generatedImages },
+              genMedia: { audios: generatedAudios, images: generatedImages, models: generatedModels },
               requestBody: {
                 model: chatModel,
                 ...llamaCommonOptions,
@@ -5931,7 +6397,7 @@ function App() {
                 };
                 return copy;
               });
-              await streamResponse(retryRes, contextInfo, searchQueries, { audios: generatedAudios, images: generatedImages }, retryMessages);
+              await streamResponse(retryRes, contextInfo, searchQueries, { audios: generatedAudios, images: generatedImages, models: generatedModels }, retryMessages);
 
               // それでも空なら、固定メッセージにフォールバック
               const afterMsg = await new Promise(resolve => {
@@ -6073,7 +6539,7 @@ function App() {
           });
 
           if (!retryRes.ok) break;
-          await streamResponse(retryRes, contextInfo, searchQueries, { audios: generatedAudios, images: generatedImages }, apiMessages);
+          await streamResponse(retryRes, contextInfo, searchQueries, { audios: generatedAudios, images: generatedImages, models: generatedModels }, apiMessages);
           // 次のループで再度<|tool_call|>が出ていないかチェック
         }
 
@@ -6387,7 +6853,8 @@ function App() {
       if (!genMedia) return content;
       const audios = genMedia.audios || [];
       const images = genMedia.images || [];
-      if (audios.length === 0 && images.length === 0) return content;
+      const models = genMedia.models || [];
+      if (audios.length === 0 && images.length === 0 && models.length === 0) return content;
       let out = content || '';
       // 1) 既存マーカーのURLを実URLで順番に上書き（余分な捏造マーカーは削除）
       let ai = 0;
@@ -6402,7 +6869,15 @@ function App() {
         const im = images[ii++];
         return `[[gen_image:${im.url}|${encodeURIComponent(im.prompt || '')}]]`;
       });
+      let mi = 0;
+      out = out.replace(/\[\[gen_model:[^\]]*\]\]/g, () => {
+        if (mi >= models.length) return '';
+        return modelMarker(models[mi++]);
+      });
       // 2) LLMがマーカーを出さなかった分を末尾に補完
+      for (; mi < models.length; mi++) {
+        out += `\n\n${modelMarker(models[mi])}`;
+      }
       for (; ai < audios.length; ai++) {
         out += `\n\n[[gen_audio:${audios[ai].url}|${encodeURIComponent(audios[ai].text || '')}]]`;
       }
@@ -6768,7 +7243,8 @@ function App() {
     // ─── 生成メディアのマーカーを実URLで確定 ───
     // LLMが [[gen_audio:...]]/[[gen_image:...]] のファイル名を改変・捏造して
     // 出力することがあるため、ツールが実際に返したURLでマーカーを上書き・補完する。
-    if (genMedia && ((genMedia.audios && genMedia.audios.length) || (genMedia.images && genMedia.images.length))) {
+    if (genMedia && ((genMedia.audios && genMedia.audios.length) || (genMedia.images && genMedia.images.length)
+        || (genMedia.models && genMedia.models.length))) {
       setMessages(prev => {
         const copy = [...prev];
         const last = copy[copy.length - 1];
@@ -8156,6 +8632,9 @@ function App() {
     for (const im of (genMedia?.images || [])) {
       if (!finalContent.includes(im.url)) finalContent += `\n\n[[gen_image:${im.url}|${encodeURIComponent(im.prompt || '')}]]`;
     }
+    for (const md of (genMedia?.models || [])) {
+      if (!finalContent.includes(md.url)) finalContent += `\n\n${modelMarker(md)}`;
+    }
     setMessages(prev => {
       const cur = prev[idx];
       if (!cur) return prev;
@@ -9370,7 +9849,7 @@ function App() {
                       {msg.searchQueries?.map((sq, si) => (
                         <div key={si} className="agent-search-item">
                           {/* 画像/音声生成はクエリ文に説明があるため、2行目のアイコンは省略（重複防止） */}
-                          {sq.type !== 'image' && sq.type !== 'audio' && (
+                          {sq.type !== 'image' && sq.type !== 'audio' && sq.type !== 'model3d' && (
                             <span className="agent-search-icon">{sq.type === 'web' ? '🌐' : sq.type === 'file' ? '📁' : sq.type === 'data' ? '🗂️' : sq.type === 'gdrive' ? '☁️' : '🔍'}</span>
                           )}
                           <span className="agent-search-query">{sq.query}</span>
@@ -10024,6 +10503,7 @@ function App() {
                 for (const w of (t?.pool || [])) loaded.push({ icon: '🎼', text: w });
                 if (t?.image) loaded.push({ icon: '🖼️', text: typeof t.image === 'string' ? t.image : '画像生成' });
                 if (t?.tts) loaded.push({ icon: '🔊', text: '音声合成' });
+                if (t?.model3d) loaded.push({ icon: '🧊', text: '3Dモデル生成' });
                 return (
                   <div className="vram-release-card">
                     <div className="vram-release-head">
@@ -10450,6 +10930,13 @@ function App() {
                           disabledReason: 'config.json の imageGen が無効、または imageModels が未定義',
                           warnLabel: '画像生成が無効のため利用不可',
                         },
+                        {
+                          id: 'model3d',
+                          label: '🧊 3Dモデル生成 (Meshy互換 /openapi/v2/text-to-3d, /openapi/v1/image-to-3d)',
+                          disabled: !appConfig.model3dGen,
+                          disabledReason: 'config.json の model3dGen が無効',
+                          warnLabel: '3Dモデル生成が無効のため利用不可',
+                        },
                       ].map(t => (
                         <label key={t.id} className="api-form-checkbox-label" style={{
                           fontSize: 12,
@@ -10579,6 +11066,11 @@ function App() {
                             <div className="api-server-usage">
                               例: <code>curl {externalUrl}/chat/completions -H "Authorization: Bearer {s.apiKey.slice(0, 12)}..." -H "Content-Type: application/json" -d '{`{"model":"x","messages":[{"role":"user","content":"hi"}]}`}'</code>
                             </div>
+                            {s.agentMode && (s.tools || []).includes('model3d') && (
+                              <div className="api-server-usage">
+                                3D: <code>curl {externalUrl.replace(/\/v1$/, '')}/openapi/v2/text-to-3d -H "Authorization: Bearer {s.apiKey.slice(0, 12)}..." -H "Content-Type: application/json" -d '{`{"mode":"preview","prompt":"a wooden chair"}`}'</code>
+                              </div>
+                            )}
                             {s.agentMode && (s.tools || []).includes('image') && (
                               <div className="api-server-usage">
                                 画像: <code>curl {externalUrl}/images/generations -H "Authorization: Bearer {s.apiKey.slice(0, 12)}..." -H "Content-Type: application/json" -d '{`{"prompt":"a cat","size":"1024x1024","response_format":"url"}`}'</code>
