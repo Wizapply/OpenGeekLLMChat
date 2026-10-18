@@ -407,13 +407,15 @@ class Hunyuan3DBackend(Backend):
             except ImportError as e:
                 self.texture_error = (f'テクスチャ生成の部品が読み込めません ({e})。'
                                       'hy3dgen/texgen の custom_rasterizer と differentiable_renderer のビルドが必要です'
-                                      ' (CUDA 必須。ROCm ではビルドできないことが多い)')
+                                      ' (NVIDIA は CUDA、AMD は ROCm の hipcc でビルド。手順は README の「テクスチャ生成」)')
                 self._update_caps()
                 log.warning('%s → 以後は形状のみ出力', self.texture_error)
                 return None
             model = self.args.texture_model or 'tencent/Hunyuan3D-2'
+            # subfolder 省略時は Hunyuan3D-2 の既定 (hunyuan3d-paint-v2-0-turbo: 速い・軽い)
+            kw = {'subfolder': self.args.texture_subfolder} if self.args.texture_subfolder else {}
             progress(f'Hunyuan3D テクスチャモデルを読み込み中 ({model})', None)
-            self.paint = Hunyuan3DPaintPipeline.from_pretrained(model)
+            self.paint = Hunyuan3DPaintPipeline.from_pretrained(model, **kw)
             if self.args.low_vram and hasattr(self.paint, 'enable_model_cpu_offload'):
                 self.paint.enable_model_cpu_offload()
         return self.paint
@@ -802,6 +804,8 @@ def parse_args(argv=None):
     p.add_argument('--model', default=None, help='形状 (または全体) のモデル ID / パス')
     p.add_argument('--subfolder', default=None, help='hunyuan3d: サブフォルダ (例: hunyuan3d-dit-v2-mini)')
     p.add_argument('--texture-model', default=None, help='hunyuan3d: テクスチャモデル (既定 tencent/Hunyuan3D-2)')
+    p.add_argument('--texture-subfolder', default=None,
+                   help='hunyuan3d: テクスチャモデルの種類 (既定 hunyuan3d-paint-v2-0-turbo。高品質版は hunyuan3d-paint-v2-0)')
     p.add_argument('--text-model', default=None, help='trellis: テキストモデル (既定 microsoft/TRELLIS-text-xlarge)')
     p.add_argument('--trellis-text', action='store_true', help='trellis: テキスト→3D を有効にする')
     p.add_argument('--device', default=None, help='cuda / cpu (既定: 自動)')

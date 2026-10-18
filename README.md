@@ -681,7 +681,59 @@ HSA_OVERRIDE_GFX_VERSION=12.0.1 ./venv/bin/python -c "import torch, hy3dgen; pri
 ```
 
 - `requirements.txt` で PyTorch が CUDA 版に入れ替わることがあるので、最後の確認で `torch.version.hip`（AMD）/ `torch.version.cuda`（NVIDIA）が出ることを確かめる。入れ替わっていたら PyTorch だけ入れ直す
-- **テクスチャ（色付け）** を使う場合だけ、`hy3dgen/texgen/custom_rasterizer` と `hy3dgen/texgen/differentiable_renderer` で `../../../venv/bin/python setup.py install` を実行する。これは **CUDA（nvcc）が必要** で、ROCm ではビルドできないことが多い。ビルドしなくても形状（グレーのモデル）は作れ、色を頼まれた時は形状だけ出して理由を返す。最初から色付けを使わないなら `extraArgs` に `"--no-texture"`
+- **テクスチャ（色付け）** を使う場合だけ、下の「テクスチャ生成の部品をビルドする」を行う。ビルドしなくても形状（グレーのモデル）は作れ、色を頼まれた時は形状だけ出して理由を返す。最初から色付けを使わないなら `extraArgs` に `"--no-texture"`
+
+**テクスチャ生成の部品をビルドする（NVIDIA / AMD 共通）**
+
+テクスチャ生成で GPU 拡張が要るのは `custom_rasterizer`（三角形を塗る小さな GPU カーネル）だけで、残り（多視点拡散・UV 展開・焼き込み）は PyTorch / diffusers / CPU のライブラリで動く。`custom_rasterizer` は PyTorch の `CUDAExtension` でビルドされ、**ROCm 版 PyTorch では CUDA コードが自動で HIP に変換されて hipcc でビルドされる**（変換で未対応の CUDA 呼び出しは 0 件）。
+
+```bash
+cd ~/Hunyuan3D-2
+./venv/bin/pip install ninja pybind11
+
+# AMD (ROCm) の場合: ROCm の hipcc が必要 (PyTorch の wheel には入っていない)
+/opt/rocm/bin/hipcc --version          # 無ければ ROCm (HIP SDK) を入れる
+export ROCM_HOME=/opt/rocm
+export PYTORCH_ROCM_ARCH=gfx1201       # 自分の GPU だけ向けにビルド (RX 9000 系 = gfx1201)
+# NVIDIA (CUDA) の場合は nvcc (CUDA Toolkit) が必要で、上の2行は不要
+
+# 1) GPU ラスタライザ。--no-build-isolation が必須 (無いと別の PyTorch で隔離ビルドされて失敗する)
+cd hy3dgen/texgen/custom_rasterizer
+../../../venv/bin/pip install --no-build-isolation .
+
+# 2) メッシュ処理 (C++ のみ。GPU 不要)。モジュールをこのフォルダに作る
+cd ../differentiable_renderer
+../../../venv/bin/python setup.py build_ext --inplace
+cd ../../..
+
+# 確認: GPU で三角形を1つ塗る。covered が 1000 前後、bary_ok が True なら OK
+HSA_OVERRIDE_GFX_VERSION=12.0.1 ./venv/bin/python - <<'PY'
+import torch, custom_rasterizer as cr
+from hy3dgen.texgen import Hunyuan3DPaintPipeline
+pos = torch.tensor([[[-0.8, -0.8, 0.5, 1], [0.8, -0.8, 0.5, 1], [0, 0.8, 0.5, 1]]], device='cuda')
+tri = torch.tensor([[0, 1, 2]], dtype=torch.int32, device='cuda')
+f, b = cr.rasterize(pos, tri, (64, 64))
+m = f > 0
+print('covered', int(m.sum()), 'bary_ok', bool(torch.allclose(b[m].sum(-1), torch.ones_like(b[m][:, 0]), atol=1e-3)))
+PY
+```
+
+- ビルドできたら `extraArgs` から `"--no-texture"` を外して OpenGeekLLMChat を再起動する
+- テクスチャのモデル（`tencent/Hunyuan3D-2` の `hunyuan3d-paint-v2-0-turbo` と `hunyuan3d-delight-v2-0`）は初回の色付け時に追加でダウンロードされる
+- VRAM が足りない時は `extraArgs` に `"--low-vram"`（テクスチャ生成の一部を CPU に逃がす。遅くなる）。高品質版は `"--texture-subfolder", "hunyuan3d-paint-v2-0"`
+- `hipcc` と PyTorch の ROCm のバージョン（`python -c "import torch; print(torch.version.hip)"`）は揃っている方が安全
+- **RDNA4（gfx1201 / RX 9000 系・Radeon AI PRO R9700）の注意**: ROCm 6.4〜7.2 の安定版 PyTorch では、形状は正常でもテクスチャが崩れることが AMD に確認されている（gfx12 固有。[ROCm/legacy-rocm-build#5981](https://github.com/ROCm/legacy-rocm-build/issues/5981)）。AMD の担当者が示した解決策は、TheRock の nightly PyTorch に替えてからビルドすること:
+
+  ```bash
+  ./venv/bin/pip install --upgrade torch torchvision torchaudio "rocm[devel]" \
+    --index-url https://rocm.nightlies.amd.com/v2/gfx120X-all/
+  ./venv/bin/rocm-sdk init
+  # hipcc は venv 内の _rocm_sdk_devel に入る (システムに ROCm SDK が無くてもビルドできる)
+  export ROCM_PATH="$(./venv/bin/python -c 'import sysconfig;print(sysconfig.get_paths()["purelib"])')/_rocm_sdk_devel"
+  export ROCM_HOME="$ROCM_PATH" PYTORCH_ROCM_ARCH=gfx1201
+  ```
+
+  `config.json` の `model3d.env` に `"TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"` も足す。PyTorch を入れ替えたら `custom_rasterizer` はビルドし直し、`transformers` が 5.18 未満のままかも確認する
 
 **2. `config.json` に設定して `model3dGen` を `true` にする**
 
