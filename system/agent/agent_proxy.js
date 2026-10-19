@@ -116,12 +116,25 @@ async function startAgentServer(opts, deps) {
     const stream = !!body.stream;
     const temperature = body.temperature;
     const maxTokens = body.max_tokens;
+    // サンプリング・チャットテンプレート系の追加パラメータ (chat_template_kwargs 等) は
+    // 内部 llama-server へそのまま渡す。捨てると enable_thinking:false が効かず、
+    // 思考だけで max_tokens を使い切って空の応答になる
+    const passthrough = pickLlamaPassthrough(body);
 
     if (!Array.isArray(userMessages) || userMessages.length === 0) {
       return res.status(400).json({ error: { message: 'messages is required', type: 'invalid_request_error' } });
     }
 
     log(ip, `[エージェントAPI] chat/completions (stream=${stream}, tools=${enabledTools.join(',')})`);
+    if (Array.isArray(body.tools) && body.tools.length > 0) {
+      log(ip, `[エージェントAPI] リクエストの tools (${body.tools.length}件) は無視します (サーバー側のツールのみ使用)`);
+    }
+
+    // 処理中は内部 llama-server を「使用中」として扱う。
+    // 外部APIの呼び出しは本体のプロキシを通らないため、これをしないと
+    // アイドルアンロードが応答の途中でモデルを止めてしまう
+    const touch = () => { if (deps.touchChat) deps.touchChat(); };
+    const keepAlive = setInterval(touch, 10000);
 
     try {
       // モデルがロード済みか確認 (アイドルアンロード後の再ロード対応)
@@ -144,6 +157,8 @@ async function startAgentServer(opts, deps) {
         }
       }
 
+      touch();
+
       // ツール定義を構築
       const tools = buildToolDefs(enabledTools, appConfig, deps);
 
@@ -153,6 +168,7 @@ async function startAgentServer(opts, deps) {
         tools,
         temperature,
         maxTokens,
+        passthrough,
         chatHost, chatPort, modelName,
         deps,
         ip,
@@ -198,6 +214,9 @@ async function startAgentServer(opts, deps) {
       if (!res.headersSent) {
         res.status(500).json({ error: { message: e.message, type: 'server_error' } });
       }
+    } finally {
+      clearInterval(keepAlive);
+      touch();
     }
   });
 
@@ -706,7 +725,7 @@ const TOOL_META = {
  * appConfig.harness が無効 (enabled=false) の場合は素通し設定で動かし、
  * ハーネス導入前のループと同じ挙動 (全ツール許可・付加機能なし) にする。
  */
-async function runAgentLoop({ messages, tools, temperature, maxTokens, chatHost, chatPort, modelName, deps, ip }) {
+async function runAgentLoop({ messages, tools, temperature, maxTokens, passthrough, chatHost, chatPort, modelName, deps, ip }) {
   const { log, appConfig } = deps;
   const hc = appConfig?.harness || {};
   const harness = createHarness({
@@ -718,6 +737,7 @@ async function runAgentLoop({ messages, tools, temperature, maxTokens, chatHost,
       tools: p.tools && p.tools.length > 0 ? p.tools : undefined,
       temperature: p.temperature !== undefined ? p.temperature : temperature,
       maxTokens: p.maxTokens !== undefined ? p.maxTokens : maxTokens,
+      extra: passthrough,
       stream: false,
     }),
     log: (msg) => log(ip, `[エージェントAPI][harness] ${msg}`),
@@ -998,13 +1018,42 @@ async function executeTool(fnName, fnArgs, deps, ip) {
   }
 }
 
+// クライアントから内部 llama-server へそのまま渡すキー (llama.cpp / OpenAI 互換のもの)。
+// messages・tools・stream・max_tokens 等のループ制御に関わるキーはハーネスが決めるので含めない
+const LLAMA_PASSTHROUGH_KEYS = [
+  'chat_template_kwargs', 'reasoning_format', 'reasoning_budget',
+  'top_p', 'top_k', 'min_p', 'typical_p',
+  'repeat_penalty', 'repeat_last_n', 'presence_penalty', 'frequency_penalty',
+  'stop', 'seed',
+];
+
+/**
+ * リクエストボディから llama-server に渡す追加パラメータを取り出す。
+ * vLLM / Qwen 形式のトップレベル enable_thinking も chat_template_kwargs に寄せる
+ */
+function pickLlamaPassthrough(body) {
+  const out = {};
+  for (const k of LLAMA_PASSTHROUGH_KEYS) {
+    if (body[k] !== undefined && body[k] !== null) out[k] = body[k];
+  }
+  if (out.chat_template_kwargs !== undefined
+      && (typeof out.chat_template_kwargs !== 'object' || Array.isArray(out.chat_template_kwargs))) {
+    delete out.chat_template_kwargs;
+  }
+  if (typeof body.enable_thinking === 'boolean') {
+    out.chat_template_kwargs = { enable_thinking: body.enable_thinking, ...(out.chat_template_kwargs || {}) };
+  }
+  return out;
+}
+
 /**
  * 内部 llama-server を呼ぶ
  */
-async function callLlama({ chatHost, chatPort, modelName, messages, tools, temperature, maxTokens, stream }) {
+async function callLlama({ chatHost, chatPort, modelName, messages, tools, temperature, maxTokens, extra, stream }) {
   const useHttps = false;  // 内部通信は常にHTTP (localhost)
   const url = `http://${chatHost}:${chatPort}/v1/chat/completions`;
   const payload = {
+    ...(extra || {}),
     model: modelName,
     messages,
     stream: false,

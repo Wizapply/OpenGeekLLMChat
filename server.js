@@ -721,6 +721,8 @@ function buildAgentDeps() {
     appConfig,
     // モデルロード保証 (アイドルアンロード後の再ロード対応)
     ensureChatModelLoaded,
+    // 外部APIの処理中にアイドルアンロードされないよう最終使用時刻を更新する
+    touchChat: () => { chatLastUsed = Date.now(); },
     // web検索
     ddgSearch,
     fetchPageText,

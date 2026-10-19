@@ -2925,12 +2925,16 @@ embedding を有効化するには `config.json` の `embeddingModel.path` に G
 ```
 
 通常モードと違い、**起動時に指定モデルがロードされているかチェック**し、未ロードなら自動でロードします。アイドルアンロードされた状態でリクエストが来た場合も、`ensureChatModelLoaded` で再ロードを自動実行 (最大 `readyTimeoutMs` 待機)。
+リクエストの処理中は内部 llama-server を使用中として扱うため、外部APIだけを使っていても `idleUnloadMs` のアイドルアンロードで応答の途中にモデルが止まることはありません。
+
+`messages`・`max_tokens`・`temperature` に加え、次のパラメータは内部 llama-server へそのまま渡します: `chat_template_kwargs`、`reasoning_format`、`reasoning_budget`、`top_p`、`top_k`、`min_p`、`typical_p`、`repeat_penalty`、`repeat_last_n`、`presence_penalty`、`frequency_penalty`、`stop`、`seed`。思考を止めたいときは `"chat_template_kwargs": {"enable_thinking": false}` を送ります (トップレベルの `"enable_thinking": false` も同じ意味として受け付けます)。
 
 ### 制約・注意点
 
 - **ツール対応モードは chat タイプのみ** (embedding タイプは非対応)
 - **モデルは関数呼び出し対応が必要**: Qwen, Gemma 等の `tool_calls` をサポートするモデルのみ
 - **ストリーミングは最終応答のみ一括返却** (途中のツール実行はストリームに乗らない)
+- **リクエストの `tools` は使わない**: 使えるツールはサーバー起動時に選んだものだけで、クライアントが送ったツール定義は無視します (`tool_calls` をクライアントへ返すことはありません)
 - **ツール実行ループの上限は `harness.maxTurns` (既定5)**: 無限ループ防止。同一ツール+同一引数の連打は `harness.repeatGuard` が途中で止める
 - **HTML応答を排除**: JSON パースエラー・404・予期しないエラーも全て JSON で返す (OpenAI 互換)
 - **`/health` は認証スキップ**: ロードバランサーや監視ツール対応のためパブリック
