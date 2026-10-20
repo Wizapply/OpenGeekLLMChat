@@ -5994,7 +5994,7 @@ app.post('/model3d/unload', requireAuth, async (req, res) => {
 //
 // .jsx / .css / .html にはビルド時のハッシュが付かないので、ファイル名が
 // 変わらないまま中身だけが差し替わる。ブラウザが再検証を省くと、更新したのに
-// 古い画面が動き続ける (しかも .jsx は Babel Standalone が XHR で取りに行くため
+// 古い画面が動き続ける (しかも .jsx は jsx_loader.js が fetch で取りに行くため
 // Ctrl+F5 でも取り直されないことがある)。no-cache を明示して毎回 ETag で
 // 確認させる。変わっていなければ 304 が返るだけなので転送量は増えない。
 const NO_CACHE_EXT = /\.(jsx|js|css|html)$/i;

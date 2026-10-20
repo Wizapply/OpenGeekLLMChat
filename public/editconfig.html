@@ -8,14 +8,22 @@
 <link rel="icon" type="image/jpeg" href="/aiicon.jpg" />
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+JP:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/editconfig-styles.css" />
+<!-- 起動中の表示 (React の描画で置き換わる)。CSS の読み込みを待たずに出せるようインラインで持つ -->
+<style>
+  .boot-loading { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; background: #0a0a0f; color: #9898b0; font: 14px/1.6 'IBM Plex Sans JP', system-ui, sans-serif; text-align: center; padding: 16px; }
+  .boot-loading-spinner { width: 28px; height: 28px; border: 3px solid #2a2a3a; border-top-color: #34d399; border-radius: 50%; animation: boot-spin 0.9s linear infinite; }
+  .boot-loading-error { color: #f87171; }
+  .boot-loading-error .boot-loading-spinner { display: none; }
+  @keyframes boot-spin { to { transform: rotate(360deg); } }
+</style>
 </head>
 <body>
-<div id="root"></div>
+<div id="root"><div class="boot-loading"><div class="boot-loading-spinner"></div><div class="boot-loading-text">読み込み中…</div></div></div>
 
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
-<script type="text/babel" src="/js/editconfig.jsx"></script>
+<!-- .jsx は jsx_loader.js が変換 (JSX のみ) してキャッシュし、実行する -->
+<script src="/js/jsx_loader.js" data-src="/js/editconfig.jsx"></script>
 </body>
 </html>

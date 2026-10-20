@@ -10,9 +10,17 @@
 <link rel="icon" type="image/jpeg" href="/aiicon.jpg" />
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+JP:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
 <link rel="stylesheet" href="/styles.css" />
+<!-- 起動中の表示 (React の描画で置き換わる)。CSS の読み込みを待たずに出せるようインラインで持つ -->
+<style>
+  .boot-loading { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; background: #0a0a0f; color: #9898b0; font: 14px/1.6 'IBM Plex Sans JP', system-ui, sans-serif; text-align: center; padding: 16px; }
+  .boot-loading-spinner { width: 28px; height: 28px; border: 3px solid #2a2a3a; border-top-color: #34d399; border-radius: 50%; animation: boot-spin 0.9s linear infinite; }
+  .boot-loading-error { color: #f87171; }
+  .boot-loading-error .boot-loading-spinner { display: none; }
+  @keyframes boot-spin { to { transform: rotate(360deg); } }
+</style>
 </head>
 <body>
-<div id="root"></div>
+<div id="root"><div class="boot-loading"><div class="boot-loading-spinner"></div><div class="boot-loading-text">読み込み中…</div></div></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.1/marked.min.js"></script>
@@ -20,13 +28,13 @@
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css" />
 <script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
 <!-- PDF.js v3 (PDFテキスト抽出用、約1MB、初回PDF読込時のみダウンロードされる)
      注意: cdnjs では v4系 は配信されていないため v3.11.174 (UMD形式、pdfjsLib グローバル提供) を使う -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <!-- エージェントハーネスのブラウザ側ゲート (権限モード/宣言フック/リマインダー)。
      読み込み失敗時も index.jsx 側の window.HarnessClient ガードで従来どおり動く -->
 <script src="/js/harness_client.js"></script>
-<script type="text/babel" src="/js/index.jsx"></script>
+<!-- .jsx は jsx_loader.js が変換 (JSX のみ) してキャッシュし、実行する -->
+<script src="/js/jsx_loader.js" data-src="/js/index.jsx"></script>
 </body>
 </html>
