@@ -678,6 +678,8 @@ function generateApiKey() {
 function listExternalServers() {
   const list = [];
   for (const [id, s] of externalServers) {
+    // ツール対応モードは内部 llama-server を使うので、その起動設定 (-c / -np) を表示する
+    const m = s.agentMode ? findModelByName(s.modelName) : null;
     list.push({
       id,
       modelName: s.modelName,
@@ -686,8 +688,8 @@ function listExternalServers() {
       apiKey: s.apiKey,
       type: s.type,
       https: !!s.https,
-      ctx: s.ctx || null,
-      nParallel: s.nParallel || null,
+      ctx: s.ctx || m?.ctx || null,
+      nParallel: s.nParallel || (m ? (m.nParallel ?? appConfig.llamaServer.nParallel ?? 1) : null),
       agentMode: !!s.agentMode,      // ツール対応モードか
       tools: s.tools || null,         // 有効なツール
       running: !!(s.agentMode ? s.agentHandle : (s.proc && !s.proc.killed)),
@@ -832,6 +834,29 @@ function buildAgentDeps() {
   };
 }
 
+// 指定 host:port で listen できるか試す。別プロセス (Ollama 等) が使っていれば理由付きで失敗させる
+// (llama-server は bind に失敗すると即終了するが、起動待ちはそれに気付かずタイムアウトまで待ってしまう)
+// 停止直後の再起動では前のプロセスがまだ終わっていないことがあるので、使用中なら数秒待ち直す
+async function assertPortFree(host, port, retries = 5) {
+  const tryListen = () => new Promise((resolve) => {
+    const tester = require('net').createServer();
+    tester.once('error', (e) => resolve(e));
+    tester.once('listening', () => tester.close(() => resolve(null)));
+    tester.listen(port, host);
+  });
+  for (let i = 0; ; i++) {
+    const e = await tryListen();
+    if (!e) return;
+    if (e.code === 'EADDRINUSE' && i < retries) {
+      await new Promise(r => setTimeout(r, 1000));
+      continue;
+    }
+    if (e.code === 'EADDRINUSE') throw new Error(`ポート ${port} は別のプロセスが使用中です (Ollama 等が起動していないか確認してください)`);
+    if (e.code === 'EACCES') throw new Error(`ポート ${port} を開く権限がありません`);
+    throw new Error(`ポート ${port} を開けません: ${e.message}`);
+  }
+}
+
 // 外部APIサーバーを起動
 async function startExternalServer({ modelName, host, port, apiKey, type, https, agentMode, tools }) {
   // 同じポートが既に使われていないかチェック
@@ -848,6 +873,8 @@ async function startExternalServer({ modelName, host, port, apiKey, type, https,
   if (https && !HTTPS_ENABLED) {
     throw new Error('HTTPSで起動するには cert.pem と key.pem が必要です（OpenGeekLLMChat本体と同じものを使用）');
   }
+  // モデルのロードを始める前に確かめる (使えないポートでロードを待たせない)
+  await assertPortFree(host, port);
 
   // ─── ツール対応モード: agent_proxy を起動 (llama-server は内部の既存ものを使う) ───
   if (agentMode) {
@@ -972,7 +999,9 @@ async function startExternalServer({ modelName, host, port, apiKey, type, https,
 
   const id = nextExternalServerId++;
   const label = `ext:${id}:${modelName}`;
-  const proc = spawnLlamaServer(args, label);
+  // 起動に失敗して終了したときに理由を返せるよう、出力の末尾を控えておく
+  let outputTail = '';
+  const proc = spawnLlamaServer(args, label, (text) => { outputTail = (outputTail + text).slice(-4000); });
 
   const serverInfo = {
     proc, modelName, host, port, apiKey, type, https: !!https,
@@ -987,10 +1016,20 @@ async function startExternalServer({ modelName, host, port, apiKey, type, https,
     serverInfo.proc = null;
   });
 
-  // 起動完了を待つ（host=0.0.0.0の場合は127.0.0.1で確認）
+  // 起動完了を待つ（host=0.0.0.0の場合は127.0.0.1で確認）。
+  // 途中でプロセスが終了したら (VRAM不足・モデル読込失敗等) タイムアウトを待たずに失敗させる
   const checkHost = host === '0.0.0.0' ? '127.0.0.1' : host;
-  const ready = await waitForReady(checkHost, port, ls.readyTimeoutMs, https);
-  if (!ready) {
+  const exited = new Promise(r => proc.once('exit', (code) => r({ exited: true, code })));
+  const result = await Promise.race([
+    waitForReady(checkHost, port, ls.readyTimeoutMs, https).then(ready => ({ ready })),
+    exited,
+  ]);
+  if (result.exited) {
+    externalServers.delete(id);
+    const lastLines = outputTail.split('\n').map(l => l.trim()).filter(Boolean).slice(-5).join('\n');
+    throw new Error(`llama-server が起動中に終了しました (code=${result.code})` + (lastLines ? `\n${lastLines}` : ''));
+  }
+  if (!result.ready) {
     try { proc.kill('SIGTERM'); } catch {}
     externalServers.delete(id);
     throw new Error(`外部APIサーバー起動タイムアウト: ${modelName} on ${host}:${port}`);
@@ -1030,17 +1069,22 @@ async function restartExternalServer(id) {
   if ((s.proc && !s.proc.killed) || s.agentHandle) throw new Error('既に稼働中です');
 
   externalServers.delete(id);
-  const newId = await startExternalServer({
-    modelName: s.modelName,
-    host: s.host,
-    port: s.port,
-    apiKey: s.apiKey,
-    type: s.type,
-    https: s.https,
-    agentMode: s.agentMode,
-    tools: s.tools,
-  });
-  return newId;
+  try {
+    return await startExternalServer({
+      modelName: s.modelName,
+      host: s.host,
+      port: s.port,
+      apiKey: s.apiKey,
+      type: s.type,
+      https: s.https,
+      agentMode: s.agentMode,
+      tools: s.tools,
+    });
+  } catch (e) {
+    // 起動に失敗しても設定は消さない (停止中として一覧に残し、原因を直して再起動できるように)
+    externalServers.set(id, s);
+    throw e;
+  }
 }
 
 function stopExternalServer(id) {
