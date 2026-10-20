@@ -25,6 +25,19 @@ function formatBytes(bytes) {
 // 日本語 (ひらがな/カタカナ/漢字) を含むか
 const HAS_JA_RE = /[぀-ゟ゠-ヿ一-鿿]/;
 
+// 外部APIのツール対応モードで選べるツール (起動フォームと、起動中サーバーの
+// 「🔧 ツール対応」リボンのホバー表示で共用する)。id は server.js の tools と一致させる
+const API_AGENT_TOOLS = [
+  { id: 'ml', label: '🤖 機械学習 (ml_predict 等5ツール)' },
+  { id: 'web_search', label: '🌐 Web検索 (web_search)' },
+  { id: 'file', label: '📁 ファイル参照 (list_files / read_file)' },
+  { id: 'rag', label: '📚 RAG文書検索 (search_documents)' },
+  { id: 'gdrive', label: '☁️ GDrive (gdrive_* ツール)' },
+  { id: 'image', label: '🎨 画像生成 (POST /v1/images/generations)' },
+  { id: 'model3d', label: '🧊 3Dモデル生成 (Meshy互換 /openapi/v2/text-to-3d, /openapi/v1/image-to-3d)' },
+];
+const API_AGENT_TOOL_LABEL = Object.fromEntries(API_AGENT_TOOLS.map(t => [t.id, t.label]));
+
 // 外部LLM (有料API) へ切り替えた理由の表示名。msg.cloudLlm.reason に入る
 const CLOUD_REASON_LABELS = {
   toggle: '🌩️ トグルON (最終回答を外部LLMに依頼)',
@@ -10907,37 +10920,33 @@ function App() {
                   {apiFormAgentMode && (
                     <div style={{ paddingLeft: 12, display: 'flex', flexDirection: 'column', gap: 4, marginTop: 2 }}>
                       {[
-                        { id: 'ml', label: '🤖 機械学習 (ml_predict 等5ツール)' },
-                        { id: 'web_search', label: '🌐 Web検索 (web_search)' },
-                        { id: 'file', label: '📁 ファイル参照 (list_files / read_file)' },
+                        { id: 'ml' },
+                        { id: 'web_search' },
+                        { id: 'file' },
                         {
                           id: 'rag',
-                          label: '📚 RAG文書検索 (search_documents)',
                           disabled: !apiEmbeddingAvailable,
                           disabledReason: apiEmbeddingReason,
                         },
                         {
                           id: 'gdrive',
-                          label: '☁️ GDrive (gdrive_* ツール)',
                           disabled: !apiGdriveAvailable,
                           disabledReason: apiGdriveReason,
                           warnLabel: 'GDrive未接続のため利用不可',
                         },
                         {
                           id: 'image',
-                          label: '🎨 画像生成 (POST /v1/images/generations)',
                           disabled: !(appConfig.imageGen && (appConfig.imageModels || []).length > 0),
                           disabledReason: 'config.json の imageGen が無効、または imageModels が未定義',
                           warnLabel: '画像生成が無効のため利用不可',
                         },
                         {
                           id: 'model3d',
-                          label: '🧊 3Dモデル生成 (Meshy互換 /openapi/v2/text-to-3d, /openapi/v1/image-to-3d)',
                           disabled: !appConfig.model3dGen,
                           disabledReason: 'config.json の model3dGen が無効',
                           warnLabel: '3Dモデル生成が無効のため利用不可',
                         },
-                      ].map(t => (
+                      ].map(t => ({ ...t, label: API_AGENT_TOOL_LABEL[t.id] })).map(t => (
                         <label key={t.id} className="api-form-checkbox-label" style={{
                           fontSize: 12,
                           opacity: t.disabled ? 0.5 : 1,
@@ -10997,12 +11006,38 @@ function App() {
                         <span className={`api-server-proto ${s.https ? 'https' : 'http'}`}>
                           {s.https ? '🔒 HTTPS' : '🔓 HTTP'}
                         </span>
-                        {s.agentMode && (
-                          <span className="api-server-proto" style={{ background: 'var(--accent-dim)', color: 'var(--accent)' }}
-                            title={`ツール対応モード: ${(s.tools || []).join(', ')}`}>
-                            🔧 ツール対応
-                          </span>
-                        )}
+                        {s.agentMode && (() => {
+                          // ホバー (またはフォーカス) で、このサーバーで有効なツールを一覧表示する。
+                          // s.tools は起動時にサーバー側で利用不可のもの (embedding 未設定の RAG 等) を
+                          // 外した後の「実際に有効なツール」
+                          const enabled = s.tools || [];
+                          const known = API_AGENT_TOOLS.filter(t => enabled.includes(t.id)).length;
+                          const unknown = enabled.filter(id => !API_AGENT_TOOL_LABEL[id]);
+                          return (
+                            <span className="api-server-proto api-server-tools-ribbon" tabIndex={0}
+                              aria-label={`ツール対応モード 有効: ${enabled.map(id => API_AGENT_TOOL_LABEL[id] || id).join(', ') || 'なし'}`}>
+                              🔧 ツール対応 ({known + unknown.length}/{API_AGENT_TOOLS.length + unknown.length})
+                              <span className="api-server-tools-pop" role="tooltip">
+                                <span className="api-server-tools-pop-title">ツール (✓ 有効 / — 無効)</span>
+                                {API_AGENT_TOOLS.map(t => {
+                                  const on = enabled.includes(t.id);
+                                  return (
+                                    <span key={t.id} className={`api-server-tools-pop-row ${on ? 'on' : 'off'}`}>
+                                      <span className="api-server-tools-pop-mark">{on ? '✓' : '—'}</span>
+                                      <span>{t.label}</span>
+                                    </span>
+                                  );
+                                })}
+                                {unknown.map(id => (
+                                  <span key={id} className="api-server-tools-pop-row on">
+                                    <span className="api-server-tools-pop-mark">✓</span>
+                                    <span>{id}</span>
+                                  </span>
+                                ))}
+                              </span>
+                            </span>
+                          );
+                        })()}
                         <button
                           className="api-server-stop"
                           onClick={() => stopApiServer(s.id)}

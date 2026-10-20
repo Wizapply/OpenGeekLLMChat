@@ -1203,6 +1203,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    position: relative; /* ツール対応リボンのホバー表示の基準 */
   }
   .api-server-status {
     font-size: 11px;
@@ -1224,6 +1225,55 @@
     background: rgba(255, 165, 0, 0.15);
     color: orange;
   }
+  /* 🔧 ツール対応リボン: ホバー / フォーカスで有効なツールを一覧表示 */
+  .api-server-tools-ribbon {
+    background: var(--accent-dim);
+    color: var(--accent);
+    cursor: help;
+    outline: none;
+  }
+  .api-server-tools-ribbon:focus-visible { box-shadow: 0 0 0 1px var(--accent); }
+  .api-server-tools-pop {
+    display: none;
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    z-index: 20;
+    flex-direction: column;
+    gap: 3px;
+    padding: 8px 10px;
+    background: var(--surface-raised);
+    border: 1px solid var(--border-active);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow);
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--text-primary);
+    white-space: normal;
+    pointer-events: none;
+  }
+  .api-server-tools-ribbon:hover .api-server-tools-pop,
+  .api-server-tools-ribbon:focus .api-server-tools-pop { display: flex; }
+  .api-server-tools-pop-title {
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-bottom: 2px;
+  }
+  .api-server-tools-pop-row {
+    display: flex;
+    gap: 6px;
+    align-items: baseline;
+    line-height: 1.4;
+  }
+  .api-server-tools-pop-row.off { color: var(--text-muted); }
+  .api-server-tools-pop-mark {
+    flex: 0 0 12px;
+    font-weight: 700;
+    text-align: center;
+  }
+  .api-server-tools-pop-row.on .api-server-tools-pop-mark { color: var(--accent); }
   .api-server-type {
     font-size: 10px;
     padding: 2px 6px;
