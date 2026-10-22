@@ -3745,6 +3745,84 @@
     animation: fadeIn 0.3s ease;
   }
 
+  /* チャットモデルの起動失敗 (メモリ不足等)。モデルが起動するか ✕ で閉じるまで残す */
+  .model-start-error {
+    position: fixed;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: min(620px, calc(100% - 32px));
+    box-sizing: border-box;
+    background: var(--bg-secondary);
+    border: 1px solid var(--red);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow);
+    padding: 12px 14px;
+    font-size: 13px;
+    color: var(--text-primary);
+    z-index: 101;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    animation: fadeIn 0.3s ease;
+  }
+  .model-start-error-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    color: var(--red);
+    font-weight: 600;
+  }
+  .model-start-error-head > span { flex: 1; }
+  .model-start-error-close {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    font-size: 14px;
+    cursor: pointer;
+    padding: 0 2px;
+  }
+  .model-start-error-close:hover { color: var(--text-primary); }
+  .model-start-error-row {
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.5;
+    word-break: break-word;
+  }
+  .model-start-error-detail summary {
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: 11px;
+  }
+  .model-start-error-detail pre {
+    margin: 6px 0 0;
+    max-height: 140px;
+    overflow: auto;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 8px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .model-start-error-actions {
+    display: flex;
+    justify-content: flex-end;
+  }
+  .model-start-error-actions button {
+    background: var(--surface-raised);
+    border: 1px solid var(--border-active);
+    color: var(--text-primary);
+    border-radius: 4px;
+    padding: 4px 12px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .model-start-error-actions button:hover { border-color: var(--accent); }
+
   .loading-toast {
     position: fixed;
     bottom: 80px;

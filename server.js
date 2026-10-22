@@ -8,7 +8,7 @@ const crypto = require('crypto');
 const os = require('os');
 const { WebSocketServer } = require('ws');
 const { startAgentServer } = require('./system/agent/agent_proxy');
-const { createLlmPool } = require('./system/llm/llm_pool');
+const { createLlmPool, detectOutOfMemory } = require('./system/llm/llm_pool');
 const { createOrchestrator, validateWorkflow } = require('./system/agent/orchestrator');
 const { createGoogleDrive, isVlmImportableMime } = require('./system/gdrive/google_drive');
 const { createCloudLlm } = require('./system/llm/cloud_llm');
@@ -554,6 +554,13 @@ let chatProc = null;          // 現在起動中のチャットモデルプロ�
 let chatProcModel = null;     // 起動中のモデル名
 let chatProcCtx = null;       // ロード完了時に llama-server /props から実測したスロットあたり n_ctx
 let chatProcStarting = false; // 起動中フラグ
+// 直近のチャットモデル起動失敗 ({ model, oom, summary, hint, others, gpu, detail, message, at })。
+// 次の起動開始・起動成功で消える。/models で画面に返し、エラーを表示させる
+let chatStartError = null;
+// 起動に失敗したモデルを、リクエストのたびに自動で起動し直さない時間。
+// メモリ不足は待っても直らないので、起動→失敗を繰り返して他の処理まで巻き込むのを防ぐ
+// (画面の「再試行」や /models/load による手動の起動はこの制限を受けない)
+const CHAT_START_RETRY_COOLDOWN_MS = 60000;
 let chatLastUsed = 0;         // 最終使用時刻（idleUnload用）
 let firstChatLoadDone = false; // 起動後の初回チャットモデルロード完了フラグ
 let embedProc = null;         // Embeddingプロセス
@@ -692,6 +699,7 @@ function listExternalServers() {
       nParallel: s.nParallel || (m ? (m.nParallel ?? appConfig.llamaServer.nParallel ?? 1) : null),
       agentMode: !!s.agentMode,      // ツール対応モードか
       tools: s.tools || null,         // 有効なツール
+      chatSystemPrompt: s.agentMode ? s.chatSystemPrompt !== false : null, // Webチャットのシステムプロンプトを付けるか
       running: !!(s.agentMode ? s.agentHandle : (s.proc && !s.proc.killed)),
       startedAt: s.startedAt,
     });
@@ -705,7 +713,7 @@ function saveExternalServersState() {
     const data = listExternalServers().map(s => ({
       id: s.id, modelName: s.modelName, host: s.host, port: s.port,
       apiKey: s.apiKey, type: s.type,
-      agentMode: s.agentMode, tools: s.tools, https: s.https,
+      agentMode: s.agentMode, tools: s.tools, chatSystemPrompt: s.chatSystemPrompt, https: s.https,
     }));
     fs.writeFileSync(EXTERNAL_SERVERS_STATE_FILE, JSON.stringify(data, null, 2));
   } catch (e) {
@@ -723,6 +731,8 @@ function buildAgentDeps() {
     appConfig,
     // モデルロード保証 (アイドルアンロード後の再ロード対応)
     ensureChatModelLoaded,
+    // 直近のモデル起動失敗 (メモリ不足等)。起動中・ロード済みなら null
+    getChatStartError: () => (!chatProc && !chatProcStarting && chatStartError) ? chatStartError.message : null,
     // 外部APIの処理中にアイドルアンロードされないよう最終使用時刻を更新する
     touchChat: () => { chatLastUsed = Date.now(); },
     // web検索
@@ -858,7 +868,7 @@ async function assertPortFree(host, port, retries = 5) {
 }
 
 // 外部APIサーバーを起動
-async function startExternalServer({ modelName, host, port, apiKey, type, https, agentMode, tools }) {
+async function startExternalServer({ modelName, host, port, apiKey, type, https, agentMode, tools, chatSystemPrompt }) {
   // 同じポートが既に使われていないかチェック
   for (const [, s] of externalServers) {
     if (s.port === port && ((s.proc && !s.proc.killed) || s.agentHandle)) {
@@ -934,9 +944,11 @@ async function startExternalServer({ modelName, host, port, apiKey, type, https,
       port, host, apiKey, modelName,
       useHttps: !!https, certPath: CERT_PATH, keyPath: KEY_PATH,
       tools: enabledTools,
+      chatSystemPrompt: chatSystemPrompt !== false,
     }, buildAgentDeps());
     const serverInfo = {
       agentHandle: handle, proc: null, agentMode: true, tools: enabledTools,
+      chatSystemPrompt: chatSystemPrompt !== false,
       modelName, host, port, apiKey, type: 'chat', https: !!https,
       ctx: null, nParallel: null, startedAt: Date.now(),
     };
@@ -1079,6 +1091,7 @@ async function restartExternalServer(id) {
       https: s.https,
       agentMode: s.agentMode,
       tools: s.tools,
+      chatSystemPrompt: s.chatSystemPrompt,
     });
   } catch (e) {
     // 起動に失敗しても設定は消さない (停止中として一覧に残し、原因を直して再起動できるように)
@@ -1396,6 +1409,67 @@ function checkTtsIdle() {
 }
 setInterval(checkTtsIdle, 30000);
 
+// ─── チャットモデル起動失敗の診断 ───
+// 画面に「何が起きて、何をすればよいか」を出すため、他に読み込まれているモデルと
+// GPU の使用量を添える (メモリ不足は「複数モデルの同時ロード」で起きることが多い)
+function describeLoadedModels() {
+  const list = [];
+  try {
+    if (embedProc) list.push(`Embedding (${path.basename(appConfig.embeddingModel?.path || '')})`);
+    for (const [id, s] of externalServers) {
+      if (s.proc && !s.proc.killed) list.push(`外部API #${id} (${s.modelName})`);
+    }
+    for (const w of llmPool.status().workers || []) list.push(`オーケストレーション (${w.modelName})`);
+    if (sdProc) list.push(`画像生成 (${sdCurrentModel || 'sd-server'})`);
+    if (ttsProc) list.push('音声合成 (TTS)');
+    if (model3d.isWorkerRunning()) list.push('3Dモデル生成');
+    if (rlOnlineWorker.proc) list.push('オンライン強化学習ワーカー');
+    if (vjepa2Worker.proc) list.push('V-JEPA 2 エンコーダ');
+  } catch {}
+  return list;
+}
+
+function describeGpuUsage() {
+  return (cachedGpuData || [])
+    .filter(g => g.vramTotalMB > 0)
+    .map(g => `${g.name || g.id || 'GPU'} ${((g.vramUsedMB || 0) / 1024).toFixed(1)}/${(g.vramTotalMB / 1024).toFixed(1)}GB`)
+    .join(' , ');
+}
+
+function buildChatStartError(model, { code, signal, tail = '', timeoutMs }) {
+  const oom = timeoutMs ? null : detectOutOfMemory(tail, signal);
+  const others = describeLoadedModels();
+  let summary;
+  if (timeoutMs) summary = `モデル「${model.name}」の起動がタイムアウトしました (${Math.round(timeoutMs / 1000)}秒待機)`;
+  else if (oom === 'vram') summary = `メモリ不足のため、モデル「${model.name}」を起動できませんでした`;
+  else if (oom === 'system') summary = `モデル「${model.name}」の起動中に llama-server が強制終了されました (システムのメモリ不足の可能性)`;
+  else summary = `モデル「${model.name}」の llama-server が起動中に終了しました (code=${code}${signal ? `, signal=${signal}` : ''})`;
+  let hint = '';
+  if (oom || timeoutMs) {
+    hint = others.length
+      ? '他に読み込まれているモデルを停止するか、config.json の ctx (コンテキスト長) / ngl (GPUに載せる層数) を下げてください。'
+      : 'config.json の ctx (コンテキスト長) / ngl (GPUに載せる層数) を下げるか、より小さいモデルを使ってください。';
+  } else {
+    hint = 'サーバーログ (llama-server の出力) を確認してください。';
+  }
+  const gpu = describeGpuUsage();
+  const detail = tail.split('\n').map(l => l.trim()).filter(Boolean).slice(-6).join('\n');
+  const message = [
+    summary,
+    others.length ? `読み込み中の他のモデル: ${others.join(', ')}` : '',
+    gpu ? `GPU: ${gpu}` : '',
+    hint,
+  ].filter(Boolean).join('\n');
+  return { model: model.name, oom: oom || null, summary, hint, others, gpu, detail, message, at: Date.now() };
+}
+
+// 起動に失敗して間もないモデルなら、その記録を返す (自動の再起動を見送る判断に使う)
+function recentChatStartError(modelName) {
+  const e = chatStartError;
+  if (!e || (modelName && e.model !== modelName)) return null;
+  return Date.now() - e.at < CHAT_START_RETRY_COOLDOWN_MS ? e : null;
+}
+
 // opts.readyTimeoutMs: 起動完了待ちの上書き (既定は llamaServer.readyTimeoutMs)。
 // 20GB級のモデルは初回ロードが既定の120秒に収まらないことがあり、
 // 呼び出し側 (RAG教師データ生成の自動ロード等) が長めに待てるようにする
@@ -1406,6 +1480,7 @@ async function startChatModel(modelName, opts = {}) {
   if (!fs.existsSync(model.path)) throw new Error(`モデルファイルが存在しません: ${model.path}`);
 
   chatProcStarting = true;
+  chatStartError = null;
   try {
     await stopChatModel();
     const ls = appConfig.llamaServer;
@@ -1464,10 +1539,25 @@ async function startChatModel(modelName, opts = {}) {
     });
 
     const readyTimeoutMs = Number(opts.readyTimeoutMs) > 0 ? Number(opts.readyTimeoutMs) : ls.readyTimeoutMs;
-    const ready = await waitForReady(ls.chatHost, ls.chatPort, readyTimeoutMs);
-    if (!ready) {
+    // 起動中にプロセスが終了したら (メモリ不足・モデル読込失敗等) タイムアウトを待たずに失敗させる
+    const exited = new Promise(r => startedProc.once('exit', (code, signal) => r({ exited: true, code, signal })));
+    const result = await Promise.race([
+      waitForReady(ls.chatHost, ls.chatPort, readyTimeoutMs).then(ready => ({ ready })),
+      exited,
+    ]);
+    if (result.exited) {
+      // stopChatModel() (アンロード・別モデルへの切替) で止められた場合は失敗として記録しない
+      if (chatProcModel !== model.name || chatProc) throw new Error(`モデル「${model.name}」の起動は中断されました`);
+      chatProcModel = null;
+      chatStartError = buildChatStartError(model, { code: result.code, signal: result.signal, tail: logTail.join('\n') });
+      log('-', `チャットモデル起動失敗: ${chatStartError.message.replace(/\n/g, ' / ')}`
+        + (chatStartError.detail ? `\n--- llama-server の最終出力 ---\n${chatStartError.detail}` : ''));
+      throw new Error(chatStartError.message);
+    }
+    if (!result.ready) {
+      chatStartError = buildChatStartError(model, { tail: logTail.join('\n'), timeoutMs: readyTimeoutMs });
       await stopChatModel();
-      throw new Error(`チャットモデル起動タイムアウト: ${model.name} (${Math.round(readyTimeoutMs / 1000)}秒待機)`);
+      throw new Error(chatStartError.message);
     }
     // 実際に確保されたコンテキストサイズを /props から読み取る。
     // llama-server は -np で n_ctx をスロット数で分割するほか、モデル側の上限で
@@ -1537,9 +1627,15 @@ async function ensureChatModelLoaded() {
   // 自動アンロードされたモデルがあればそれを優先、なければデフォルトを使う（初回ロード対応）
   const modelToReload = chatProcAutoUnloaded || appConfig.defaultModel;
   if (!modelToReload) return false;
+  // 直前に起動に失敗したモデルは、しばらく自動では起動し直さない (呼び出し側は chatStartError を返す)
+  if (recentChatStartError(modelToReload)) return false;
   chatProcAutoUnloaded = null;
   log('-', `自動ロード: モデル「${modelToReload}」を起動`);
-  startChatModel(modelToReload).catch(e => log('-', `自動ロードエラー: ${e.message}`));
+  startChatModel(modelToReload).catch(e => {
+    log('-', `自動ロードエラー: ${e.message.split('\n')[0]}`);
+    // 起動できなかったモデルを次の自動ロードの対象に残す (既定モデルへ黙って切り替えない)
+    if (chatStartError && !chatProc && !chatProcStarting) chatProcAutoUnloaded = modelToReload;
+  });
   return false;  // 起動中なのでこのリクエストは待機（プロキシ側で待つ）
 }
 
@@ -1595,8 +1691,24 @@ async function startEmbeddingModel() {
       ...(em.poolingType ? ['--pooling', em.poolingType] : []),
       ...(em.extraArgs || []),
     ];
-    embedProc = spawnLlamaServer(args, `embed`);
-    const ready = await waitForReady(ls.embeddingHost, ls.embeddingPort, ls.readyTimeoutMs);
+    let embedTail = '';
+    const startedEmbed = spawnLlamaServer(args, `embed`, (text) => { embedTail = (embedTail + text).slice(-4000); });
+    embedProc = startedEmbed;
+    // 起動中にプロセスが終了したら (メモリ不足等) タイムアウトを待たずに失敗させる
+    const exited = new Promise(r => startedEmbed.once('exit', (code, signal) => r({ exited: true, code, signal })));
+    const result = await Promise.race([
+      waitForReady(ls.embeddingHost, ls.embeddingPort, ls.readyTimeoutMs).then(ready => ({ ready })),
+      exited,
+    ]);
+    if (result.exited) {
+      const oom = detectOutOfMemory(embedTail, result.signal);
+      log('-', `Embeddingサーバーが起動中に終了しました (code=${result.code}${result.signal ? `, signal=${result.signal}` : ''})`
+        + (oom ? ` — メモリ不足の可能性。読み込み中: ${describeLoadedModels().join(', ') || 'なし'} / GPU: ${describeGpuUsage() || '不明'}` : '')
+        + `\n${embedTail.split('\n').map(l => l.trim()).filter(Boolean).slice(-5).join('\n')}`);
+      if (embedProc === startedEmbed) embedProc = null;
+      return;
+    }
+    const ready = result.ready;
     if (!ready) {
       log('-', 'Embeddingサーバー起動タイムアウト（RAGが動作しない可能性があります）');
       try { embedProc.kill('SIGTERM'); } catch {}
@@ -2195,9 +2307,9 @@ function proxyToLlama(targetHost, targetPort, pathPrefix, isChatProxy) {
           await new Promise(r => setTimeout(r, 500));
         }
         if (chatProcStarting || !chatProc) {
-          if (!isQuiet) log(ip, `503 ${req.method} ${targetPath} (起動タイムアウト)`);
+          if (!isQuiet) log(ip, `503 ${req.method} ${targetPath} (${chatStartError ? '起動失敗' : '起動タイムアウト'})`);
           return res.status(503).json({
-            error: 'モデル起動がタイムアウトしました。サーバーログを確認してください。',
+            error: chatStartError ? chatStartError.message : 'モデル起動がタイムアウトしました。サーバーログを確認してください。',
             starting: false,
           });
         }
@@ -2211,12 +2323,14 @@ function proxyToLlama(targetHost, targetPort, pathPrefix, isChatProxy) {
           // 起動完了を待つ（最大60秒）
           const startWait = Date.now();
           while ((chatProcStarting || !chatProc) && (Date.now() - startWait < 60000)) {
+            // 起動に失敗した (または直前の失敗で自動起動を見送った) なら待たずに返す
+            if (!chatProcStarting && !chatProc && chatStartError) break;
             await new Promise(r => setTimeout(r, 500));
           }
           if (!chatProc) {
             if (!isQuiet) log(ip, `503 ${req.method} ${targetPath} (自動ロード失敗)`);
             return res.status(503).json({
-              error: 'モデル自動ロードに失敗しました。サーバーログを確認してください。',
+              error: chatStartError ? chatStartError.message : 'モデル自動ロードに失敗しました。サーバーログを確認してください。',
               starting: false,
             });
           }
@@ -2417,6 +2531,12 @@ app.get('/models', requireAuth, (req, res) => {
     current: chatProcModel,
     currentCtx: chatProcCtx,  // ロード中モデルの実測コンテキストサイズ（未ロード時はnull）
     starting: chatProcStarting,
+    // 直近の起動失敗 (メモリ不足等)。ロード済み・起動中の間は返さない
+    startError: (!chatProc && !chatProcStarting && chatStartError) ? {
+      model: chatStartError.model, oom: chatStartError.oom, summary: chatStartError.summary,
+      hint: chatStartError.hint, others: chatStartError.others, gpu: chatStartError.gpu,
+      detail: chatStartError.detail, at: chatStartError.at,
+    } : null,
     embeddingReady: !!embedProc,
     autoUnloaded: chatProcAutoUnloaded,  // アイドルでアンロード済みのモデル名（次のリクエストで再ロードされる）
     idleUnloadMs: appConfig.llamaServer.idleUnloadMs || 0,
@@ -2461,7 +2581,7 @@ app.get('/external-servers', requireAuth, (req, res) => {
 app.post('/external-servers', requireAuth, jsonParser, async (req, res) => {
   const ip = getIP(req);
   try {
-    const { modelName, host, port, apiKey, type, https, agentMode, tools } = req.body || {};
+    const { modelName, host, port, apiKey, type, https, agentMode, tools, chatSystemPrompt } = req.body || {};
     if (!port || typeof port !== 'number' || port < 1 || port > 65535) {
       return res.status(400).json({ error: 'portは1-65535の数値で指定してください' });
     }
@@ -2488,6 +2608,8 @@ app.post('/external-servers', requireAuth, jsonParser, async (req, res) => {
       https: !!https,
       agentMode: !!agentMode,
       tools: Array.isArray(tools) ? tools : undefined,
+      // 省略時は付ける (false を明示した時だけクライアントの system をそのまま使う)
+      chatSystemPrompt: chatSystemPrompt !== false,
     });
     // 起動後のツール一覧を取得して、要求と差分があれば warnings に
     const s = externalServers.get(id);

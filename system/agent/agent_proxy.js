@@ -16,6 +16,9 @@
  *
  * server.js から提供される deps オブジェクト経由で内部関数を呼ぶ (循環参照回避)。
  *
+ * opts.chatSystemPrompt が true (既定) なら、Webチャットと同じ config.systemPrompts から
+ * システムプロンプトを組み立てて先頭に付ける (buildChatSystemPrompt)。
+ *
  * v2: エージェントループは harness.js (Claude のハーネスに倣った制御層) に委譲。
  *     権限モード・フック・System-1 即決・リマインダー・リピートガード・
  *     コンパクションは appConfig.harness で設定する (既定は従来互換の素通し)。
@@ -30,7 +33,7 @@ const { createHarness, neutralHarnessConfig, HARNESS_VERSION } = require('./harn
 
 /**
  * ツール対応エージェントサーバーを起動
- * @param {object} opts { port, host, apiKey, modelName, useHttps, certPath, keyPath, tools }
+ * @param {object} opts { port, host, apiKey, modelName, useHttps, certPath, keyPath, tools, chatSystemPrompt }
  * @param {object} deps server.js から渡す内部関数群
  * @returns {Promise<{server, close}>}
  */
@@ -39,6 +42,7 @@ async function startAgentServer(opts, deps) {
     port, host = '0.0.0.0', apiKey, modelName,
     useHttps = false, certPath, keyPath,
     tools: enabledTools = ['ml', 'web_search', 'file'],
+    chatSystemPrompt = true,      // Webチャットのシステムプロンプトを付けるか
   } = opts;
 
   const {
@@ -125,7 +129,7 @@ async function startAgentServer(opts, deps) {
       return res.status(400).json({ error: { message: 'messages is required', type: 'invalid_request_error' } });
     }
 
-    log(ip, `[エージェントAPI] chat/completions (stream=${stream}, tools=${enabledTools.join(',')})`);
+    log(ip, `[エージェントAPI] chat/completions (stream=${stream}, tools=${enabledTools.join(',')}, systemPrompt=${chatSystemPrompt ? 'chat' : 'client'})`);
     if (Array.isArray(body.tools) && body.tools.length > 0) {
       log(ip, `[エージェントAPI] リクエストの tools (${body.tools.length}件) は無視します (サーバー側のツールのみ使用)`);
     }
@@ -145,13 +149,20 @@ async function startAgentServer(opts, deps) {
         if (!ready) {
           const startedAt = Date.now();
           const timeoutMs = (deps.appConfig?.llamaServer?.readyTimeoutMs) || 300000;
+          let startError = null;
           while (!ready && Date.now() - startedAt < timeoutMs) {
+            // 起動に失敗した (メモリ不足等) なら、タイムアウトまで待たずに理由を返す
+            startError = deps.getChatStartError ? deps.getChatStartError() : null;
+            if (startError) break;
             await new Promise(r => setTimeout(r, 1000));
             ready = await deps.ensureChatModelLoaded();
           }
           if (!ready) {
             return res.status(503).json({
-              error: { message: 'チャットモデルのロードがタイムアウトしました', type: 'service_unavailable' }
+              error: {
+                message: startError ? `チャットモデルを起動できませんでした: ${startError}` : 'チャットモデルのロードがタイムアウトしました',
+                type: 'service_unavailable',
+              }
             });
           }
         }
@@ -162,9 +173,14 @@ async function startAgentServer(opts, deps) {
       // ツール定義を構築
       const tools = buildToolDefs(enabledTools, appConfig, deps);
 
+      // Webチャットのシステムプロンプトを付ける (config.json の編集がすぐ反映されるよう毎回組み立てる)
+      const messages = chatSystemPrompt
+        ? withSystemPrompt(userMessages, buildChatSystemPrompt(enabledTools, appConfig))
+        : userMessages;
+
       // エージェントループ
       const result = await runAgentLoop({
-        messages: userMessages,
+        messages,
         tools,
         temperature,
         maxTokens,
@@ -681,6 +697,37 @@ function buildToolDefs(enabledTools, appConfig, deps = {}) {
   }
 
   return tools;
+}
+
+/**
+ * Webチャットと同じ config.systemPrompts から、外部API用のシステムプロンプトを組み立てる。
+ * チャット画面専用の部分は付けない:
+ *   documents (チャット添付) / fileAccess (write_file と画面の実行ボタン前提) /
+ *   python (画面の実行ボタン) / math (画面の KaTeX 描画) / rag (画面の出典表示 【S1】) / judge
+ */
+function buildChatSystemPrompt(enabledTools, appConfig) {
+  const sp = appConfig?.systemPrompts || {};
+  const today = new Date();
+  const dateStr = `${today.getFullYear()}年${today.getMonth() + 1}月${today.getDate()}日`;
+  const parts = [(sp.base || '').replace(/\{date\}/g, dateStr)];
+  if (enabledTools.includes('web_search') && sp.webSearch) parts.push(sp.webSearch);
+  if (enabledTools.includes('gdrive') && sp.googleDrive) parts.push(sp.googleDrive);
+  if (sp.meta) parts.push(sp.meta);
+  return parts.filter(t => t && t.trim()).join('\n\n');
+}
+
+/**
+ * システムプロンプトを messages の先頭に付ける。クライアントが先頭に system を
+ * 送ってきた場合はその後ろにつなげて1つにまとめる (後ろに置く = クライアントの指示を優先)。
+ * system を複数並べると、先頭にしか置けないチャットテンプレート (Gemma 等) でエラーになるため。
+ */
+function withSystemPrompt(messages, systemText) {
+  if (!systemText) return messages;
+  const first = messages[0];
+  if (first && first.role === 'system' && typeof first.content === 'string') {
+    return [{ ...first, content: systemText + '\n\n' + first.content }, ...messages.slice(1)];
+  }
+  return [{ role: 'system', content: systemText }, ...messages];
 }
 
 /**

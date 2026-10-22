@@ -23,6 +23,26 @@
 const fs = require('fs');
 const path = require('path');
 
+// llama-server の出力のうち、メモリ (VRAM / RAM) 不足で確保に失敗したことを示す行。
+// CUDA / ROCm / Vulkan / Metal / CPU で文言が違うので、代表的なものをまとめて見る
+const OOM_OUTPUT_RE = new RegExp([
+  'out of (?:device )?memory', 'cudaMalloc[^\\n]*failed', 'hipMalloc[^\\n]*failed', 'ErrorOutOfDeviceMemory',
+  'failed to allocate', 'unable to allocate', 'allocation failed', 'std::bad_alloc',
+  'alloc_buffer[^\\n]*failed', 'not enough memory', 'insufficient memory',
+].join('|'), 'i');
+
+/**
+ * llama-server が異常終了したときの出力・シグナルから、メモリ不足が原因かを判定する。
+ *   'vram'   … 出力にメモリ確保の失敗がある (主に GPU。CPU オフロード時は RAM)
+ *   'system' … 自分で止めていないのに SIGKILL (Linux の OOM killer による強制終了)
+ *   null     … メモリ不足とは判定できない
+ */
+function detectOutOfMemory(output, signal) {
+  if (OOM_OUTPUT_RE.test(String(output || ''))) return 'vram';
+  if (signal === 'SIGKILL') return 'system';
+  return null;
+}
+
 // GGUF 以外の追加モデル(mmproj 等)も VRAM を食うので、extraArgs 中の
 // ファイルパスらしき引数はサイズを加算する
 const MODEL_FILE_RE = /\.(gguf|bin|safetensors)$/i;
@@ -784,7 +804,23 @@ function createLlmPool(deps) {
         }
       });
 
-      const ready = await waitForReady(host, port, ls.readyTimeoutMs || 120000);
+      // 起動中にプロセスが落ちたら (VRAM不足・モデル読込失敗等) タイムアウトを待たずに失敗させる
+      const exited = new Promise(r => worker.proc.once('exit', (code, signal) => r({ exited: true, code, signal })));
+      const result = await Promise.race([
+        waitForReady(host, port, ls.readyTimeoutMs || 120000).then(ready => ({ ready })),
+        exited,
+      ]);
+      if (result.exited) {
+        const tail = worker.logTail.slice(-12).join('\n');
+        const oom = detectOutOfMemory(tail, result.signal);
+        throw new Error(
+          (oom ? `VRAM/メモリ不足のため、ワーカーを起動できませんでした: ${modelName}` : `ワーカーが起動中に終了しました: ${modelName}`)
+          + ` (code=${result.code}${result.signal ? `, signal=${result.signal}` : ''})`
+          + (oom ? '\n他に読み込まれているモデルを停止するか、ctx / ngl を下げてください。' : '')
+          + (tail ? `\n--- llama-server の出力 ---\n${tail}` : '')
+        );
+      }
+      const ready = result.ready;
       if (!ready) {
         worker.stopping = true;
         try { worker.proc.kill('SIGTERM'); } catch {}
@@ -1066,5 +1102,5 @@ function createLlmPool(deps) {
 
 module.exports = {
   createLlmPool, estimateModelVram, estimateModelVramMB, readGgufMeta,
-  parseMeasurements, getMeasured,
+  parseMeasurements, getMeasured, detectOutOfMemory,
 };

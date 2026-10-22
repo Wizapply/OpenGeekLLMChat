@@ -2509,6 +2509,11 @@ function App() {
   const [modelStarting, setModelStarting] = useState(false);  // モデル起動中
   const [autoUnloadedName, setAutoUnloadedName] = useState(null);  // アイドルアンロード中のモデル名
   const [firstLoadPending, setFirstLoadPending] = useState(false);  // 起動後の初回ロード待ち
+  // 直近のチャットモデル起動失敗 (メモリ不足等。サーバーの /models の startError)
+  // { model, oom, summary, hint, others, gpu, detail, at } / null
+  const [modelStartError, setModelStartError] = useState(null);
+  // ✕ で閉じた起動失敗の at (同じ失敗は再表示しない。新しい失敗が起きればまた出す)
+  const [dismissedStartErrorAt, setDismissedStartErrorAt] = useState(null);
 
   const [documents, setDocuments] = useState([]); // { name, text, chunks, embeddings }
   const ragEnabled = true; // RAGはドキュメントがあれば常に有効
@@ -2554,6 +2559,8 @@ function App() {
   // ツール対応モード (agent_proxy 経由でツール群を使えるようにする)
   const [apiFormAgentMode, setApiFormAgentMode] = useState(false);
   const [apiFormTools, setApiFormTools] = useState(['ml', 'web_search', 'file']);
+  // ツール対応モードで Webチャットのシステムプロンプトを自動で付けるか
+  const [apiFormChatPrompt, setApiFormChatPrompt] = useState(true);
   // HTTPSデフォルト: 現在ブラウザでHTTPSアクセス中ならtrue（同じ証明書を使う想定）
   const [apiFormHttps, setApiFormHttps] = useState(typeof window !== 'undefined' && window.location.protocol === 'https:');
   const [apiHttpsAvailable, setApiHttpsAvailable] = useState(false);
@@ -2833,6 +2840,7 @@ function App() {
       setModelReady(!!data.current && !data.starting && !data.autoUnloaded);
       setAutoUnloadedName(data.autoUnloaded || null);
       setFirstLoadPending(!!data.firstLoadPending);
+      setModelStartError(data.startError || null);
       // 現在ロード中モデルのctxを反映（読み取り専用）。
       // currentCtx はロード完了時にサーバーが llama-server の /props から実測した
       // スロットあたりの n_ctx。-np 分割やモデル側の上限調整を反映した実値なので最優先。
@@ -2850,10 +2858,14 @@ function App() {
         }
       }
       // 現在ロード中モデルを自動選択（指定がなければ）
-      // 優先: 1) ロード中(current), 2) 自動アンロード状態(autoUnloaded=前回モデル), 3) 一覧先頭
+      // 優先: 1) ロード中(current), 2) 自動アンロード状態(autoUnloaded=前回モデル),
+      //       3) 起動に失敗したモデル, 4) 一覧先頭
+      // 3) が無いと、メモリ不足で起動できなかった時に一覧先頭の別モデルへ黙って切り替わり、
+      // 失敗の表示も消えてしまう (どのモデルを使っているのか分からなくなる)
       if (!chatModel) {
         if (data.current) setChatModel(data.current);
         else if (data.autoUnloaded) setChatModel(data.autoUnloaded);
+        else if (data.startError) setChatModel(data.startError.model);
         else if (names.length > 0) setChatModel(names[0]);
       }
     } catch {
@@ -3384,6 +3396,12 @@ function App() {
 
     // モデル未ロード時は送信できない（ただし firstLoadPending = 初回ロード待ち、または autoUnloadedName = アイドルアンロード状態 は送信時にロードするのでOK）
     if (!modelReady && !firstLoadPending && !autoUnloadedName) {
+      if (modelStartError && !modelStarting) {
+        // 起動失敗のバナーを閉じていても、送れない理由はもう一度見せる
+        setDismissedStartErrorAt(null);
+        setError(`モデルを起動できません: ${modelStartError.summary}`);
+        return;
+      }
       setError(modelStarting
         ? 'モデルを起動中です。完了までお待ちください...'
         : 'モデルがロードされていません。しばらくお待ちください...');
@@ -3431,12 +3449,19 @@ function App() {
           const maxWaitMs = 120000;
           const startWait = Date.now();
           let ready = false;
+          let startError = null;
           while (Date.now() - startWait < maxWaitMs) {
             await new Promise(r => setTimeout(r, 2000));
             try {
               const pres = await fetch('/models');
               if (!pres.ok) continue;
               const pdata = await pres.json();
+              // 起動に失敗した (メモリ不足等) なら、タイムアウトまで待たずに理由を出す。
+              // サーバーは失敗直後のモデルを自動では起動し直さないので、待っても変わらない
+              if (pdata.startError && !pdata.starting && !pdata.current) {
+                startError = pdata.startError;
+                break;
+              }
               if (pdata.current && !pdata.starting && !pdata.autoUnloaded) {
                 ready = true;
                 setModelReady(true);
@@ -3446,6 +3471,13 @@ function App() {
                 break;
               }
             } catch {}
+          }
+          if (startError) {
+            setModelStartError(startError);
+            setDismissedStartErrorAt(null);
+            setModelStarting(false);
+            setLoadingMessage('');
+            return;
           }
           if (!ready) {
             setError('モデルのロードがタイムアウトしました。しばらくしてから再度送信してください。');
@@ -7882,6 +7914,7 @@ function App() {
           https: apiFormHttps,
           agentMode: apiFormAgentMode,
           tools: apiFormAgentMode ? apiFormTools : undefined,
+          chatSystemPrompt: apiFormAgentMode ? apiFormChatPrompt : undefined,
         }),
       });
       const data = await res.json();
@@ -9243,7 +9276,10 @@ function App() {
         setLoadingMessage('');
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
-          setError(`モデル切替失敗: ${data.error || res.status}`);
+          // 詳細 (他に読み込まれているモデル・GPU使用量) は起動失敗のバナーに出す
+          setError(`モデル切替失敗: ${String(data.error || res.status).split('\n')[0]}`);
+          setDismissedStartErrorAt(null);
+          fetchModels();
         } else {
           setError('');
         }
@@ -9262,6 +9298,14 @@ function App() {
     if (!authenticated || !connected) return;
     // ユーザーが手動でモデル切替中（既にloadingMessage設定済み）は上書きしない
     if (loadingMessage && loadingMessage.includes('をロード中') && !loadingMessage.includes('再ロード中')) return;
+    // 起動に失敗している間は「ロード中」を出さない (失敗はバナーで表示する)
+    if (modelStartError && !modelStarting) {
+      if (loadingMessage === 'モデルを起動中' || loadingMessage === 'モデルをロード中'
+          || (loadingMessage && (loadingMessage.includes('を再ロード中') || loadingMessage.includes('をロードします')))) {
+        setLoadingMessage('');
+      }
+      return;
+    }
     // 初回ロード待ち or アイドルアンロード状態（実際に起動中ではない）→ トースト不要
     // 実際に起動中(modelStarting=true)になってからトーストを出す
     if (firstLoadPending || (autoUnloadedName && !modelStarting)) {
@@ -9288,7 +9332,7 @@ function App() {
         setLoadingMessage('');
       }
     }
-  }, [modelReady, modelStarting, autoUnloadedName, firstLoadPending, authenticated, connected, availableModels.length]);
+  }, [modelReady, modelStarting, autoUnloadedName, firstLoadPending, modelStartError, authenticated, connected, availableModels.length]);
 
   // 新規チャットで最初のユーザーメッセージから自動タイトル生成
   useEffect(() => {
@@ -9324,6 +9368,29 @@ function App() {
     }, 1500);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
   }, [messages, documents, isLoading, webSearchEnabled, persistentRagCategory, gdriveEnabled, cloudLlmEnabled]);
+
+  // ─── 起動失敗したモデルを手動で起動し直す (バナーの「再試行」) ───
+  // /models/load はサーバー側の「失敗直後は自動で起動し直さない」制限を受けない
+  async function retryModelStart() {
+    const name = modelStartError?.model;
+    if (!name) return;
+    setModelStartError(null);
+    setModelStarting(true);
+    setLoadingMessage(`モデル「${name}」をロード中`);
+    try {
+      const res = await fetch('/models/load', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      if (!res.ok) setDismissedStartErrorAt(null);
+    } catch (e) {
+      setError(`モデル起動エラー: ${e.message}`);
+    } finally {
+      setLoadingMessage('');
+      fetchModels();
+    }
+  }
 
   // ─── エラー自動消去 ───
   useEffect(() => {
@@ -10425,6 +10492,7 @@ function App() {
                     || (!orchWorkflowId && !modelReady && !firstLoadPending && !autoUnloadedName)}
                   title={
                     orchWorkflowId ? '送信時に必要なモデルを順次ロードします'
+                    : modelStartError && !modelStarting && !modelReady ? `モデルを起動できません: ${modelStartError.summary}`
                     : firstLoadPending ? '送信時にモデルをロードします'
                     : autoUnloadedName && !modelReady ? '送信時にモデルを再ロードします'
                     : !modelReady ? (modelStarting ? 'モデル起動中です' : 'モデルがロードされていません')
@@ -10970,6 +11038,19 @@ function App() {
                           </span>
                         </label>
                       ))}
+                      <label className="api-form-checkbox-label" style={{ fontSize: 12, marginTop: 4 }}>
+                        <input
+                          type="checkbox"
+                          checked={apiFormChatPrompt}
+                          onChange={e => setApiFormChatPrompt(e.target.checked)}
+                        />
+                        <span>💬 Webチャットのシステムプロンプトを付ける</span>
+                      </label>
+                      <span className="api-form-hint" style={{ marginTop: -2 }}>
+                        config.json の systemPrompts (base / Web検索 / GDrive / meta) を先頭に自動で付けます。
+                        クライアントが system を送った場合はその後ろにつなげます (クライアントの指示が優先)。
+                        OFF の場合はクライアントが送った messages をそのまま使います。
+                      </span>
                       <span className="api-form-hint">
                         ※ ツール対応モードは llama.cpp の関数呼び出し対応モデル (Qwen, Gemma等) が必要です。
                         ストリーミングは最終応答を一括返却します。
@@ -11034,6 +11115,13 @@ function App() {
                                     <span>{id}</span>
                                   </span>
                                 ))}
+                                <span className="api-server-tools-pop-title" style={{ marginTop: 4 }}>システムプロンプト</span>
+                                <span className={`api-server-tools-pop-row ${s.chatSystemPrompt !== false ? 'on' : 'off'}`}>
+                                  <span className="api-server-tools-pop-mark">{s.chatSystemPrompt !== false ? '✓' : '—'}</span>
+                                  <span>{s.chatSystemPrompt !== false
+                                    ? '💬 Webチャットのシステムプロンプトを付ける'
+                                    : '💬 付けない (クライアントの messages のみ)'}</span>
+                                </span>
                               </span>
                             </span>
                           );
@@ -11140,6 +11228,29 @@ function App() {
       )}
       {loadingMessage && <div className="loading-toast">{loadingMessage}</div>}
       {error && <div className="error-toast">{error}</div>}
+      {modelStartError && !modelStarting && modelStartError.at !== dismissedStartErrorAt && (
+        <div className="model-start-error" role="alert">
+          <div className="model-start-error-head">
+            <span>⚠️ {modelStartError.summary}</span>
+            <button className="model-start-error-close" title="閉じる"
+              onClick={() => setDismissedStartErrorAt(modelStartError.at)}>✕</button>
+          </div>
+          {modelStartError.others && modelStartError.others.length > 0 && (
+            <div className="model-start-error-row">読み込み中の他のモデル: {modelStartError.others.join(', ')}</div>
+          )}
+          {modelStartError.gpu && <div className="model-start-error-row">GPU: {modelStartError.gpu}</div>}
+          {modelStartError.hint && <div className="model-start-error-row">{modelStartError.hint}</div>}
+          {modelStartError.detail && (
+            <details className="model-start-error-detail">
+              <summary>llama-server の出力</summary>
+              <pre>{modelStartError.detail}</pre>
+            </details>
+          )}
+          <div className="model-start-error-actions">
+            <button onClick={retryModelStart}>🔄 再試行</button>
+          </div>
+        </div>
+      )}
       {lightboxSrc && (
         <div className="image-lightbox" onClick={() => setLightboxSrc(null)}>
           <img src={lightboxSrc} alt="拡大表示" />
