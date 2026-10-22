@@ -10552,13 +10552,18 @@ function App() {
               {(() => {
                 const lv = gpuData.find(g => g.llamaVersion)?.llamaVersion;
                 if (!lv) return null;
-                const label = lv.build
-                  ? `b${lv.build}${lv.commit ? ` (${lv.commit})` : ''}`
+                // ビルド番号があれば b11820 (commit)、無ければ版表記 (0.7.0-dev 等)、どちらも無ければ生の行。
+                // 版表記はビルド番号と別に小さく添える (0.7.0-dev は開発中ずっと同じなので、
+                // 更新できたかはビルド番号で見分ける)
+                const commit = lv.commit ? ` (${lv.commit})` : '';
+                const label = lv.build ? `b${lv.build}${commit}`
+                  : lv.version ? `${lv.version}${commit}`
                   : lv.raw;
                 return (
                   <div className="llama-version-card" title={lv.raw}>
                     <span className="llama-version-icon">🦙</span>
                     <span className="llama-version-label">llama.cpp</span>
+                    {lv.build && lv.version && <span className="llama-version-semver">{lv.version}</span>}
                     <span className="llama-version-value">{label}</span>
                   </div>
                 );

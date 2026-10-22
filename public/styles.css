@@ -1602,6 +1602,7 @@
 
   .llama-version-card {
     display: flex;
+    flex-wrap: wrap;  /* 狭い画面では版表記・ビルド番号を次の行へ送る (文字の途中で折り返さない) */
     align-items: center;
     gap: 8px;
     background: var(--bg-tertiary);
@@ -1624,8 +1625,16 @@
     color: var(--text-muted);
   }
 
+  .llama-version-semver {
+    font-size: 10px;
+    font-family: var(--font-mono);
+    color: var(--text-secondary);
+    white-space: nowrap;
+  }
+
   .llama-version-value {
     margin-left: auto;
+    white-space: nowrap;
     font-size: 12px;
     font-weight: 500;
     font-family: var(--font-mono);

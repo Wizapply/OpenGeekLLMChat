@@ -12763,10 +12763,36 @@ async function updateGpuData() {
 
 // ─── llama.cpp バージョン検出（起動時に1回だけ取得してキャッシュ） ───
 // llama-server --version の出力（stderr）例:
-//   version: 4589 (abc1234)
+//   version: 4589 (abc1234)                               … ビルド番号形式 (従来)
+//   version: 0.7.0-dev (build 11820, commit d77256999)    … 版表記形式 (新しい llama.cpp)
 //   built with cc (GCC) ... for x86_64-linux-gnu
 // バイナリは再起動まで変わらないので毎秒取る必要はなく、起動時に1回取得すれば十分。
-let cachedLlamaVersion = null; // { build, commit, raw } または null
+let cachedLlamaVersion = null; // { build, version, commit, raw } または null
+
+// --version の出力を { build, version, commit, raw } に分解する。
+//   build   … ビルド番号 (画面では b4589 と表示)。従来形式は version: の直後、
+//             新形式は括弧内の "build N" にある
+//   version … 版表記 (0.7.0-dev 等。従来形式では空)
+// 数字の先頭だけを拾うと、0.7.0-dev が「b0」になってしまうため、空白か ( までを1語として読む。
+// git 情報なしでビルドすると version: 0 (unknown) になるので、0 は版として扱わない
+function parseLlamaVersion(out) {
+  const m = String(out || '').match(/version:\s*([^\s(]+)\s*(?:\(([^)]*)\))?/i);
+  if (!m) {
+    const line = String(out || '').split('\n').map(s => s.trim()).find(Boolean);
+    return line ? { build: '', version: '', commit: '', raw: line } : null;
+  }
+  const ver = m[1];
+  const paren = m[2] || '';
+  const isBuild = /^\d+$/.test(ver);
+  const build = isBuild ? ver : (paren.match(/\bbuild\s+(\d+)/i) || [])[1] || '';
+  const commit = /^[0-9a-f]{6,40}$/i.test(paren) ? paren : (paren.match(/\bcommit\s+([0-9a-f]{6,40})/i) || [])[1] || '';
+  return {
+    build: build !== '0' ? build : '',
+    version: !isBuild ? ver : '',
+    commit,
+    raw: m[0].trim(),
+  };
+}
 
 function detectLlamaVersion() {
   return new Promise((resolve) => {
@@ -12782,16 +12808,7 @@ function detectLlamaVersion() {
       proc.stdout.on('data', (d) => { out += d.toString(); });
       proc.stderr.on('data', (d) => { out += d.toString(); });
       proc.on('error', () => finish(null));
-      proc.on('close', () => {
-        const m = out.match(/version:\s*(\d+)\s*(?:\(([0-9a-f]+)\))?/i);
-        if (m) {
-          finish({ build: m[1], commit: m[2] || '', raw: m[0].trim() });
-        } else {
-          // 念のため最初の非空行を生で保持
-          const line = out.split('\n').map(s => s.trim()).find(Boolean);
-          finish(line ? { build: '', commit: '', raw: line } : null);
-        }
-      });
+      proc.on('close', () => finish(parseLlamaVersion(out)));
     } catch {
       finish(null);
     }
