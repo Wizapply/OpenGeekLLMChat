@@ -2514,6 +2514,12 @@ function App() {
   const [modelStartError, setModelStartError] = useState(null);
   // ✕ で閉じた起動失敗の at (同じ失敗は再表示しない。新しい失敗が起きればまた出す)
   const [dismissedStartErrorAt, setDismissedStartErrorAt] = useState(null);
+  // 外部APIがチャットのモデルを共用中なら { model, servers: [{ id, port, mode }], blocked: { モデル名: 理由 } }
+  // (サーバーの /models の chatLock)。別のモデルへ切り替えると外部APIは LLM プールのワーカーへ移る。
+  // VRAM が足りない等で移せないモデル (blocked) には切り替えられない
+  const [chatModelLock, setChatModelLock] = useState(null);
+  // サーバーのチャットに載っている (またはアイドルで降りている) モデル。外部API起動時に共用されるかの表示に使う
+  const [serverChatModel, setServerChatModel] = useState(null);
 
   const [documents, setDocuments] = useState([]); // { name, text, chunks, embeddings }
   const ragEnabled = true; // RAGはドキュメントがあれば常に有効
@@ -2841,6 +2847,8 @@ function App() {
       setAutoUnloadedName(data.autoUnloaded || null);
       setFirstLoadPending(!!data.firstLoadPending);
       setModelStartError(data.startError || null);
+      setChatModelLock(data.chatLock || null);
+      setServerChatModel(data.current || data.autoUnloaded || null);
       // 現在ロード中モデルのctxを反映（読み取り専用）。
       // currentCtx はロード完了時にサーバーが llama-server の /props から実測した
       // スロットあたりの n_ctx。-np 分割やモデル側の上限調整を反映した実値なので最優先。
@@ -2865,6 +2873,7 @@ function App() {
       if (!chatModel) {
         if (data.current) setChatModel(data.current);
         else if (data.autoUnloaded) setChatModel(data.autoUnloaded);
+        else if (data.chatLock) setChatModel(data.chatLock.model);
         else if (data.startError) setChatModel(data.startError.model);
         else if (names.length > 0) setChatModel(names[0]);
       }
@@ -9487,6 +9496,14 @@ function App() {
               <span className="setting-label">
                 チャットモデル
                 {isLoading && <span className="setting-locked-hint" title="生成中はモデルを切り替えられません">🔒</span>}
+                {!isLoading && chatModelLock && (
+                  <span className="setting-locked-hint"
+                    title={`外部API ${chatModelLock.servers.map(x => `#${x.id} (ポート ${x.port})`).join(', ')} がこのモデルを共用中です。`
+                      + '別のモデルに切り替えると、外部APIはこのモデルを別の llama-server (LLM プールのワーカー) に移して使い続けます。'
+                      + 'VRAM が足りないモデルには切り替えられません。'}>
+                    🔗 外部APIと共用中
+                  </span>
+                )}
               </span>
               {/* 単一モデルと、マルチLLMワークフロー(config.jsonで定義)を同じ場所から選ぶ。
                   ワークフローは値を "wf:<id>" にして通常のモデル名と区別する */}
@@ -9507,7 +9524,10 @@ function App() {
                   const label = info && info.ctx
                     ? `${m} (${info.ctx.toLocaleString()})`
                     : m;
-                  return <option key={m} value={m}>{label}</option>;
+                  // 外部APIが共用中で、切り替えると外部APIのモデルを移せない (VRAM 不足等) モデルは選べない
+                  // (サーバー側でも 409 で止める)
+                  const blockedReason = chatModelLock?.blocked?.[m];
+                  return <option key={m} value={m} disabled={!!blockedReason}>{blockedReason ? `${label} — 切替不可: ${blockedReason}` : label}</option>;
                 })}
                 {orchInfo.enabled && (orchInfo.workflows || []).length > 0 && (
                   <optgroup label="🎼 マルチLLM（ワークフロー）">
@@ -10942,6 +10962,18 @@ function App() {
                         <option key={m.name} value={m.name}>{m.name}</option>
                       ))}
                     </select>
+                    {/* サーバーの判定 (startExternalServer) と同じ条件: チャットに別のモデルが載っていなければ共用 */}
+                    {apiFormModel && ((!serverChatModel || serverChatModel === apiFormModel)
+                      ? <span className="api-form-hint">
+                          🔗 チャットと同じモデルなので、読み込み済みのモデルを共用します (メモリを追加で使いません)。
+                          あとでチャットを別のモデルに切り替えると、VRAM に余裕があれば外部APIは別の llama-server に移って動き続けます。
+                        </span>
+                      : <span className="api-form-hint" style={{ color: 'var(--orange)' }}>
+                          ⚠️ チャットのモデル「{serverChatModel}」とは別なので、
+                          {apiFormAgentMode ? 'LLM プールのワーカーとして' : 'llama-server をもう1つ起動して'}
+                          読み込みます (メモリを追加で使います)。チャットのモデルは切り替わりません。
+                        </span>
+                    )}
                   </label>
                   <label className="api-form-label">
                     <span>公開範囲（リッスンするインターフェース）</span>
@@ -11092,6 +11124,18 @@ function App() {
                         <span className={`api-server-proto ${s.https ? 'https' : 'http'}`}>
                           {s.https ? '🔒 HTTPS' : '🔓 HTTP'}
                         </span>
+                        {s.detached && (
+                          <span className="api-server-proto" style={{ background: 'var(--orange-dim)', color: 'var(--orange)' }}
+                            title="チャットとは別のモデルなので、LLM プールのワーカー (別の llama-server) で動いています。使われないとアイドルアンロードで降り、次の要求で読み込み直します。">
+                            🧩 別ワーカーで実行
+                          </span>
+                        )}
+                        {s.sharedChat && !s.agentMode && (
+                          <span className="api-server-proto" style={{ background: 'var(--accent-dim)', color: 'var(--accent)' }}
+                            title="チャットと同じモデルを共用しています (別の llama-server を起動していないので、メモリを追加で使いません)。共用中はチャットで別のモデルに切り替えられません。">
+                            🔗 チャットと共用
+                          </span>
+                        )}
                         {s.agentMode && (() => {
                           // ホバー (またはフォーカス) で、このサーバーで有効なツールを一覧表示する。
                           // s.tools は起動時にサーバー側で利用不可のもの (embedding 未設定の RAG 等) を

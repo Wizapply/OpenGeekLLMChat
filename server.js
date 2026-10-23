@@ -570,7 +570,11 @@ let embedLastUsed = 0;        // Embedding最終使用時刻（idleUnload用）
 // ─── 外部API公開サーバー管理 ───
 // 外部公開用の OpenAI 互換 llama-server を独立プロセスで起動・管理する。
 // メインのチャット/Embedding用とは別ポート・別プロセス。
-// 構造: Map<serverId, { proc, modelName, host, port, apiKey, type, startedAt }>
+// 構造: Map<serverId, { proc, listenHandle, modelName, host, port, apiKey, type, agentMode, sharedChat, startedAt }>
+//   proc         … 別プロセスの llama-server (チャットと別のモデル / embedding)
+//   listenHandle … server.js 内の待ち受け。ツール対応モード (agent_proxy) と、
+//                  チャットと同じモデルを共用する通常モード (sharedChat) が使う。
+//                  どちらもメインチャットの llama-server を共用するので、モデルを二重に読み込まない
 const externalServers = new Map();
 let nextExternalServerId = 1;
 const EXTERNAL_SERVERS_STATE_FILE = path.join(__dirname, 'external-servers.json');
@@ -685,8 +689,8 @@ function generateApiKey() {
 function listExternalServers() {
   const list = [];
   for (const [id, s] of externalServers) {
-    // ツール対応モードは内部 llama-server を使うので、その起動設定 (-c / -np) を表示する
-    const m = s.agentMode ? findModelByName(s.modelName) : null;
+    // ツール対応モード・チャット共用は内部 llama-server を使うので、その起動設定 (-c / -np) を表示する
+    const m = (s.agentMode || s.sharedChat) ? findModelByName(s.modelName) : null;
     list.push({
       id,
       modelName: s.modelName,
@@ -698,9 +702,11 @@ function listExternalServers() {
       ctx: s.ctx || m?.ctx || null,
       nParallel: s.nParallel || (m ? (m.nParallel ?? appConfig.llamaServer.nParallel ?? 1) : null),
       agentMode: !!s.agentMode,      // ツール対応モードか
+      sharedChat: !!(s.agentMode || s.sharedChat) && !s.detached, // チャットの llama-server を共用しているか
+      detached: !!s.detached,        // チャットから切り離され、LLM プールのワーカーで動いているか
       tools: s.tools || null,         // 有効なツール
       chatSystemPrompt: s.agentMode ? s.chatSystemPrompt !== false : null, // Webチャットのシステムプロンプトを付けるか
-      running: !!(s.agentMode ? s.agentHandle : (s.proc && !s.proc.killed)),
+      running: !!(s.listenHandle || (s.proc && !s.proc.killed)),
       startedAt: s.startedAt,
     });
   }
@@ -871,7 +877,7 @@ async function assertPortFree(host, port, retries = 5) {
 async function startExternalServer({ modelName, host, port, apiKey, type, https, agentMode, tools, chatSystemPrompt }) {
   // 同じポートが既に使われていないかチェック
   for (const [, s] of externalServers) {
-    if (s.port === port && ((s.proc && !s.proc.killed) || s.agentHandle)) {
+    if (s.port === port && ((s.proc && !s.proc.killed) || s.listenHandle)) {
       throw new Error(`ポート ${port} は既に外部APIサーバーで使用中です`);
     }
   }
@@ -892,9 +898,14 @@ async function startExternalServer({ modelName, host, port, apiKey, type, https,
     const model = findModelByName(modelName);
     if (!model) throw new Error(`モデルが見つかりません: ${modelName}`);
 
-    // 内部 llama-server に指定モデルがロードされているか確認
-    // 別モデルが起動中、または未起動なら、このモデルに切り替えてロード
-    if (chatProcModel !== modelName) {
+    // チャットと同じモデル (またはチャットが空) ならチャットの llama-server を共用し、
+    // 別のモデルが載っていれば LLM プールのワーカーで動かす (チャットのモデルは切り替えない)
+    const chatTarget = chatProcModel || chatProcAutoUnloaded;
+    const detached = !!chatTarget && chatTarget !== modelName;
+    if (detached) {
+      log('-', `[外部API] チャットは「${chatTarget}」のため、ツール対応モードの「${modelName}」は LLM プールのワーカーで動かします`);
+      await prewarmPoolModel(modelName);
+    } else if (chatProcModel !== modelName) {
       if (chatProcStarting) {
         throw new Error('別のモデルが起動中です。完了を待ってから再試行してください');
       }
@@ -945,15 +956,40 @@ async function startExternalServer({ modelName, host, port, apiKey, type, https,
       useHttps: !!https, certPath: CERT_PATH, keyPath: KEY_PATH,
       tools: enabledTools,
       chatSystemPrompt: chatSystemPrompt !== false,
-    }, buildAgentDeps());
+    }, { ...buildAgentDeps(), acquireBackend: () => acquireExternalBackend(id) });
     const serverInfo = {
-      agentHandle: handle, proc: null, agentMode: true, tools: enabledTools,
+      listenHandle: handle, proc: null, agentMode: true, tools: enabledTools, detached,
       chatSystemPrompt: chatSystemPrompt !== false,
       modelName, host, port, apiKey, type: 'chat', https: !!https,
       ctx: null, nParallel: null, startedAt: Date.now(),
     };
     externalServers.set(id, serverInfo);
     log('-', `[外部API ${id}] ツール対応モード起動: ${modelName} @ ${host}:${port} (tools: ${enabledTools.join(',')})`);
+    saveExternalServersState();
+    return id;
+  }
+
+  // ─── 通常モードでチャットと同じモデル: 別プロセスを立てずにチャットの llama-server を共用 ───
+  // 同じモデルを2回読み込むと重み・KVキャッシュ・計算バッファがすべて2倍になり、メモリ不足の原因になる。
+  // チャットに別のモデルが載っている (起動中・アイドルで降りている場合も含む) 時だけ、従来どおり別プロセスで起動する
+  const chatTarget = chatProcModel || chatProcAutoUnloaded;
+  if (type !== 'embedding' && (!chatTarget || chatTarget === modelName)) {
+    const model = findModelByName(modelName);
+    if (!model) throw new Error(`モデルが見つかりません: ${modelName}`);
+    // 他の外部APIが別のモデルでチャットを共用中なら、ここで止まる (startChatModel の案A ガード)
+    if (chatProcModel !== modelName) {
+      if (chatProcStarting) throw new Error('別のモデルが起動中です。完了を待ってから再試行してください');
+      log('-', `[外部API] チャットと共用するため内部モデルを ${chatProcModel || '(未ロード)'} → ${modelName} に切替`);
+      await startChatModel(modelName);
+    }
+    const id = nextExternalServerId++;
+    const handle = await startSharedChatServer({ id, host, port, apiKey, useHttps: !!https });
+    externalServers.set(id, {
+      listenHandle: handle, proc: null, sharedChat: true, detached: false,
+      modelName, host, port, apiKey, type: 'chat', https: !!https,
+      ctx: null, nParallel: null, startedAt: Date.now(),
+    });
+    log('-', `[外部API ${id}] チャットと共用で起動: ${modelName} @ ${host}:${port}`);
     saveExternalServersState();
     return id;
   }
@@ -1052,14 +1088,142 @@ async function startExternalServer({ modelName, host, port, apiKey, type, https,
   return id;
 }
 
+// ─── チャット共用の外部APIサーバー (通常モード) ───
+// 外部APIのポートで待ち受け、API キーを確かめて llama-server へそのまま転送する。
+// llama-server を直接公開する従来の通常モードと同じく、/v1/* もネイティブの /completion 等も通す。
+// 転送先は要求ごとに acquireExternalBackend が決める (チャットと共用中ならチャット、
+// チャットが別のモデルに切り替わった後は LLM プールのワーカー)
+function startSharedChatServer({ id, host, port, apiKey, useHttps }) {
+  const shareApp = express();
+  shareApp.use(async (req, res) => {
+    // /health は llama-server と同じく認証なし。モデルを読み込ませないよう、ここで答える
+    if (req.path === '/health') return res.json({ status: 'ok' });
+    if (apiKey) {
+      const auth = req.headers.authorization || '';
+      const token = auth.startsWith('Bearer ') ? auth.slice(7) : req.headers['x-api-key'];
+      if (token !== apiKey) return res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
+    }
+    let backend;
+    try {
+      backend = await acquireExternalBackend(id);
+    } catch (e) {
+      return res.status(503).json({ error: { message: `モデルを起動できませんでした: ${e.message}`, type: 'service_unavailable' } });
+    }
+    // 処理中はアイドルアンロードされないよう使用時刻を更新し続ける (長い生成の途中で止まらないように)
+    const keepAlive = setInterval(() => { if (backend.viaMainChat && chatProc) chatLastUsed = Date.now(); }, 10000);
+    let released = false;
+    const done = () => { if (released) return; released = true; clearInterval(keepAlive); backend.release(); };
+    res.on('close', done);
+    const proxyReq = http.request({
+      hostname: backend.host, port: backend.port, path: req.url, method: req.method,
+      headers: {
+        'content-type': req.headers['content-type'] || 'application/json',
+        'accept': req.headers['accept'] || '*/*',
+        ...(req.headers['content-length'] ? { 'content-length': req.headers['content-length'] } : {}),
+      },
+      timeout: 600000,
+    }, (proxyRes) => {
+      res.writeHead(proxyRes.statusCode, {
+        'content-type': proxyRes.headers['content-type'] || 'application/json',
+        'cache-control': 'no-cache',
+      });
+      proxyRes.pipe(res);
+    });
+    proxyReq.on('error', (err) => {
+      if (!res.headersSent) res.status(502).json({ error: { message: 'llama-server に接続できません: ' + err.message } });
+      done();
+    });
+    proxyReq.on('timeout', () => proxyReq.destroy(new Error('タイムアウト')));
+    req.pipe(proxyReq);
+  });
+  return new Promise((resolve, reject) => {
+    const srv = useHttps
+      ? https.createServer({ cert: fs.readFileSync(CERT_PATH), key: fs.readFileSync(KEY_PATH) }, shareApp)
+      : http.createServer(shareApp);
+    srv.on('error', reject);
+    srv.listen(port, host, () => resolve({ server: srv, close: () => new Promise(r => srv.close(r)) }));
+  });
+}
+
+// 外部API (チャット共用・ツール対応モード) の要求ごとに、転送先の llama-server を決める。
+//   チャットと共用中 … チャットの llama-server (未ロードなら読み込みを待つ)
+//   切り離し後       … LLM プールのワーカー (チャットに同じモデルが戻っていればプールがチャットを使う)
+// 戻り値の release() は処理が終わったら必ず呼ぶ (プールはこれでワーカーの使用中を数えている)
+async function acquireExternalBackend(id) {
+  const s = externalServers.get(id);
+  if (!s) throw new Error('外部APIサーバーが見つかりません');
+  if (!s.detached && chatProcModel && chatProcModel !== s.modelName) s.detached = true;  // 念のため
+  if (s.detached) return await llmPool.acquire(s.modelName);
+  if (!chatProc || chatProcStarting) {
+    ensureChatModelLoaded();
+    const deadline = Date.now() + (appConfig.llamaServer.readyTimeoutMs || 120000);
+    while ((chatProcStarting || !chatProc) && Date.now() < deadline) {
+      // 起動に失敗した (または直前の失敗で自動起動を見送った) なら待たずに返す
+      if (!chatProcStarting && !chatProc && chatStartError) break;
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (!chatProc) throw new Error(chatStartError ? chatStartError.message : 'チャットモデルのロードがタイムアウトしました');
+  }
+  chatLastUsed = Date.now();
+  const ls = appConfig.llamaServer;
+  return { host: ls.chatHost, port: ls.chatPort, viaMainChat: true, release() { chatLastUsed = Date.now(); } };
+}
+
+// LLM プールにモデルを先に読み込ませておく (最初の要求で待たせない。読み込めなければここで失敗させる)。
+// すぐ release するので、使われなければプールのアイドルアンロードで降りる
+async function prewarmPoolModel(modelName) {
+  const h = await llmPool.acquire(modelName);
+  h.release();
+}
+
+// チャットの llama-server を共用している稼働中の外部API (ツール対応モード・チャット共用。切り離し済みは除く)
+function chatSharingServers() {
+  const list = [];
+  for (const [id, s] of externalServers) {
+    if (s.listenHandle && (s.agentMode || s.sharedChat) && !s.detached) {
+      list.push({ id, port: s.port, modelName: s.modelName, mode: s.agentMode ? 'tool' : 'shared' });
+    }
+  }
+  return list;
+}
+
+const gbText = (mb) => `${(mb / 1024).toFixed(1)}GB`;
+
+// チャットを別のモデルへ切り替えられるか。共用中の外部APIがあれば、そのモデルを LLM プールの
+// ワーカーへ移す (切り離す) ことになるので、切り替え先のモデルが空きVRAMに収まるかを見る。
+//   収まる   … null (切り替えてよい。startChatModel が外部APIを切り離す)
+//   収まらない … 理由付きのエラー (status 409)。外部APIを止めてもらう
+// 切り離した外部APIのモデルはチャットから降りてワーカーに載り直すだけなので、増えるのは切り替え先の分。
+// GPU の情報が取れない環境では判断できないので止めない (足りなければ起動失敗として表示される)
+function chatSwitchBlocker(modelName) {
+  const holders = chatSharingServers().filter(h => h.modelName !== modelName);
+  if (!holders.length) return null;
+  const names = holders.map(h => `外部API #${h.id} (ポート ${h.port})`).join(', ');
+  const block = (reason) => Object.assign(new Error(
+    `${names} がモデル「${holders[0].modelName}」をチャットと共用中で、${reason}「${modelName}」に切り替えられません。`
+    + '切り替えるには、外部APIのパネルでそのサーバーを停止してください。'
+  ), { status: 409, lockedBy: holders, reason });
+  if ((appConfig.orchestration?.poolMode || 'auto') === 'swap') {
+    return block('LLM プールが swap (同時に1モデル) 設定のため、');
+  }
+  const model = findModelByName(modelName);
+  const gpus = (cachedGpuData || []).filter(g => g.vramTotalMB > 0);
+  if (model && gpus.length) {
+    const needMB = llmPool.estimateModelVramMB(model);
+    const freeMB = llmPool.freeVramMB();
+    if (needMB > freeMB) return block(`VRAM が足りないため (必要 ${gbText(needMB)} / 空き ${gbText(freeMB)})、`);
+  }
+  return null;
+}
+
 // 外部APIサーバーを停止
 // プロセスのみ停止（設定は保持。後で再起動できる）
 function stopExternalServerProcess(id) {
   const s = externalServers.get(id);
   if (!s) return false;
-  if (s.agentMode && s.agentHandle) {
-    try { s.agentHandle.close(); } catch {}
-    s.agentHandle = null;
+  if (s.listenHandle) {
+    try { s.listenHandle.close(); } catch {}
+    s.listenHandle = null;
   }
   if (s.proc && !s.proc.killed) {
     try { s.proc.kill('SIGTERM'); } catch {}
@@ -1078,7 +1242,7 @@ function stopExternalServerProcess(id) {
 async function restartExternalServer(id) {
   const s = externalServers.get(id);
   if (!s) throw new Error('Not found');
-  if ((s.proc && !s.proc.killed) || s.agentHandle) throw new Error('既に稼働中です');
+  if ((s.proc && !s.proc.killed) || s.listenHandle) throw new Error('既に稼働中です');
 
   externalServers.delete(id);
   try {
@@ -1103,9 +1267,9 @@ async function restartExternalServer(id) {
 function stopExternalServer(id) {
   const s = externalServers.get(id);
   if (!s) return false;
-  if (s.agentMode && s.agentHandle) {
-    try { s.agentHandle.close(); } catch {}
-    s.agentHandle = null;
+  if (s.listenHandle) {
+    try { s.listenHandle.close(); } catch {}
+    s.listenHandle = null;
   }
   if (s.proc && !s.proc.killed) {
     try { s.proc.kill('SIGTERM'); } catch {}
@@ -1148,7 +1312,7 @@ const llmPool = createLlmPool({
   // 外部APIサーバーが使用中のポートは避ける
   isPortTaken: (port) => {
     for (const [, s] of externalServers) {
-      if (s.port === port && ((s.proc && !s.proc.killed) || s.agentHandle)) return true;
+      if (s.port === port && ((s.proc && !s.proc.killed) || s.listenHandle)) return true;
     }
     return false;
   },
@@ -1159,8 +1323,14 @@ const llmPool = createLlmPool({
     touch: () => { chatLastUsed = Date.now(); },
     // 一時アンロード。chatProcAutoUnloaded に控えておくことで、
     // 次のチャットリクエスト時に既存の自動再ロード機構が同じモデルを戻してくれる
+    // 外部APIが共用中は降ろさない (処理中の外部APIの要求が途中で切れるため)。降ろさなかったら false
     unload: async () => {
-      if (!chatProc) return;
+      if (!chatProc) return true;
+      const sharing = chatSharingServers();
+      if (sharing.length) {
+        log('-', `[LLMプール] 外部API #${sharing.map(h => h.id).join(', #')} が共用中のため、メインチャットのモデルは降ろしません`);
+        return false;
+      }
       chatProcAutoUnloaded = chatProcModel;
       await stopChatModel();
       chatLastUsed = 0;
@@ -1475,6 +1645,15 @@ function recentChatStartError(modelName) {
 // 呼び出し側 (RAG教師データ生成の自動ロード等) が長めに待てるようにする
 async function startChatModel(modelName, opts = {}) {
   if (chatProcStarting) throw new Error('既にモデル起動処理中です');
+  const blocker = chatSwitchBlocker(modelName);
+  if (blocker) throw blocker;
+  // 共用中の外部APIのモデルと違うモデルに切り替えるなら、その外部APIを LLM プールのワーカーへ移す
+  const detaching = chatSharingServers().filter(h => h.modelName !== modelName);
+  for (const h of detaching) {
+    const es = externalServers.get(h.id);
+    if (es) es.detached = true;
+    log('-', `[外部API ${h.id}] チャットが「${modelName}」に切り替わるため、「${h.modelName}」は LLM プールのワーカーで動かします`);
+  }
   const model = findModelByName(modelName);
   if (!model) throw new Error(`モデルが見つかりません: ${modelName}`);
   if (!fs.existsSync(model.path)) throw new Error(`モデルファイルが存在しません: ${model.path}`);
@@ -1573,6 +1752,22 @@ async function startChatModel(modelName, opts = {}) {
     if (!chatProcCtx) chatProcCtx = model.ctx;
     chatLastUsed = Date.now();
     firstChatLoadDone = true;
+    // チャットに同じモデルが戻ってきた外部APIは、再びチャットと共用する
+    // (LLM プール側に残ったワーカーは使われなくなり、アイドルアンロードで降りる)
+    for (const [id, es] of externalServers) {
+      if (es.detached && es.listenHandle && es.modelName === model.name) {
+        es.detached = false;
+        log('-', `[外部API ${id}] チャットに「${model.name}」が載ったので、再びチャットと共用します`);
+      }
+    }
+    // チャットから切り離した外部APIのモデルを、ワーカーに先に読み込ませておく (最初の要求で待たせない)
+    for (const h of detaching) {
+      prewarmPoolModel(h.modelName).catch(e => log('-', `[外部API ${h.id}] ワーカーの起動に失敗: ${e.message.split('\n')[0]}`));
+    }
+    // モデルが載ったので「自動アンロード状態」の記録は消す。外部API (ツール対応モード・共用) の起動など
+    // ensureChatModelLoaded を通らない経路で読み込むと記録が残り、画面が「再ロード中」のまま
+    // 存在しない再ロードの完了を待ち続けていた (サーバー起動直後は初期モデルが記録されている)
+    chatProcAutoUnloaded = null;
     log('-', `チャットモデル起動完了: ${model.name} (実測ctx=${chatProcCtx})`);
   } finally {
     chatProcStarting = false;
@@ -1624,8 +1819,8 @@ setInterval(async () => {
 async function ensureChatModelLoaded() {
   if (chatProc) return true;  // 既にロード済み
   if (chatProcStarting) return false;  // 起動中（プロキシ側で待機）
-  // 自動アンロードされたモデルがあればそれを優先、なければデフォルトを使う（初回ロード対応）
-  const modelToReload = chatProcAutoUnloaded || appConfig.defaultModel;
+  // 外部APIが共用中ならそのモデル、次に自動アンロードされたモデル、なければデフォルトを使う（初回ロード対応）
+  const modelToReload = chatSharingServers()[0]?.modelName || chatProcAutoUnloaded || appConfig.defaultModel;
   if (!modelToReload) return false;
   // 直前に起動に失敗したモデルは、しばらく自動では起動し直さない (呼び出し側は chatStartError を返す)
   if (recentChatStartError(modelToReload)) return false;
@@ -2317,7 +2512,7 @@ function proxyToLlama(targetHost, targetPort, pathPrefix, isChatProxy) {
       // プロセスが存在しない場合: アイドル復帰または初回ロードを行う
       if (!chatProc) {
         // 初回ロード（サーバー起動後の最初のチャット）または自動アンロードからの復帰
-        if (chatProcAutoUnloaded || appConfig.defaultModel) {
+        if (chatProcAutoUnloaded || appConfig.defaultModel || chatSharingServers().length) {
           if (!isQuiet) log(ip, `${req.method} ${targetPath} → モデル自動ロード待機`);
           ensureChatModelLoaded();  // バックグラウンドで起動開始
           // 起動完了を待つ（最大60秒）
@@ -2531,6 +2726,20 @@ app.get('/models', requireAuth, (req, res) => {
     current: chatProcModel,
     currentCtx: chatProcCtx,  // ロード中モデルの実測コンテキストサイズ（未ロード時はnull）
     starting: chatProcStarting,
+    // 外部APIがチャットのモデルを共用中なら { model, servers: [{ id, port, mode }] }。
+    // この間は別のモデルへ切り替えられない (案A)
+    // blocked は切り替えられないモデルとその理由 (VRAM 不足等)。載っていないモデルは切り替えると
+    // 外部APIが LLM プールのワーカーへ移る
+    chatLock: (() => {
+      const h = chatSharingServers();
+      if (!h.length) return null;
+      const blocked = {};
+      for (const m of chatModels) {
+        const b = m.name !== h[0].modelName && chatSwitchBlocker(m.name);
+        if (b) blocked[m.name] = b.reason.replace(/、$/, '');
+      }
+      return { model: h[0].modelName, servers: h.map(x => ({ id: x.id, port: x.port, mode: x.mode })), blocked };
+    })(),
     // 直近の起動失敗 (メモリ不足等)。ロード済み・起動中の間は返さない
     startError: (!chatProc && !chatProcStarting && chatStartError) ? {
       model: chatStartError.model, oom: chatStartError.oom, summary: chatStartError.summary,
@@ -2538,7 +2747,8 @@ app.get('/models', requireAuth, (req, res) => {
       detail: chatStartError.detail, at: chatStartError.at,
     } : null,
     embeddingReady: !!embedProc,
-    autoUnloaded: chatProcAutoUnloaded,  // アイドルでアンロード済みのモデル名（次のリクエストで再ロードされる）
+    // アイドルでアンロード済みのモデル名（次のリクエストで再ロードされる）。モデルが載っている間は返さない
+    autoUnloaded: (chatProc && !chatProcStarting) ? null : chatProcAutoUnloaded,
     idleUnloadMs: appConfig.llamaServer.idleUnloadMs || 0,
     firstLoadPending: !firstChatLoadDone,  // サーバー起動後、まだ一度もチャットモデルがロードされていない
   });
@@ -2560,7 +2770,7 @@ app.post('/models/load', requireAuth, jsonParser, async (req, res) => {
     res.json({ ok: true, current: chatProcModel });
   } catch (e) {
     log(ip, `MODEL LOAD ERROR ${e.message}`);
-    res.status(500).json({ error: e.message });
+    res.status(e.status || 500).json({ error: e.message, lockedBy: e.lockedBy || undefined });
   }
 });
 

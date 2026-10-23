@@ -956,8 +956,8 @@ function createLlmPool(deps) {
       // 設定が有効なら一旦アンロードして枠を空ける（次のチャット要求で自動再ロードされる）
       if (mode === 'swap' && cfg().swapUnloadsMainChat !== false && mainChat.getModel()) {
         log('-', `[LLMプール] スワップモード: メインチャットモデル「${mainChat.getModel()}」を一時アンロード`);
-        await mainChat.unload();
-        mainChatReleased = true;
+        // 外部APIがチャットのモデルを共用中は降ろさない (unload が false を返す)
+        if (await mainChat.unload() !== false) mainChatReleased = true;
       }
 
       const w = await startWorker(modelName);

@@ -137,14 +137,25 @@ async function startAgentServer(opts, deps) {
     // 処理中は内部 llama-server を「使用中」として扱う。
     // 外部APIの呼び出しは本体のプロキシを通らないため、これをしないと
     // アイドルアンロードが応答の途中でモデルを止めてしまう
-    const touch = () => { if (deps.touchChat) deps.touchChat(); };
+    // 転送先の llama-server。deps.acquireBackend があれば server.js が決める
+    // (チャットと共用中ならチャットの llama-server、チャットと別のモデルなら LLM プールのワーカー)
+    let backend = null;
+    const touch = () => { if (deps.touchChat && (!backend || backend.viaMainChat)) deps.touchChat(); };
     const keepAlive = setInterval(touch, 10000);
 
     try {
-      // モデルがロード済みか確認 (アイドルアンロード後の再ロード対応)
-      // ensureChatModelLoaded は「未起動なら起動開始して false を返す」設計のため、
-      // ready=false の場合は起動完了までポーリングで待つ (最大 readyTimeoutMs)
-      if (deps.ensureChatModelLoaded) {
+      if (deps.acquireBackend) {
+        try {
+          backend = await deps.acquireBackend();
+        } catch (e) {
+          return res.status(503).json({
+            error: { message: `モデルを起動できませんでした: ${e.message}`, type: 'service_unavailable' },
+          });
+        }
+      } else if (deps.ensureChatModelLoaded) {
+        // モデルがロード済みか確認 (アイドルアンロード後の再ロード対応)
+        // ensureChatModelLoaded は「未起動なら起動開始して false を返す」設計のため、
+        // ready=false の場合は起動完了までポーリングで待つ (最大 readyTimeoutMs)
         let ready = await deps.ensureChatModelLoaded();
         if (!ready) {
           const startedAt = Date.now();
@@ -185,7 +196,9 @@ async function startAgentServer(opts, deps) {
         temperature,
         maxTokens,
         passthrough,
-        chatHost, chatPort, modelName,
+        chatHost: backend ? backend.host : chatHost,
+        chatPort: backend ? backend.port : chatPort,
+        modelName,
         deps,
         ip,
       });
@@ -233,6 +246,7 @@ async function startAgentServer(opts, deps) {
     } finally {
       clearInterval(keepAlive);
       touch();
+      if (backend) backend.release();
     }
   });
 
