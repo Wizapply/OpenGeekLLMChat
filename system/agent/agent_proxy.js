@@ -105,11 +105,17 @@ async function startAgentServer(opts, deps) {
   });
 
   // モデル一覧 (OpenAI互換)
+  // 画像生成を公開している時は imageModels の名前も載せる
+  // (画像生成クライアントは送る前に model がこの一覧にあるかを確かめるため)
   app.get('/v1/models', (req, res) => {
-    res.json({
-      object: 'list',
-      data: [{ id: modelName, object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'opengeek-llm' }],
-    });
+    const created = Math.floor(Date.now() / 1000);
+    const data = [{ id: modelName, object: 'model', created, owned_by: 'opengeek-llm' }];
+    if (imageEnabled) {
+      for (const m of appConfig.imageModels || []) {
+        if (m && m.name && m.name !== modelName) data.push({ id: m.name, object: 'model', created, owned_by: 'opengeek-llm' });
+      }
+    }
+    res.json({ object: 'list', data });
   });
 
   // メインのチャット補完エンドポイント
