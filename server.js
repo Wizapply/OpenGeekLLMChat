@@ -1388,7 +1388,13 @@ async function startImageModel(modelName) {
   if (sdProcStarting) throw new Error('既に画像生成モデル起動処理中です');
   const model = findImageModelByName(modelName);
   if (!model) throw new Error(`画像生成モデルが見つかりません: ${modelName}`);
-  if (!fs.existsSync(model.path)) throw new Error(`モデルファイルが存在しません: ${model.path}`);
+  // Qwen-Image / Flux 等の分割モデルは diffusionModel (拡散モデル単体) で、
+  // SDXL 等の1ファイルのチェックポイントは path で指定する
+  const mainFile = model.diffusionModel || model.path;
+  if (!mainFile) throw new Error(`imageModels「${modelName}」に path か diffusionModel が必要です`);
+  for (const f of [mainFile, model.vae, model.llm, model.llmVision]) {
+    if (f && !fs.existsSync(f)) throw new Error(`モデルファイルが存在しません: ${f}`);
+  }
 
   sdProcStarting = true;
   // 重要: 起動開始時に sdLastActivity をリセット
@@ -1402,10 +1408,12 @@ async function startImageModel(modelName) {
     const port = sdConfig.port || 7860;
 
     const args = [
-      '--model', model.path,
+      ...(model.diffusionModel ? ['--diffusion-model', model.diffusionModel] : ['--model', model.path]),
       '--listen-port', String(port),
       '--listen-ip', '127.0.0.1',
       ...(model.vae ? ['--vae', model.vae] : []),
+      ...(model.llm ? ['--llm', model.llm] : []),                    // テキストエンコーダ (Qwen-Image は Qwen3-VL 等)
+      ...(model.llmVision ? ['--llm_vision', model.llmVision] : []), // その mmproj (画像編集用)
       ...(model.taesd ? ['--taesd', model.taesd] : []),
       ...(model.controlNet ? ['--control-net', model.controlNet] : []),
       ...(model.extraArgs || []),
@@ -1444,9 +1452,14 @@ async function startImageModel(modelName) {
     });
 
     // 起動完了を待つ
-    // sd-server には /health エンドポイントがないため、TCP接続だけで判定
-    const ready = await waitForTcpReady('127.0.0.1', port, sdConfig.readyTimeoutMs || 300000);
-    if (!ready) throw new Error(`sd-server が ${sdConfig.readyTimeoutMs || 300000}ms 以内に起動しませんでした`);
+    // sd-server には /health エンドポイントがないため、まず TCP 接続で判定する。
+    // 新しい sd-server はモデルの読み込み前にポートを開け、読み込み中は txt2img に
+    // 503 (model_loading) を返すので、続けてモデル一覧が埋まるまで待つ
+    const readyTimeoutMs = sdConfig.readyTimeoutMs || 300000;
+    const readyDeadline = Date.now() + readyTimeoutMs;
+    const ready = await waitForTcpReady('127.0.0.1', port, readyTimeoutMs)
+      && await waitForSdModelLoaded(port, proc, readyDeadline);
+    if (!ready) throw new Error(`sd-server が ${readyTimeoutMs}ms 以内に起動しませんでした`);
 
     sdCurrentModel = modelName;
     sdLastActivity = Date.now();
@@ -1454,6 +1467,25 @@ async function startImageModel(modelName) {
   } finally {
     sdProcStarting = false;
   }
+}
+
+// sd-server のモデル読み込み完了を待つ。GET /sdapi/v1/sd-models は読み込み中は 503 か空配列、
+// 読み込み後はモデルが1件以上返る。このエンドポイントが無い古い sd-server (404) は
+// 読み込み後にポートを開けるので、TCP 接続できた時点で読み込み済みとみなす
+async function waitForSdModelLoaded(port, proc, deadline) {
+  while (Date.now() < deadline) {
+    if (proc.exitCode !== null || proc.killed) throw new Error(`sd-server が読み込み中に終了しました (code=${proc.exitCode})`);
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}/sdapi/v1/sd-models`, { signal: AbortSignal.timeout(5000) });
+      if (r.status === 404) return true;
+      if (r.ok) {
+        const list = await r.json().catch(() => null);
+        if (Array.isArray(list) && list.length > 0) return true;
+      }
+    } catch {}
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  return false;
 }
 
 async function stopImageModel() {
@@ -3135,8 +3167,8 @@ async function generateImages({
   model = null,             // 省略時は defaultModel または現在ロード中
   width = 1024,
   height = 1024,
-  steps = 20,
-  cfgScale = 7.0,
+  steps = null,             // 省略時は imageModels[].steps、無ければ 20
+  cfgScale = null,          // 省略時は imageModels[].cfgScale、無ければ 7.0
   seed = -1,                // -1 = ランダム
   batchCount = 1,           // 同じ設定で何枚生成するか (最大4)
 } = {}, ip = '-') {
@@ -3149,6 +3181,10 @@ async function generateImages({
   // モデル決定
   const sdConfig = appConfig.stableDiffusion || {};
   const targetModel = model || sdCurrentModel || sdConfig.defaultModel || appConfig.imageModels[0].name;
+  // ステップ数・CFG はモデルごとに適値が違う (Turbo 系は CFG 1.0 等) ので、指定が無ければモデルの既定を使う
+  const modelDef = findImageModelByName(targetModel) || {};
+  if (steps == null) steps = modelDef.steps ?? 20;
+  if (cfgScale == null) cfgScale = modelDef.cfgScale ?? 7.0;
 
   // 既に別モデルがロードされていれば切り替え
   if (sdCurrentModel && sdCurrentModel !== targetModel) {
@@ -3236,7 +3272,7 @@ async function generateImages({
 
   const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
   log(ip, `[IMAGE-GEN] 完了: ${images.length}枚, ${elapsed}秒, prompt="${prompt.slice(0, 60)}"`);
-  return { images, model: targetModel, elapsed: Number(elapsed) };
+  return { images, model: targetModel, steps, cfgScale, elapsed: Number(elapsed) };
 }
 
 app.post('/image-gen', requireAuth, jsonParser, async (req, res) => {
@@ -3247,8 +3283,8 @@ app.post('/image-gen', requireAuth, jsonParser, async (req, res) => {
     model = null,
     width = 1024,
     height = 1024,
-    steps = 20,
-    cfgScale = 7.0,
+    steps = null,             // 省略時はモデルの既定 (generateImages 参照)
+    cfgScale = null,
     sampler = 'euler_a',      // sd-server のサンプラー名 (互換性のため sd-server には送らない)
     seed = -1,
     batchCount = 1,
@@ -3263,7 +3299,7 @@ app.post('/image-gen', requireAuth, jsonParser, async (req, res) => {
       model: result.model,
       prompt,
       negativePrompt,
-      parameters: { width, height, steps, cfgScale, sampler },
+      parameters: { width, height, steps: result.steps, cfgScale: result.cfgScale, sampler },
       elapsed: result.elapsed,
     });
   } catch (e) {
