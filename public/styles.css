@@ -1078,6 +1078,86 @@
     color: var(--text-secondary);
   }
 
+  /* ── Git パネル (GDrive パネルのクラスを流用し、足りない部品だけ定義) ── */
+  .git-version { color: var(--text-muted); font-size: 10px; }
+  .git-repo-select { flex: 1; min-width: 0; }
+  .git-repo-meta { display: flex; flex-direction: column; gap: 2px; word-break: break-all; }
+  .git-repo-meta a { color: var(--accent); }
+  .git-repo-url {
+    font-family: var(--font-mono, monospace);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .git-add-form {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 6px;
+    border-top: 1px solid var(--border);
+  }
+  .git-notice {
+    padding: 8px 10px;
+    background: var(--accent-dim);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-sm);
+    color: var(--accent);
+    font-size: 11px;
+    line-height: 1.6;
+    word-break: break-word;
+  }
+  .git-file-view {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 6px 8px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-sm);
+  }
+  .git-file-view-header { display: flex; align-items: center; gap: 2px; }
+  .git-file-view-title {
+    flex: 1;
+    min-width: 0;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .git-file-content {
+    margin: 0;
+    max-height: 360px;
+    overflow: auto;
+    font-family: var(--font-mono, monospace);
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--text-primary);
+    white-space: pre;
+    tab-size: 4;
+  }
+  .git-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-height: 240px;
+    overflow-y: auto;
+  }
+  .git-list-item {
+    font-size: 11px;
+    color: var(--text-secondary);
+    padding: 4px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .git-list-item:hover { background: var(--accent-dim); color: var(--text-primary); }
+  .git-list-path { font-family: var(--font-mono, monospace); color: var(--accent); }
+  .git-list-meta { color: var(--text-muted); }
+
   .gdrive-upload-select {
     padding: 7px 10px;
     background: var(--bg-tertiary);
@@ -3146,6 +3226,20 @@
   }
   .toolbar-btn.gdrive-toggle:hover { opacity: 0.8; }
   .toolbar-btn.gdrive-toggle.active:hover { opacity: 1; }
+
+  /* Git トグル: GDrive トグルと同じ挙動 */
+  .toolbar-btn.git-toggle {
+    opacity: 0.4;
+    position: relative;
+  }
+  .toolbar-btn.git-toggle.active {
+    opacity: 1;
+    background: var(--accent-dim);
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  .toolbar-btn.git-toggle:hover { opacity: 0.8; }
+  .toolbar-btn.git-toggle.active:hover { opacity: 1; }
 
   /* 外部LLM (有料API) トグル。課金・外部送信を伴うので accent ではなく orange で目立たせる */
   .toolbar-btn.cloud-llm-toggle {

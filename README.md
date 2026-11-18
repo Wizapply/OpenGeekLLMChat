@@ -67,6 +67,34 @@ LLMが直接サーバーのファイルシステムに `.py` / `.xml` / `.json` 
 
 → セットアップ手順は [☁️ Google Drive 連携のセットアップ](#️-google-drive-連携のセットアップ) を参照
 
+### 🐙 Git 連携（GitHub / Gitea / GitLab / ローカル git をLLMが読み書き）
+「リポジトリの README 要約して」「`parse_config` はどこで定義されてる？」「直近のコミットで何が変わった？」「この修正をコミットして push して」で、LLMが自分で Git リポジトリを取得・検索・閲覧し、（許可すれば）書き込み・コミット・push まで行います。追加の npm パッケージは不要（サーバーの `git` コマンドを `execFile` で呼ぶだけ）。git が話せる相手ならどこでも使えます。
+
+| 相手 | 指定方法 |
+|---|---|
+| GitHub / Gitea / Forgejo / GitLab / Bitbucket | `https://…/owner/repo.git`（アクセストークン）または `git@host:owner/repo.git`（SSH鍵） |
+| 自前の git サーバー・ローカルの bare リポジトリ | `ssh://…` / `file:///srv/git/repo.git` |
+| サーバー上の既存の作業コピー（ローカル git） | `path` にディレクトリを指定（clone せずそのまま使う） |
+
+| ツール | できること |
+|---|---|
+| `git_list_repos` / `git_status` | 登録リポジトリの一覧／現在のブランチ・リモートとの差・未コミットの変更 |
+| `git_pull` | リモートから取得（未取得なら clone、以降は fetch + fast-forward） |
+| `git_list_files` / `git_read_file` / `git_search` | ファイル一覧・読み込み・全文検索（`git grep`）。`ref` で**別ブランチ・タグ・過去のコミット**も読める |
+| `git_log` / `git_show_commit` / `git_diff` / `git_list_branches` | 履歴・コミット内容・差分・ブランチ |
+| `git_import_to_server` | リポジトリのファイルを `uploads/` に取り込む → そのまま Python/DuckDB で処理できる |
+| `git_write_file` / `git_export_from_server` / `git_delete_file` | 作業コピーへの書き込み・uploads からのコピー・削除（書き込み許可時のみ） |
+| `git_checkout` / `git_commit` | ブランチ作成・切替／コミット（書き込み許可時のみ） |
+| `git_push` | リモートへ反映（push 許可時のみ。force push はしない） |
+
+**安全側に倒した設計**
+- 既定は **読み取り専用**。`readOnly:false` + `allowWrite:true` で書き込み・コミット、さらに `allowPush:true` で push のツールが生えます。`protectedBranches`（例: `["main"]`）へのコミット・push は拒否
+- トークンは URL に埋め込まず、**そのホスト宛ての通信だけに付く** `Authorization` ヘッダとして環境変数経由で git に渡します（`.git/config` にもプロセス一覧にも残らない）。ブラウザ・LLM・エラーメッセージにも出しません
+- フック無効・`ext::` 等の危険なプロトコル禁止・対話プロンプト禁止・サブモジュール再帰なし。パスは `..` / `.git` / リポジトリ外へのシンボリックリンクを拒否
+- チャット入力欄の 🐙 ボタンで ON/OFF、右パネルの「🐙 Git」タブでファイル閲覧・検索・履歴・取り込み・コミット・push・リポジトリ追加ができます。外部APIのツール対応モードでも `git` を選べます
+
+→ セットアップ手順は [🐙 Git 連携のセットアップ](#-git-連携のセットアップ) を参照
+
 ### 🌩️ 外部LLMフォールバック（ローカルが限界の時だけ有料APIに聞き直す）
 
 ローカルLLMで**限界に達した時だけ**、同じ会話を外部の大きなLLM（OpenAI / Anthropic / Gemini / OpenRouter / Groq / DeepSeek / Mistral / xAI / 任意の OpenAI 互換API）に投げて回答をもらう機能です。追加の npm パッケージは不要（Node標準の `https` だけで各社APIを叩く `cloud_llm.js`）。**既定は無効**で、`config.json` の `cloudLlm.enabled` を true にしない限り外部への送信は一切起きません。
@@ -985,7 +1013,7 @@ requests.post(f"{BASE}/ml/rl/sim/train", headers=H, json={
 通常の外部APIは llama-server を直接公開する「素のLLM」モードですが、**ツール対応モード** ではWebチャットと同じツール群を外部プログラムからも使えます。
 
 - **OpenAI互換 + エージェント動作**: `/v1/chat/completions` を叩くだけで、LLM が自律的にツールを選んで実行 → 結果に基づいて最終応答
-- **対応ツール**: 機械学習 (`ml_*` 5ツール) / Web検索 / ファイル参照 / RAG文書検索
+- **対応ツール**: 機械学習 (`ml_*` 5ツール) / Web検索 / ファイル参照 / RAG文書検索 / Google Drive (`gdrive_*`) / Git (`git_*`。GitHub・Gitea・ローカル git)
 - **モデルロード保証**: 起動時に指定モデルを内部で自動ロード、アイドルアンロード後の再リクエストでも自動再ロード (ポーリング待機)
 - **OpenAI互換エラー応答**: JSON パースエラーや404も HTML ではなく JSON で返す
 - **`/health` はパブリック**: 認証なしでヘルスチェック可能 (ロードバランサー・監視ツール対応)
@@ -2443,6 +2471,103 @@ PDF・画像・Excel などのバイナリは `gdrive_read_file` では読めな
 
 ---
 
+## 🐙 Git 連携のセットアップ
+
+LLM と画面の「🐙 Git」パネルから、GitHub / Gitea / GitLab / ローカル git のリポジトリを読み書きできるようにします。
+**追加の npm パッケージは不要**です。サーバーに `git` コマンド（**2.31 以上**。トークン認証に必要）を入れておいてください。
+
+```bash
+git --version
+```
+
+### 1. config.json を編集
+
+```jsonc
+"git": {
+  "enabled": true,                       // ← 機能ON
+  "readOnly": true,                      // 既定は読み取り専用
+  "allowWrite": false,                   // 書き込み・コミットを許すなら readOnly:false と両方設定
+  "allowPush": false,                    // push まで許すなら true (allowWrite も必要)
+  "protectedBranches": ["main"],         // ここに挙げたブランチへのコミット・push は拒否 (* 可)
+  "authorName": "OpenGeekLLM",           // コミットの作成者
+  "authorEmail": "bot@example.com",
+  "repos": [
+    // GitHub (非公開リポジトリはトークン。公開なら token 不要)
+    { "name": "myapp", "url": "https://github.com/owner/myapp.git", "branch": "main",
+      "tokenEnv": "GITHUB_TOKEN", "description": "Webアプリ本体" },
+    // 社内 Gitea (トークンを直接書くこともできる。/config には出ない)
+    { "name": "infra", "url": "https://gitea.example.com/team/infra.git", "provider": "gitea",
+      "username": "me", "token": "xxxxxxxxxxxxxxxx" },
+    // SSH 鍵で接続
+    { "name": "docs", "url": "git@github.com:owner/docs.git", "sshKeyFile": "/home/me/.ssh/id_ed25519_llm" },
+    // サーバー上の既存の作業コピーをそのまま使う (ローカル git)
+    { "name": "local-notes", "path": "/home/me/notes" }
+  ]
+}
+```
+
+保存して再起動すると、チャット入力欄に 🐙 ボタン、右パネルに「🐙 Git」タブが出ます。
+`url` のリポジトリは、初回アクセス時（LLM のツール呼び出し、またはパネルで選択した時）に `workDir`（既定 `git_repos/`）へ自動で clone されます。以降の最新化は「⬇️ pull」ボタンか `git_pull` ツールで行います。
+
+### 2. アクセストークンの作り方
+
+| サービス | 作り方 | 必要な権限 |
+|---|---|---|
+| GitHub | Settings → Developer settings → **Fine-grained personal access tokens** → 対象リポジトリを選択 | Contents: **Read**（コミット・push するなら **Read and write**） |
+| Gitea / Forgejo | 右上のアイコン → 設定 → アプリケーション → **アクセストークンを生成** | repository: **Read**（push するなら **Read and Write**） |
+| GitLab | User Settings → Access tokens | `read_repository`（push するなら `write_repository`） |
+
+- `username` は省略可（GitHub は `x-access-token`、Gitea/GitLab は `oauth2` を自動で使います。Gitea は名前に関係なくトークンで認証されます）
+- `token` を config.json に書きたくない場合は `tokenEnv` に環境変数名を書き、その環境変数にトークンを入れて起動します
+- 画面から追加したリポジトリのトークンは `git_repos.json`（chmod 600・gitignore 済み）に保存されます
+
+### 3. 画面からリポジトリを追加したい場合（任意）
+
+```jsonc
+"allowAddRepo": true,                    // 🐙 Git パネルの「＋ リポジトリを追加」を有効化
+"allowLocalPaths": ["/home/me/repos"]    // 画面から登録できるサーバー上のディレクトリ (path / file:// の範囲)
+```
+
+`allowLocalPaths` が空のままだと、画面からはサーバー上のパスを登録できません（任意のディレクトリを覗かれないため）。config.json に直接書いたリポジトリはこの制限を受けません。
+
+### 4. 使い方の例
+
+- 「myapp の README を要約して」→ `git_read_file`
+- 「`parse_config` はどこで定義されてる？」→ `git_search` → `git_read_file`
+- 「release/1.2 ブランチと main の違いは？」→ `git_diff`（`from`/`to`）
+- 「昨日のコミットで何が変わった？」→ `git_log` → `git_show_commit`
+- 「data/sales.csv をグラフにして」→ `git_import_to_server` → Python
+- 「README のタイポを直して feature/typo ブランチにコミットして push して」→ `git_checkout` → `git_read_file` → `git_write_file` → `git_diff` → `git_commit` → `git_push`（書き込み・push 許可時）
+
+### 主な設定項目
+
+| キー | 既定 | 説明 |
+|---|---|---|
+| `workDir` | `git_repos` | clone 先 |
+| `cloneDepth` | `0` | 0 = 全履歴。巨大なリポジトリは `50` 等で浅く clone |
+| `allowHttp` | `false` | 暗号化なしの `http://`（社内 Gitea 等）を許可 |
+| `allowFileProtocol` | `true` | `file://` やローカルパスからの clone を許可 |
+| `allowHooks` | `false` | git フック（pre-commit 等）を実行する |
+| `signCommits` | `false` | `true` でコミット署名を git の設定（`commit.gpgsign`）に任せる。既定は無人実行で止まらないよう署名しない |
+| `sshKeyFile` / `sshStrictHostKeyChecking` | `""` / `accept-new` | SSH 接続の鍵とホスト鍵の確認方法（パスフレーズ付き鍵は不可） |
+| `maxTextChars` / `maxFileMB` / `maxListEntries` / `maxSearchResults` | 20000 / 5 / 500 / 100 | LLM に渡す量の上限 |
+
+API トークン（`ml.apiTokens`）で REST API を使う場合、参照系は `git:read`、更新系（pull・取り込み・書き込み・コミット・push・登録）は `git:write` の権限が必要です。
+
+### トラブルシューティング
+
+| 症状 | 対処 |
+|---|---|
+| 🐙 ボタンが出ない | `git.enabled: true` にして再起動 |
+| 「git コマンドが見つかりません」 | サーバーに git をインストール（`sudo apt install git` 等） |
+| 非公開リポジトリの clone が `Authentication failed` / `not found` | トークンの権限・有効期限・対象リポジトリを確認。git が 2.31 未満だとトークンが渡らない（起動ログに警告が出る） |
+| SSH で `Host key verification failed` | `sshStrictHostKeyChecking: "yes"` の時は、先にサーバーで一度 `ssh -T git@github.com` 等を実行して known_hosts に登録 |
+| pull で「fast-forward できません」 | 手元に未 push のコミットがあり、リモートと分岐している。🐙 パネルで内容を確認し、手動でマージするか作業コピーを作り直す（画面から追加したリポジトリは登録解除→再登録で clone し直せる） |
+| 書き込み・コミットのツールが出てこない | `readOnly: false` **と** `allowWrite: true` の両方が必要。push は加えて `allowPush: true` |
+| 「ブランチ「main」は保護されている」 | `protectedBranches` の対象。`git_checkout` で作業用ブランチを作ってからコミット・push する |
+
+---
+
 ## 🌩️ 外部LLMフォールバックのセットアップ
 
 「ローカルで粘って、ダメな時だけ外部の大きなモデルに聞く」ための設定です。`config.json` の `cloudLlm` を編集して再起動します（`/editconfig.html` からも編集できます。「cloudLlm」で絞り込むと全キーの説明が出ます）。
@@ -2858,6 +2983,7 @@ print(r.json()["x_tools_used"])
    - 📁 ファイル参照 (`list_files` / `read_file`)
    - 📚 RAG文書検索 (`search_documents`) — embeddingサーバー必要
    - ☁️ GDrive (`gdrive_*`) — GDrive連携が有効かつ接続済みの時のみ
+   - 🐙 Git (`git_*`) — Git連携が有効かつリポジトリ登録済みの時のみ (書き込み・push 系は config の許可に従う)
 5. 🚀 起動
 
 起動後、起動中サーバー一覧に **「🔧 ツール対応」バッジ** が表示されます。
@@ -2883,6 +3009,13 @@ print(r.json()["x_tools_used"])
 | `gdrive_upload_from_server` | uploads のファイルを Drive へ | 要 `allowWrite` |
 | `gdrive_create_folder` | Drive にフォルダ作成 | 要 `allowWrite` |
 | `gdrive_delete_file` | Drive のファイルをゴミ箱へ | 要 `allowDelete` |
+| `git_list_repos` / `git_status` | 登録リポジトリ一覧 / ブランチ・変更状況 | Git連携が必要 |
+| `git_pull` | リモートから取得 (初回は clone) | fast-forward のみ |
+| `git_list_files` / `git_read_file` / `git_search` | ファイル一覧・読み込み・全文検索 | `ref` で別ブランチ/過去のコミットも可 |
+| `git_log` / `git_show_commit` / `git_diff` / `git_list_branches` | 履歴・コミット内容・差分・ブランチ | |
+| `git_import_to_server` | リポジトリのファイルを uploads に取り込む | バイナリ対応 |
+| `git_write_file` / `git_export_from_server` / `git_delete_file` / `git_checkout` / `git_commit` | 作業コピーの変更・ブランチ・コミット | 要 `readOnly:false` + `allowWrite` |
+| `git_push` | リモートへ push | 要 `allowPush`。force はしない |
 
 **非対応** (セキュリティ・複雑性のため):
 - `generate_image` (画像生成)

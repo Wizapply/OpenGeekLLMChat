@@ -13,6 +13,9 @@ key.pem
 # Google Drive のリフレッシュトークン / サービスアカウントキー（機密）
 gdrive_token.json
 gdrive-service-account*.json
+# Git 連携: clone した作業コピーと、画面から追加したリポジトリ (アクセストークンを含む)
+/git_repos/
+git_repos.json
 # 3Dモデル生成のタスク記録 (生成物は public/uploads/model3d/ で既に除外済み)
 model3d_tasks.json
 # 3Dモデル生成ワーカーがホームに書けない時のモデル・キャッシュ置き場 (数GB)

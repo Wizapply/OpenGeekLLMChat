@@ -33,6 +33,7 @@ const API_AGENT_TOOLS = [
   { id: 'file', label: '📁 ファイル参照 (list_files / read_file)' },
   { id: 'rag', label: '📚 RAG文書検索 (search_documents)' },
   { id: 'gdrive', label: '☁️ GDrive (gdrive_* ツール)' },
+  { id: 'git', label: '🐙 Git (git_* ツール: GitHub / Gitea / ローカル git)' },
   { id: 'image', label: '🎨 画像生成 (POST /v1/images/generations)' },
   { id: 'model3d', label: '🧊 3Dモデル生成 (Meshy互換 /openapi/v2/text-to-3d, /openapi/v1/image-to-3d)' },
 ];
@@ -162,6 +163,27 @@ const FAST_WEB_HINT_RE = /最新|今日|昨日|明日|現在|今週|今月|今�
 const FAST_WEB_CMD_RE = /検索して|調べて|ググ|search for/i;
 const FAST_DOC_HINT_RE = /資料|ドキュメント|添付|アップロード/;
 const FAST_GDRIVE_HINT_RE = /ドライブ|drive|クラウド/i;
+const FAST_GIT_HINT_RE = /\bgit|github|gitea|gitlab|リポジトリ|レポジトリ|コミット|ブランチ|プルリク|push|pull|ソースコード/i;
+// Git ツールの進捗表示ラベル (通常チャットのツール実行で使う)
+const GIT_TOOL_LABELS = {
+  git_list_repos: '📚 Git リポジトリ一覧',
+  git_status: '🔎 Git の状態を確認',
+  git_pull: '⬇️ Git リモートから取得',
+  git_list_files: '📂 Git のファイル一覧',
+  git_read_file: '📄 Git のファイルを読み込み',
+  git_search: '🔍 Git を全文検索',
+  git_log: '🕘 Git の履歴',
+  git_show_commit: '🧾 Git のコミット内容',
+  git_diff: '± Git の差分',
+  git_list_branches: '🌿 Git のブランチ一覧',
+  git_import_to_server: '⬇️ Git からサーバーへ取り込み',
+  git_write_file: '✍️ Git の作業コピーに書き込み',
+  git_export_from_server: '⬆️ サーバーから Git へコピー',
+  git_delete_file: '🗑️ Git のファイルを削除',
+  git_checkout: '🌿 Git のブランチ切り替え',
+  git_commit: '✅ Git にコミット',
+  git_push: '🚀 Git リモートへ push',
+};
 const FAST_TTS_HINT_RE = /音声|読み上げ|しゃべ|喋|の声で/;
 const FAST_IMGGEN_HINT_RE = /描いて|イラスト|画像を(作|生成|描)|絵を(作|生成|描)/;
 const FAST_MODEL3D_HINT_RE = /3\s*D|３Ｄ|立体|モデリング|glb|メッシュ|フィギュア/i;
@@ -2616,6 +2638,7 @@ function App() {
         ? String(t.persistentRagCategory)
         : (cfg.ragEnabledByDefault === true ? 'all' : 'off'),
       gdrive: t.gdrive !== undefined ? !!t.gdrive : true,
+      git: t.git !== undefined ? !!t.git : true,
     };
   };
   // 選択中カテゴリの範囲に入るドキュメント。ツール定義・判断プロンプト・件数表示は
@@ -2629,6 +2652,9 @@ function App() {
   // Google Drive が外部APIのツール対応モードで使えるか
   const [apiGdriveAvailable, setApiGdriveAvailable] = useState(false);
   const [apiGdriveReason, setApiGdriveReason] = useState('');
+  // Git が外部APIのツール対応モードで使えるか
+  const [apiGitAvailable, setApiGitAvailable] = useState(false);
+  const [apiGitReason, setApiGitReason] = useState('');
   const [apiBusy, setApiBusy] = useState(false);
   const [tokenSpeed, setTokenSpeed] = useState(null); // { tokPerSec, totalTokens }
   const tokenHistoryRef = useRef([]); // [{ tokens, durationNs }]
@@ -2794,6 +2820,30 @@ function App() {
   // gdriveEnabled はチャット欄のトグル。接続済みでもユーザーがOFFにすればツールを出さない。
   const [gdriveStatus, setGdriveStatus] = useState(null);
   const [gdriveEnabled, setGdriveEnabled] = useState(true);
+  // ─── Git (GitHub / Gitea / ローカル git) ───
+  // gitStatus は /git/status の結果 (enabled / available / repos / allowWrite 等。トークンは含まない)。
+  // gitEnabled はチャット欄の 🐙 トグル。OFF なら git_* ツールを LLM に見せない。
+  const [gitStatus, setGitStatus] = useState(null);
+  const [gitEnabled, setGitEnabled] = useState(true);
+  // 右パネル「🐙 Git」の表示状態
+  const [gitRepo, setGitRepo] = useState('');            // 選択中のリポジトリ名
+  const [gitRepoInfo, setGitRepoInfo] = useState(null);  // /git/repos/:name/status
+  const [gitBranches, setGitBranches] = useState(null);  // /git/repos/:name/branches
+  const [gitRef, setGitRef] = useState('');              // 閲覧中の ref ('' = 作業コピー)
+  const [gitPath, setGitPath] = useState('');            // 閲覧中のディレクトリ
+  const [gitEntries, setGitEntries] = useState([]);
+  const [gitLoading, setGitLoading] = useState(false);
+  const [gitBusy, setGitBusy] = useState(false);
+  const [gitError, setGitError] = useState('');
+  const [gitNotice, setGitNotice] = useState('');
+  const [gitFileView, setGitFileView] = useState(null);  // { title, path, content, binary, ... }
+  const [gitSearchQuery, setGitSearchQuery] = useState('');
+  const [gitSearchResults, setGitSearchResults] = useState(null);
+  const [gitLog, setGitLog] = useState(null);
+  const [gitCommitMsg, setGitCommitMsg] = useState('');
+  const [gitNewBranch, setGitNewBranch] = useState('');
+  const [gitAddOpen, setGitAddOpen] = useState(false);
+  const [gitAddForm, setGitAddForm] = useState({ name: '', url: '', path: '', provider: '', branch: '', username: '', token: '' });
   // ─── 外部LLM (有料API) フォールバック ───
   // cloudLlmStatus: サーバーの /cloud-llm/status (設定の有無・プロバイダ・自動エスカレーション条件・利用回数)。
   //   キーや URL は含まれない (サーバーが返さない)。
@@ -3741,6 +3791,9 @@ function App() {
       const gdriveCanWrite = gdriveActive && !!gdriveStatus?.allowWrite;
       const gdriveCanDelete = gdriveActive && !!gdriveStatus?.allowDelete;
 
+      // Git が使えるか: configで有効 + リポジトリ登録済み + チャット欄でON
+      const gitActive = !!(appConfig.git?.enabled && gitStatus?.available && gitEnabled);
+
       // 永続RAGが使えるか: embedding利用可 + 選択範囲に資料あり + 📚プルダウンで検索対象を選択済み。
       // 「使用しない」の間は検索ツールもRAG用システムプロンプトも出さないので、
       // 雑談やコード生成に無関係なベクトル検索が挟まらない
@@ -3756,7 +3809,7 @@ function App() {
       // search_persistent_documents に一生たどり着けない
       const useAgentic = appConfig.ragMode === 'agentic'
         && (documents.length > 0 || webSearchActive || appConfig.imageGen || appConfig.ttsGen || appConfig.model3dGen || gdriveActive
-            || persistentRagActive);
+            || gitActive || persistentRagActive);
 
       if (useAgentic) {
         // ─── Agentic RAG + Web検索: LLMがツールで検索を判断 ───
@@ -3950,6 +4003,25 @@ function App() {
                 },
               },
             });
+          }
+        }
+
+        // ─── Git ツール ───
+        // 定義はサーバー (system/git/git_repo.js) が設定に応じて組み立てる
+        // (読み取り専用なら参照系だけ、allowWrite で書き込み・コミット、allowPush で push が増える)。
+        // 実行もサーバーの /git/tool に任せるので、外部APIのツール対応モードと動きが揃う
+        let gitCanWrite = false, gitCanPush = false;
+        if (gitActive) {
+          try {
+            const res = await fetch('/git/tool-defs');
+            if (res.ok) {
+              const defs = (await res.json()).tools || [];
+              tools.push(...defs);
+              gitCanWrite = defs.some(d => d.function?.name === 'git_commit');
+              gitCanPush = defs.some(d => d.function?.name === 'git_push');
+            }
+          } catch (e) {
+            console.warn('[git] ツール定義の取得に失敗:', e.message);
           }
         }
 
@@ -4409,6 +4481,9 @@ function App() {
         if (gdriveActive && sp.googleDrive) {
           agentSystem += '\n\n' + sp.googleDrive;
         }
+        if (gitActive && sp.git) {
+          agentSystem += '\n\n' + sp.git;
+        }
         // 永続RAGが使える時だけ、引用の忠実性に関する指示を足す
         // (原文の数式・記号を一般形に書き換えるのを抑え、出典ページを添えさせる)
         if (persistentRagActive && sp.rag) {
@@ -4618,6 +4693,16 @@ function App() {
             'まず検索か一覧でIDを特定してから読むこと' + gdWrite + gdDelete
           );
         }
+        if (gitActive) {
+          const repoNames = (gitStatus?.repos || []).map(r => r.name).slice(0, 10).join(', ');
+          toolListLines.push(
+            `- git_list_repos / git_status / git_pull / git_list_files / git_read_file / git_search / git_log / git_show_commit / git_diff / git_list_branches / git_import_to_server: ` +
+            `Git リポジトリ (${repoNames}) の取得・閲覧・検索・履歴 ` +
+            '★「リポジトリ」「GitHub」「Gitea」「git」「コミット」「ブランチ」「ソースコード」等の言及があれば使う。パスが分からなければ一覧か検索で特定してから読むこと' +
+            (gitCanWrite ? '／git_write_file・git_export_from_server・git_delete_file・git_checkout・git_commit: 作業コピーの変更とコミット' : '') +
+            (gitCanPush ? '／git_push: リモートへ反映 (ユーザーが明示した時だけ)' : '')
+          );
+        }
         if (hasImages && appConfig.ml?.enabled) {
           toolListLines.push('- detect_objects: 添付画像の物体検出（「何が写ってる」「物体を検出」「画像を分析」等で使う。カスタムモデル名の明示があれば model 引数で指定）');
           toolListLines.push('- detect_keypoints: 添付画像のキーポイント検出（「姿勢を検出」「キーポイント」「関節位置」等で使う。カスタムモデル名の明示があれば model 引数で指定）');
@@ -4735,6 +4820,7 @@ function App() {
               // 添付したファイル名 (拡張子抜き) を本文中で呼んでいる場合も資料の話
               || documents.some(d => text.includes(d.name.replace(/\.[^.]+$/, '')))),
             gdrive: gdriveActive && !!text && FAST_GDRIVE_HINT_RE.test(text),
+            git: gitActive && !!text && FAST_GIT_HINT_RE.test(text),
             tts: !!appConfig.ttsGen && !!text && FAST_TTS_HINT_RE.test(text),
             imageGen: !!appConfig.imageGen && !!text && FAST_IMGGEN_HINT_RE.test(text),
             model3d: !!appConfig.model3dGen && !!text && FAST_MODEL3D_HINT_RE.test(text),
@@ -4768,7 +4854,7 @@ function App() {
             } else if (hintKeys[0] === 'doc' && text.length <= 200) {
               fastDirectCall = { name: 'search_documents', args: { query: text } };
             }
-            // gdrive/画像生成/音声合成/サーバーファイル/ML は引数の組み立てに
+            // gdrive/git/画像生成/音声合成/サーバーファイル/ML は引数の組み立てに
             // 判断が要る (ID特定・プロンプト英訳・パス指定) ので即決しない
             if (fastDirectCall) {
               console.log(`[高速ルート] ${fastDirectCall.name} が明白 → 判断LLMを省略して即実行`);
@@ -5624,6 +5710,70 @@ function App() {
                 });
               }
               apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: gdResultText });
+
+            } else if (fnName && fnName.startsWith('git_')) {
+              // ─── Git 系ツール ───
+              // 実行はサーバーの /git/tool (外部APIのツール対応モードと同じ executeTool) に任せ、
+              // ここは進捗表示と結果の整形だけ行う。結果は LLM 向けに整形済みのテキストで返ってくる
+              const gLabel = GIT_TOOL_LABELS[fnName] || '🐙 Git 操作';
+              const gArg = fnArgs.path || fnArgs.query || fnArgs.commit || fnArgs.branch || fnArgs.message || fnArgs.repo || '';
+              searchQueries.push({
+                query: `Git: ${gLabel.replace(/^\S+\s/, '')}${gArg ? `「${String(gArg).slice(0, 40)}」` : ''}`,
+                resultCount: null, type: 'git',
+              });
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = {
+                  ...copy[copy.length - 1],
+                  agentStatus: `${gLabel}${gArg ? `「${String(gArg).slice(0, 30)}」` : ''}中...`,
+                  searchQueries: [...searchQueries],
+                };
+                return copy;
+              });
+              let gResultText = '';
+              let gOk = false;
+              try {
+                const res = await fetch('/git/tool', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ name: fnName, args: fnArgs }),
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok || data.ok === false) throw new Error(data.error || `HTTP ${res.status}`);
+                gResultText = data.text || '(結果なし)';
+                gOk = true;
+              } catch (e) {
+                console.error(`[${fnName}] エラー:`, e);
+                gResultText = `Git の操作に失敗しました: ${e.message}`
+                  + (/登録されていません|repo を指定/.test(e.message) ? '\n\ngit_list_repos で登録済みのリポジトリ名を確認してください。' : '')
+                  + (/見つかりません|ありません/.test(e.message) && fnName === 'git_read_file' ? '\n\nパスを推測せず、git_list_files か git_search でファイルを特定してください。' : '');
+              }
+              searchQueries[searchQueries.length - 1].resultCount = gOk ? 1 : 0;
+              setMessages(prev => {
+                const copy = [...prev];
+                copy[copy.length - 1] = { ...copy[copy.length - 1], agentStatus: null, searchQueries: [...searchQueries] };
+                return copy;
+              });
+              const GIT_RESULT_MAX = 24000;
+              if (gResultText.length > GIT_RESULT_MAX) {
+                gResultText = gResultText.slice(0, GIT_RESULT_MAX) + '\n... (以降省略)';
+              }
+              // 読み込んだファイルは「参照した資料」に出す
+              if (fnName === 'git_read_file' && gOk) {
+                allContexts.push({
+                  docName: `${fnArgs.repo || ''}:${fnArgs.path || ''}${fnArgs.ref ? ` @${fnArgs.ref}` : ''}`,
+                  source: 'Git',
+                  url: null,
+                  chunk: gResultText.slice(0, 8000),
+                });
+              }
+              // 状態を変える操作の後は uploads 一覧 / Git パネルを最新にする
+              if (gOk && (fnName === 'git_import_to_server')) loadFileList();
+              if (gOk && !['git_list_repos', 'git_status', 'git_list_files', 'git_read_file', 'git_search', 'git_log', 'git_show_commit', 'git_diff', 'git_list_branches'].includes(fnName)) {
+                loadGitStatus();
+                if (gitRepo && (!fnArgs.repo || fnArgs.repo === gitRepo)) loadGitRepoInfo(gitRepo);
+              }
+              apiMessages.push({ role: 'tool', tool_call_id: tc.id, content: gResultText });
 
             } else if (fnName === 'list_files') {
               searchQueries.push({ query: 'サーバーファイル一覧', resultCount: null, type: 'file' });
@@ -7826,14 +7976,289 @@ function App() {
     }
   }
 
+  // ─── Git (GitHub / Gitea / ローカル git) ───
+  // 状態 (リポジトリ一覧・許可フラグ) を取る。トークンはサーバーが返さない
+  async function loadGitStatus() {
+    try {
+      const res = await fetch('/git/status');
+      if (!res.ok) { setGitStatus(null); return null; }
+      const st = await res.json();
+      setGitStatus(st);
+      return st;
+    } catch {
+      setGitStatus(null);
+      return null;
+    }
+  }
+
+  // JSON API の共通呼び出し (エラー時はサーバーのメッセージで例外)
+  async function gitApi(url, opts) {
+    const res = await fetch(url, opts);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    return data;
+  }
+  const gitRepoUrl = (repo, suffix = '') => `/git/repos/${encodeURIComponent(repo)}${suffix}`;
+  const gitPost = (url, body) => gitApi(url, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
+  });
+
+  // 右パネルの Git タブを開く (未選択なら先頭のリポジトリを開く)
+  async function openGitPanel() {
+    setRightPanelTab('git');
+    setGpuPanelOpen(true);
+    const st = await loadGitStatus();
+    const repos = st?.repos || [];
+    if (repos.length === 0) return;
+    const keep = repos.some(r => r.name === gitRepo);
+    if (!keep) openGitRepo(repos[0].name);
+    else if (gitEntries.length === 0) openGitRepo(gitRepo);
+  }
+
+  async function loadGitRepoInfo(repo = gitRepo) {
+    if (!repo) return;
+    try {
+      const [st, br] = await Promise.all([
+        gitApi(gitRepoUrl(repo, '/status')),
+        gitApi(gitRepoUrl(repo, '/branches')),
+      ]);
+      setGitRepoInfo(st);
+      setGitBranches(br);
+    } catch (e) {
+      setGitError(e.message);
+    }
+  }
+
+  async function loadGitDir(repo = gitRepo, dir = gitPath, ref = gitRef) {
+    if (!repo) return;
+    setGitLoading(true);
+    setGitError('');
+    try {
+      const p = new URLSearchParams({ path: dir || '', ref: ref || '' });
+      const data = await gitApi(`${gitRepoUrl(repo, '/files')}?${p.toString()}`);
+      setGitEntries(data.entries || []);
+      setGitPath(dir || '');
+    } catch (e) {
+      setGitError(e.message);
+      setGitEntries([]);
+    } finally {
+      setGitLoading(false);
+    }
+  }
+
+  // リポジトリを切り替える (未 clone ならサーバーが初回に clone するので時間がかかることがある)
+  async function openGitRepo(repo) {
+    setGitRepo(repo);
+    setGitRef('');
+    setGitPath('');
+    setGitFileView(null);
+    setGitSearchResults(null);
+    setGitLog(null);
+    setGitNotice('');
+    setGitError('');
+    setGitRepoInfo(null);
+    setGitBranches(null);
+    await loadGitDir(repo, '', '');
+    await loadGitRepoInfo(repo);
+    loadGitStatus();   // cloned フラグを更新
+  }
+
+  async function openGitFile(filePath, line) {
+    setGitBusy(true);
+    setGitError('');
+    try {
+      const p = new URLSearchParams({ path: filePath, ref: gitRef || '' });
+      const data = await gitApi(`${gitRepoUrl(gitRepo, '/file')}?${p.toString()}`);
+      setGitFileView({ kind: 'file', title: filePath, path: filePath, ref: gitRef, line: line || null, ...data });
+    } catch (e) {
+      setGitError(e.message);
+    } finally {
+      setGitBusy(false);
+    }
+  }
+
+  async function runGitSearch() {
+    const q = gitSearchQuery.trim();
+    if (!q) { setGitSearchResults(null); return; }
+    setGitBusy(true);
+    setGitError('');
+    try {
+      const p = new URLSearchParams({ q, ref: gitRef || '' });
+      setGitSearchResults(await gitApi(`${gitRepoUrl(gitRepo, '/search')}?${p.toString()}`));
+    } catch (e) {
+      setGitError(e.message);
+    } finally {
+      setGitBusy(false);
+    }
+  }
+
+  async function loadGitLog() {
+    setGitBusy(true);
+    setGitError('');
+    try {
+      const p = new URLSearchParams({ ref: gitRef || '', limit: '30' });
+      setGitLog(await gitApi(`${gitRepoUrl(gitRepo, '/log')}?${p.toString()}`));
+    } catch (e) {
+      setGitError(e.message);
+    } finally {
+      setGitBusy(false);
+    }
+  }
+
+  async function showGitCommit(hash) {
+    setGitBusy(true);
+    setGitError('');
+    try {
+      const data = await gitApi(gitRepoUrl(gitRepo, `/commits/${encodeURIComponent(hash)}`));
+      setGitFileView({ kind: 'commit', title: `commit ${hash}`, content: data.content, truncated: data.truncated });
+    } catch (e) {
+      setGitError(e.message);
+    } finally {
+      setGitBusy(false);
+    }
+  }
+
+  async function showGitDiff() {
+    setGitBusy(true);
+    setGitError('');
+    try {
+      const data = await gitApi(gitRepoUrl(gitRepo, '/diff'));
+      const extra = data.untracked?.length ? `\n\n# 未追跡の新規ファイル\n${data.untracked.join('\n')}` : '';
+      setGitFileView({ kind: 'diff', title: '未コミットの変更', content: (data.content || '(差分なし)') + extra, truncated: data.truncated });
+    } catch (e) {
+      setGitError(e.message);
+    } finally {
+      setGitBusy(false);
+    }
+  }
+
+  // 更新系の操作の共通処理: 実行 → 通知 → 表示の更新
+  async function gitAction(fn, { refreshDir = true } = {}) {
+    setGitBusy(true);
+    setGitError('');
+    setGitNotice('');
+    try {
+      const msg = await fn();
+      if (msg) setGitNotice(msg);
+      await loadGitRepoInfo(gitRepo);
+      if (refreshDir) await loadGitDir(gitRepo, gitPath, gitRef);
+      loadGitStatus();
+    } catch (e) {
+      setGitError(e.message);
+    } finally {
+      setGitBusy(false);
+    }
+  }
+
+  const gitPull = () => gitAction(async () => {
+    const r = await gitPost(gitRepoUrl(gitRepo, '/pull'));
+    return `⬇️ ${r.message || '取得しました'}`;
+  });
+
+  async function importGitFile(filePath) {
+    setGitBusy(true);
+    setGitError('');
+    try {
+      const r = await gitPost(gitRepoUrl(gitRepo, '/import'), { path: filePath, ref: gitRef || '' });
+      setGitNotice(`⬇️ uploads/${r.path} に取り込みました (${formatBytes(r.size)})`);
+      loadFileList();
+    } catch (e) {
+      setGitError(e.message);
+    } finally {
+      setGitBusy(false);
+    }
+  }
+
+  function downloadGitFile(filePath) {
+    const p = new URLSearchParams({ path: filePath, ref: gitRef || '', raw: '1' });
+    const a = document.createElement('a');
+    a.href = `${gitRepoUrl(gitRepo, '/file')}?${p.toString()}`;
+    a.download = filePath.split('/').pop();
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+
+  const exportToGit = (uploadPath) => gitAction(async () => {
+    const dest = (gitPath ? `${gitPath}/` : '') + uploadPath.split('/').pop();
+    const r = await gitPost(gitRepoUrl(gitRepo, '/export'), { path: uploadPath, dest });
+    return `⬆️ uploads/${uploadPath} を ${r.path} にコピーしました (未コミット)`;
+  });
+
+  const commitGit = () => gitAction(async () => {
+    const message = gitCommitMsg.trim();
+    if (!message) throw new Error('コミットメッセージを入力してください');
+    const r = await gitPost(gitRepoUrl(gitRepo, '/commit'), { message });
+    if (!r.committed) return r.message;
+    setGitCommitMsg('');
+    return `✅ ${r.branch} にコミットしました: ${r.commit} (${r.files.length} ファイル)`;
+  });
+
+  const pushGit = () => {
+    const branch = gitRepoInfo?.branch || '';
+    if (!confirm(`ブランチ「${branch}」をリモート (${gitRepoInfo?.url || ''}) に push しますか？`)) return;
+    return gitAction(async () => {
+      const r = await gitPost(gitRepoUrl(gitRepo, '/push'), { branch });
+      return `🚀 ${r.branch} を push しました`;
+    }, { refreshDir: false });
+  };
+
+  const checkoutGit = (branch, create = false) => gitAction(async () => {
+    const r = await gitPost(gitRepoUrl(gitRepo, '/checkout'), { branch, create });
+    setGitRef('');
+    setGitPath('');
+    setGitNewBranch('');
+    return `🌿 ブランチ ${r.branch} に${r.created ? '作成して' : ''}切り替えました`;
+  });
+
+  async function addGitRepo() {
+    setGitBusy(true);
+    setGitError('');
+    try {
+      const f = gitAddForm;
+      const body = { name: f.name.trim() };
+      if (f.path.trim()) body.path = f.path.trim(); else body.url = f.url.trim();
+      for (const k of ['provider', 'branch', 'username', 'token']) if (f[k] && f[k].trim()) body[k] = f[k].trim();
+      const r = await gitPost('/git/repos', body);
+      setGitAddForm({ name: '', url: '', path: '', provider: '', branch: '', username: '', token: '' });
+      setGitAddOpen(false);
+      await loadGitStatus();
+      setGitNotice(`＋ リポジトリ「${r.repo.name}」を登録しました`);
+      openGitRepo(r.repo.name);
+    } catch (e) {
+      setGitError(e.message);
+    } finally {
+      setGitBusy(false);
+    }
+  }
+
+  async function removeGitRepo(name) {
+    if (!confirm(`リポジトリ「${name}」の登録を解除しますか？\n（サーバーに clone した作業コピーも削除します。未 push のコミットは失われます）`)) return;
+    setGitBusy(true);
+    setGitError('');
+    try {
+      await gitApi(`${gitRepoUrl(name)}?deleteClone=1`, { method: 'DELETE' });
+      const st = await loadGitStatus();
+      setGitNotice(`リポジトリ「${name}」の登録を解除しました`);
+      const next = st?.repos?.[0]?.name || '';
+      if (next) openGitRepo(next);
+      else { setGitRepo(''); setGitEntries([]); setGitRepoInfo(null); setGitBranches(null); }
+    } catch (e) {
+      setGitError(e.message);
+    } finally {
+      setGitBusy(false);
+    }
+  }
+
   // ─── 外部APIサーバー管理 ───
   async function loadExternalServers() {
     try {
-      const [r1, r2, r3, r4] = await Promise.all([
+      const [r1, r2, r3, r4, r5] = await Promise.all([
         fetch('/external-servers'),
         fetch('/external-servers/https-available'),
         fetch('/external-servers/embedding-available'),
         fetch('/external-servers/gdrive-available'),
+        fetch('/external-servers/git-available'),
       ]);
       if (r1.ok) {
         const data = await r1.json();
@@ -7860,6 +8285,12 @@ function App() {
         setApiGdriveReason(data.reason || '');
         // 利用不可ならツール選択から gdrive を自動的に外す
         if (!data.available) setApiFormTools(prev => prev.filter(t => t !== 'gdrive'));
+      }
+      if (r5 && r5.ok) {
+        const data = await r5.json();
+        setApiGitAvailable(!!data.available);
+        setApiGitReason(data.reason || '');
+        if (!data.available) setApiFormTools(prev => prev.filter(t => t !== 'git'));
       }
       return { embeddingAvailable };
     } catch {
@@ -8987,6 +9418,7 @@ function App() {
             persistentRag: persistentRagEnabled,          // 旧形式 (後方互換のため残す)
             persistentRagCategory,                        // 新形式: 'off'/'all'/''/カテゴリ名
             gdrive: gdriveEnabled,
+            git: gitEnabled,
             cloudLlm: cloudLlmEnabled,
           },
         }),
@@ -9020,6 +9452,7 @@ function App() {
       else if (tg.persistentRag !== undefined) setPersistentRagCategory(tg.persistentRag ? 'all' : 'off');
       else setPersistentRagCategory(dflt.persistentRagCategory);
       setGdriveEnabled(tg.gdrive !== undefined ? !!tg.gdrive : dflt.gdrive);
+      setGitEnabled(tg.git !== undefined ? !!tg.git : dflt.git);
       setCloudLlmEnabled(!!tg.cloudLlm);   // 課金が絡むので保存が無ければ OFF
       messagesDirtyRef.current = false;  // ロードしただけでは dirty にしない
     } finally {
@@ -9045,6 +9478,7 @@ function App() {
     setPersistentRagCategory(dflt.persistentRagCategory);
     setWebSearchEnabled(dflt.webSearch);
     setGdriveEnabled(dflt.gdrive);
+    setGitEnabled(dflt.git);
     messagesDirtyRef.current = false;  // 新規チャット時もクリア
   }
 
@@ -9101,6 +9535,8 @@ function App() {
     loadFileList();
     // Google Drive の接続状態 (ツール提供の可否判定に使う)
     loadGdriveStatus();
+    // Git の利用可否とリポジトリ一覧 (ツール提供の可否判定に使う)
+    loadGitStatus();
     // 外部LLM (有料API) の設定状態
     loadCloudLlmStatus();
     // 外部APIサーバー情報を取得 → embedding 可否を永続RAG判定に渡す (fetch重複回避)
@@ -9137,6 +9573,7 @@ function App() {
               setWebSearchEnabled(dflt.webSearch);
               setPersistentRagCategory(dflt.persistentRagCategory);
               setGdriveEnabled(dflt.gdrive);
+              setGitEnabled(dflt.git);
             }
           }
         } else if (cfg?.defaultModel) {
@@ -9242,6 +9679,7 @@ function App() {
       webSearch: webSearchEnabled,
       persistentRagCategory,
       gdrive: gdriveEnabled,
+      git: gitEnabled,
     };
     savedTogglesRef.current = toggles;
     const t = setTimeout(async () => {
@@ -9254,7 +9692,7 @@ function App() {
       } catch {}
     }, 500);
     return () => clearTimeout(t);
-  }, [chatModel, orchWorkflowId, webSearchEnabled, persistentRagCategory, gdriveEnabled]);
+  }, [chatModel, orchWorkflowId, webSearchEnabled, persistentRagCategory, gdriveEnabled, gitEnabled]);
 
   // chatModel変更時、llama-serverのチャットモデルをロード（リスタート）
   useEffect(() => {
@@ -9950,7 +10388,7 @@ function App() {
                         <div key={si} className="agent-search-item">
                           {/* 画像/音声生成はクエリ文に説明があるため、2行目のアイコンは省略（重複防止） */}
                           {sq.type !== 'image' && sq.type !== 'audio' && sq.type !== 'model3d' && (
-                            <span className="agent-search-icon">{sq.type === 'web' ? '🌐' : sq.type === 'file' ? '📁' : sq.type === 'data' ? '🗂️' : sq.type === 'gdrive' ? '☁️' : '🔍'}</span>
+                            <span className="agent-search-icon">{sq.type === 'web' ? '🌐' : sq.type === 'file' ? '📁' : sq.type === 'data' ? '🗂️' : sq.type === 'gdrive' ? '☁️' : sq.type === 'git' ? '🐙' : '🔍'}</span>
                           )}
                           <span className="agent-search-query">{sq.query}</span>
                           {sq.resultCount != null && (
@@ -10478,6 +10916,29 @@ function App() {
                     ☁️
                   </button>
                 )}
+                {/* Git: 設定で有効な時だけ出す。リポジトリ未登録ならクリックで Git パネルへ誘導 */}
+                {appConfig.git?.enabled && (
+                  <button
+                    className={`toolbar-btn git-toggle ${gitStatus?.available && gitEnabled ? 'active' : ''}`}
+                    title={
+                      !gitStatus?.available
+                        ? `Git: 利用不可（${gitStatus?.reason || 'クリックで Git パネルを開く'}）`
+                        : gitEnabled
+                          ? `Git: ON（クリックでOFF） / ${gitStatus.repos.map(r => r.name).join(', ')}`
+                          : 'Git: OFF（クリックでON）'
+                    }
+                    onClick={() => {
+                      if (!gitStatus?.available) {
+                        openGitPanel();
+                        return;
+                      }
+                      setGitEnabled(v => !v);
+                      messagesDirtyRef.current = true;
+                    }}
+                  >
+                    🐙
+                  </button>
+                )}
                 {/* 外部LLM (有料API): 設定で有効な時だけ出す。ON の間は最終回答を外部LLMが書く
                     (ツール判断・検索・Python はローカルのまま)。未設定ならクリックで理由を表示 */}
                 {appConfig.cloudLlm?.enabled && (
@@ -10537,6 +10998,7 @@ function App() {
             {rightPanelTab === 'gpu' && <>{gpuData.some(g => g.gpus?.length > 0) && <span className="gpu-live-dot" />} GPU モニター</>}
             {rightPanelTab === 'files' && <>📁 サーバーファイル</>}
             {rightPanelTab === 'gdrive' && <>☁️ GDrive</>}
+            {rightPanelTab === 'git' && <>🐙 Git</>}
             {rightPanelTab === 'api' && <>🌐 外部APIサーバー</>}
           </div>
           <button className="clear-btn" onClick={() => setGpuPanelOpen(false)}>✕</button>
@@ -10560,6 +11022,14 @@ function App() {
                 }}
               >
                 ☁️ GDrive
+              </button>
+            )}
+            {appConfig.git?.enabled && (
+              <button
+                className={`right-panel-tab ${rightPanelTab === 'git' ? 'active' : ''}`}
+                onClick={openGitPanel}
+              >
+                🐙 Git
               </button>
             )}
             <button className={`right-panel-tab ${rightPanelTab === 'api' ? 'active' : ''}`} onClick={() => { setRightPanelTab('api'); loadExternalServers(); }}>
@@ -10949,6 +11419,347 @@ function App() {
             </div>
           )}
 
+          {rightPanelTab === 'git' && (() => {
+            const repos = gitStatus?.repos || [];
+            const cur = repos.find(r => r.name === gitRepo) || null;
+            const info = gitRepoInfo && gitRepoInfo.repo === gitRepo ? gitRepoInfo : null;
+            const crumbs = gitPath ? gitPath.split('/') : [];
+            const refOptions = gitBranches ? [
+              ...gitBranches.local.map(b => ({ v: b.name, label: `🌿 ${b.name}${b.current ? ' (現在)' : ''}` })),
+              ...gitBranches.remote.map(b => ({ v: b.name, label: `☁️ ${b.name}` })),
+              ...gitBranches.tags.map(t => ({ v: t.name, label: `🏷️ ${t.name}` })),
+            ] : [];
+            return (
+            <div className="gdrive-panel-body git-panel-body">
+              {/* ── 状態 ── */}
+              <div className="gdrive-status-card">
+                <div className="gdrive-status-row">
+                  <span className={`gdrive-status-dot ${gitStatus?.available ? 'ok' : 'ng'}`} />
+                  <span className="gdrive-status-text">
+                    {gitStatus?.available ? `${repos.length} リポジトリ` : '利用不可'}
+                    {gitStatus?.gitVersion && <span className="git-version"> · {gitStatus.gitVersion.replace(/^git version /, 'git ')}</span>}
+                  </span>
+                  <span className={`gdrive-mode-badge ${gitStatus?.allowWrite ? 'rw' : 'ro'}`}>
+                    {gitStatus?.allowPush ? '読み書き・push 可' : gitStatus?.allowWrite ? '読み書き可' : '読み取り専用'}
+                  </span>
+                </div>
+                {!gitStatus?.available && gitStatus?.reason && (
+                  <div className="gdrive-status-hint">{gitStatus.reason}</div>
+                )}
+                {repos.length > 0 && (
+                  <div className="gdrive-search-row">
+                    <select
+                      className="gdrive-upload-select git-repo-select"
+                      value={gitRepo}
+                      disabled={gitBusy || gitLoading}
+                      onChange={e => openGitRepo(e.target.value)}
+                    >
+                      {!gitRepo && <option value="">-- リポジトリを選択 --</option>}
+                      {repos.map(r => (
+                        <option key={r.name} value={r.name}>
+                          {r.name} [{r.provider}]{r.cloned ? '' : ' (未取得)'}
+                        </option>
+                      ))}
+                    </select>
+                    {cur?.kind === 'url' && (
+                      <button className="gdrive-btn" disabled={gitBusy || !gitRepo} onClick={gitPull} title="リモートから取得 (未取得なら clone、以降は fetch + fast-forward)">
+                        ⬇️ pull
+                      </button>
+                    )}
+                    <button className="gdrive-btn" disabled={gitBusy || !gitRepo} onClick={() => { loadGitRepoInfo(gitRepo); loadGitDir(gitRepo, gitPath, gitRef); }} title="表示を更新">🔄</button>
+                  </div>
+                )}
+                {cur && (
+                  <div className="gdrive-status-hint git-repo-meta">
+                    <div className="git-repo-url" title={cur.url || cur.path}>{cur.url || cur.path}</div>
+                    {info && (
+                      <div>
+                        🌿 {info.branch || '(detached)'}
+                        {info.hasUpstream && ` · ↑${info.ahead} ↓${info.behind}`}
+                        {info.head && ` · ${info.head.hash.slice(0, 7)} ${info.head.subject}`}
+                        {!info.clean && <> · <a href="#" onClick={e => { e.preventDefault(); showGitDiff(); }}>未コミット {info.changeCount} 件</a></>}
+                      </div>
+                    )}
+                    {cur.description && <div>{cur.description}</div>}
+                    <div>
+                      {cur.canPush ? '読み書き・push 可' : cur.canWrite ? '読み書き可 (push 不可)' : '読み取り専用'}
+                      {cur.hasToken && ' · 🔑 トークン設定済み'}
+                      {cur.source === 'user' && gitStatus?.allowAddRepo && (
+                        <> · <a href="#" onClick={e => { e.preventDefault(); removeGitRepo(cur.name); }}>登録解除</a></>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {gitStatus?.allowAddRepo && (
+                  <div className="gdrive-status-actions">
+                    <button className="gdrive-btn" disabled={gitBusy} onClick={() => setGitAddOpen(v => !v)}>
+                      {gitAddOpen ? '✕ 閉じる' : '＋ リポジトリを追加'}
+                    </button>
+                  </div>
+                )}
+                {gitAddOpen && (
+                  <div className="git-add-form">
+                    <input className="gdrive-search-input" placeholder="名前 (英数字 . _ -)" value={gitAddForm.name}
+                      onChange={e => setGitAddForm(f => ({ ...f, name: e.target.value }))} />
+                    <input className="gdrive-search-input" placeholder="URL (https://github.com/owner/repo.git / git@host:owner/repo.git)" value={gitAddForm.url}
+                      disabled={!!gitAddForm.path} onChange={e => setGitAddForm(f => ({ ...f, url: e.target.value }))} />
+                    <input className="gdrive-search-input" placeholder="または サーバー上のローカルリポジトリのパス" value={gitAddForm.path}
+                      disabled={!!gitAddForm.url} onChange={e => setGitAddForm(f => ({ ...f, path: e.target.value }))} />
+                    <div className="gdrive-search-row">
+                      <select className="gdrive-upload-select" value={gitAddForm.provider} onChange={e => setGitAddForm(f => ({ ...f, provider: e.target.value }))}>
+                        <option value="">種類 (自動判定)</option>
+                        <option value="github">GitHub</option>
+                        <option value="gitea">Gitea / Forgejo</option>
+                        <option value="gitlab">GitLab</option>
+                        <option value="bitbucket">Bitbucket</option>
+                        <option value="local">ローカル</option>
+                        <option value="generic">その他</option>
+                      </select>
+                      <input className="gdrive-search-input" placeholder="ブランチ (省略可)" value={gitAddForm.branch}
+                        onChange={e => setGitAddForm(f => ({ ...f, branch: e.target.value }))} />
+                    </div>
+                    {!gitAddForm.path && (
+                      <div className="gdrive-search-row">
+                        <input className="gdrive-search-input" placeholder="ユーザー名 (省略可)" value={gitAddForm.username} autoComplete="off"
+                          onChange={e => setGitAddForm(f => ({ ...f, username: e.target.value }))} />
+                        <input className="gdrive-search-input" type="password" placeholder="アクセストークン (非公開なら)" value={gitAddForm.token} autoComplete="new-password"
+                          onChange={e => setGitAddForm(f => ({ ...f, token: e.target.value }))} />
+                      </div>
+                    )}
+                    <div className="gdrive-status-hint">
+                      トークンはサーバーの {'git_repos.json'} (chmod 600) に保存され、ブラウザや LLM には返りません。
+                      GitHub は Fine-grained PAT (Contents: Read{gitStatus?.allowWrite ? ' and write' : ''})、Gitea はアクセストークン (repository 権限) を使ってください。
+                    </div>
+                    <button className="gdrive-btn primary" disabled={gitBusy || !gitAddForm.name.trim() || !(gitAddForm.url.trim() || gitAddForm.path.trim())} onClick={addGitRepo}>
+                      登録する
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {gitError && <div className="gdrive-error">{gitError}</div>}
+              {gitNotice && <div className="git-notice">{gitNotice}</div>}
+
+              {cur && (
+                <>
+                  {/* ── 閲覧する ref と検索 ── */}
+                  <div className="gdrive-search-row">
+                    <select
+                      className="gdrive-upload-select"
+                      value={gitRef}
+                      disabled={gitBusy || gitLoading}
+                      onChange={e => { const v = e.target.value; setGitRef(v); setGitFileView(null); setGitSearchResults(null); setGitLog(null); loadGitDir(gitRepo, '', v); }}
+                      title="閲覧するブランチ・タグ (作業コピー = 未コミットの変更を含む現在の内容)"
+                    >
+                      <option value="">📝 作業コピー</option>
+                      {refOptions.map(o => <option key={o.v} value={o.v}>{o.label}</option>)}
+                    </select>
+                    <button className="gdrive-btn" disabled={gitBusy} onClick={() => (gitLog ? setGitLog(null) : loadGitLog())}>
+                      🕘 履歴
+                    </button>
+                  </div>
+                  <div className="gdrive-search-row">
+                    <input
+                      className="gdrive-search-input"
+                      placeholder="リポジトリ内を検索（中身・ファイル名）"
+                      value={gitSearchQuery}
+                      onChange={e => setGitSearchQuery(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter') runGitSearch(); }}
+                    />
+                    <button className="gdrive-btn" disabled={gitBusy} onClick={runGitSearch}>🔍</button>
+                    {gitSearchResults && (
+                      <button className="gdrive-btn" onClick={() => { setGitSearchQuery(''); setGitSearchResults(null); }}>✕</button>
+                    )}
+                  </div>
+
+                  {/* ── ファイル/コミット/差分の表示 ── */}
+                  {gitFileView && (
+                    <div className="git-file-view">
+                      <div className="git-file-view-header">
+                        <span className="git-file-view-title" title={gitFileView.title}>
+                          {gitFileView.kind === 'file' ? '📄' : gitFileView.kind === 'commit' ? '🧾' : '±'} {gitFileView.title}
+                          {gitFileView.line ? ` :${gitFileView.line}` : ''}
+                        </span>
+                        {gitFileView.kind === 'file' && (
+                          <>
+                            <button className="gdrive-icon-btn" disabled={gitBusy} title="サーバー (uploads) に取り込む" onClick={() => importGitFile(gitFileView.path)}>⬇️</button>
+                            <button className="gdrive-icon-btn" title="ダウンロード" onClick={() => downloadGitFile(gitFileView.path)}>💾</button>
+                          </>
+                        )}
+                        <button className="gdrive-icon-btn" title="閉じる" onClick={() => setGitFileView(null)}>✕</button>
+                      </div>
+                      {gitFileView.binary
+                        ? <div className="gdrive-status-hint">バイナリファイルです ({formatBytes(gitFileView.size)})。⬇️ で uploads に取り込むか 💾 でダウンロードしてください。</div>
+                        : <pre className="git-file-content">{gitFileView.content}{gitFileView.truncated ? '\n… (長いので途中まで)' : ''}</pre>}
+                    </div>
+                  )}
+
+                  {/* ── 検索結果 ── */}
+                  {gitSearchResults && (
+                    <div className="git-list">
+                      <div className="gdrive-section-title">
+                        「{gitSearchResults.query}」 {gitSearchResults.total} 件{gitSearchResults.truncated ? ` (先頭 ${gitSearchResults.hits.length} 件)` : ''}
+                      </div>
+                      {gitSearchResults.fileNameHits?.map(f => (
+                        <div key={`n-${f}`} className="git-list-item" onClick={() => openGitFile(f)}>📄 {f}</div>
+                      ))}
+                      {gitSearchResults.hits.map((h, i) => (
+                        <div key={`h-${i}`} className="git-list-item" onClick={() => openGitFile(h.path, h.line)} title={h.text}>
+                          <span className="git-list-path">{h.path}:{h.line}</span> {h.text}
+                        </div>
+                      ))}
+                      {gitSearchResults.hits.length === 0 && !gitSearchResults.fileNameHits?.length && (
+                        <div className="gdrive-status-hint">見つかりませんでした</div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* ── 履歴 ── */}
+                  {gitLog && (
+                    <div className="git-list">
+                      <div className="gdrive-section-title">コミット履歴 ({gitLog.ref})</div>
+                      {gitLog.commits.map(c => (
+                        <div key={c.hash} className="git-list-item" onClick={() => showGitCommit(c.short)} title={`${c.author} <${c.email}>\n${c.date}`}>
+                          <span className="git-list-path">{c.short}</span> {c.subject}
+                          <span className="git-list-meta"> — {c.author}, {new Date(c.date).toLocaleDateString('ja-JP')}</span>
+                        </div>
+                      ))}
+                      {gitLog.commits.length === 0 && <div className="gdrive-status-hint">コミットはありません</div>}
+                    </div>
+                  )}
+
+                  {/* ── パンくず ── */}
+                  <div className="gdrive-breadcrumb">
+                    <button className={`gdrive-breadcrumb-item ${crumbs.length === 0 ? 'current' : ''}`} onClick={() => loadGitDir(gitRepo, '', gitRef)}>
+                      {gitRepo}
+                    </button>
+                    {crumbs.map((c, i) => (
+                      <React.Fragment key={`${c}-${i}`}>
+                        <span className="gdrive-breadcrumb-sep">/</span>
+                        <button
+                          className={`gdrive-breadcrumb-item ${i === crumbs.length - 1 ? 'current' : ''}`}
+                          onClick={() => loadGitDir(gitRepo, crumbs.slice(0, i + 1).join('/'), gitRef)}
+                        >
+                          {c}
+                        </button>
+                      </React.Fragment>
+                    ))}
+                  </div>
+
+                  {/* ── ファイル一覧 ── */}
+                  {gitLoading ? (
+                    <div className="gdrive-loading">読み込み中...{cur.cloned ? '' : ' (初回は clone するので時間がかかります)'}</div>
+                  ) : gitEntries.length === 0 ? (
+                    <div className="files-empty">
+                      <div className="docs-empty-icon">🐙</div>
+                      <div>ファイルがありません</div>
+                    </div>
+                  ) : (
+                    gitEntries.map(f => {
+                      const name = f.path.split('/').pop();
+                      return (
+                        <div key={f.path} className="gdrive-file-item">
+                          <div
+                            className="gdrive-file-main"
+                            onClick={() => (f.type === 'dir' ? loadGitDir(gitRepo, f.path, gitRef) : openGitFile(f.path))}
+                            title={f.path}
+                            style={{ cursor: 'pointer' }}
+                          >
+                            <span className="gdrive-file-icon">{f.type === 'dir' ? '📁' : '📄'}</span>
+                            <div className="gdrive-file-info">
+                              <div className="gdrive-file-name">{name}</div>
+                              <div className="gdrive-file-meta">{f.type === 'dir' ? 'フォルダ' : (f.size != null ? formatBytes(f.size) : '—')}</div>
+                            </div>
+                          </div>
+                          {f.type !== 'dir' && (
+                            <div className="gdrive-file-actions">
+                              <button className="gdrive-icon-btn" disabled={gitBusy} title="サーバー (uploads) に取り込む" onClick={() => importGitFile(f.path)}>⬇️</button>
+                              <button className="gdrive-icon-btn" title="ダウンロード" onClick={() => downloadGitFile(f.path)}>💾</button>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })
+                  )}
+
+                  {/* ── 変更・コミット・push (書き込み許可時) ── */}
+                  {cur.canWrite && (
+                    <div className="gdrive-upload-section">
+                      <div className="gdrive-section-title">変更をコミット</div>
+                      {info && !info.clean && (
+                        <div className="git-list">
+                          {info.changes.slice(0, 30).map(c => (
+                            <div key={c.path} className="git-list-item" onClick={() => openGitFile(c.path)}>
+                              <span className="git-list-path">{c.status}</span> {c.path}
+                            </div>
+                          ))}
+                          {info.changeCount > 30 && <div className="gdrive-status-hint">ほか {info.changeCount - 30} 件</div>}
+                        </div>
+                      )}
+                      {info?.clean && <div className="gdrive-status-hint">未コミットの変更はありません</div>}
+                      {fileList.length > 0 && (
+                        <select
+                          className="gdrive-upload-select"
+                          defaultValue=""
+                          disabled={gitBusy}
+                          onChange={e => { const v = e.target.value; e.target.value = ''; if (v) exportToGit(v); }}
+                          title="サーバーの uploads のファイルを、表示中のフォルダにコピーする (コミットはしない)"
+                        >
+                          <option value="">-- uploads のファイルをこのフォルダにコピー --</option>
+                          {fileList.map(f => (
+                            <option key={f.path} value={f.path}>{f.path} ({formatBytes(f.size)})</option>
+                          ))}
+                        </select>
+                      )}
+                      <div className="gdrive-search-row">
+                        <input
+                          className="gdrive-search-input"
+                          placeholder="コミットメッセージ"
+                          value={gitCommitMsg}
+                          onChange={e => setGitCommitMsg(e.target.value)}
+                          onKeyDown={e => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) commitGit(); }}
+                        />
+                        <button className="gdrive-btn primary" disabled={gitBusy || !gitCommitMsg.trim() || (info && info.clean)} onClick={commitGit}>✅ コミット</button>
+                      </div>
+                      <div className="gdrive-search-row">
+                        <input
+                          className="gdrive-search-input"
+                          placeholder="新しいブランチ名"
+                          value={gitNewBranch}
+                          onChange={e => setGitNewBranch(e.target.value)}
+                        />
+                        <button className="gdrive-btn" disabled={gitBusy || !gitNewBranch.trim()} onClick={() => checkoutGit(gitNewBranch.trim(), true)}>🌿 作成</button>
+                        {gitBranches && gitBranches.local.length > 1 && (
+                          <select
+                            className="gdrive-upload-select"
+                            value=""
+                            disabled={gitBusy}
+                            onChange={e => { const v = e.target.value; if (v) checkoutGit(v); }}
+                            title="ブランチを切り替える"
+                          >
+                            <option value="">切替…</option>
+                            {gitBranches.local.filter(b => !b.current).map(b => <option key={b.name} value={b.name}>{b.name}</option>)}
+                          </select>
+                        )}
+                      </div>
+                      {cur.canPush && (
+                        <button
+                          className="gdrive-btn primary"
+                          disabled={gitBusy || !info?.branch || (info.hasUpstream && info.ahead === 0)}
+                          onClick={pushGit}
+                          title={info?.hasUpstream ? `リモートより ${info.ahead} 件先行` : 'リモートにまだ無いブランチ (push すると作成されます)'}
+                        >
+                          🚀 push{info?.hasUpstream ? ` (${info.ahead} 件)` : ''}
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+            );
+          })()}
+
           {rightPanelTab === 'api' && (
             <div className="api-panel-body">
               <div className="api-section">
@@ -11040,6 +11851,12 @@ function App() {
                           warnLabel: 'GDrive未接続のため利用不可',
                         },
                         {
+                          id: 'git',
+                          disabled: !apiGitAvailable,
+                          disabledReason: apiGitReason,
+                          warnLabel: 'Git が無効、またはリポジトリ未登録のため利用不可',
+                        },
+                        {
                           id: 'image',
                           disabled: !(appConfig.imageGen && (appConfig.imageModels || []).length > 0),
                           disabledReason: 'config.json の imageGen が無効、または imageModels が未定義',
@@ -11084,7 +11901,7 @@ function App() {
                         <span>💬 Webチャットのシステムプロンプトを付ける</span>
                       </label>
                       <span className="api-form-hint" style={{ marginTop: -2 }}>
-                        config.json の systemPrompts (base / Web検索 / GDrive / meta) を先頭に自動で付けます。
+                        config.json の systemPrompts (base / Web検索 / GDrive / Git / meta) を先頭に自動で付けます。
                         クライアントが system を送った場合はその後ろにつなげます (クライアントの指示が優先)。
                         OFF の場合はクライアントが送った messages をそのまま使います。
                       </span>

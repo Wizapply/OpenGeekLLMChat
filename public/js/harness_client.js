@@ -55,6 +55,24 @@
     gdrive_upload_from_server:   { readOnly: false },
     gdrive_create_folder:        { readOnly: false },
     gdrive_delete_file:          { readOnly: false, dangerous: true },
+    // Git (サーバー側 system/git/git_repo.js の GIT_TOOL_META と揃える)
+    git_list_repos:              { readOnly: true },
+    git_status:                  { readOnly: true },
+    git_list_files:              { readOnly: true },
+    git_read_file:               { readOnly: true, untrusted: true },
+    git_search:                  { readOnly: true, untrusted: true },
+    git_log:                     { readOnly: true, untrusted: true },
+    git_show_commit:             { readOnly: true, untrusted: true },
+    git_diff:                    { readOnly: true, untrusted: true },
+    git_list_branches:           { readOnly: true },
+    git_pull:                    { readOnly: false },  // 作業コピーを更新する
+    git_import_to_server:        { readOnly: false },  // uploads にファイルを書く
+    git_write_file:              { readOnly: false },
+    git_export_from_server:      { readOnly: false },
+    git_checkout:                { readOnly: false },
+    git_commit:                  { readOnly: false },
+    git_delete_file:             { readOnly: false, dangerous: true },
+    git_push:                    { readOnly: false, dangerous: true },  // 外部に公開される
   };
 
   const REMINDER_UNTRUSTED =

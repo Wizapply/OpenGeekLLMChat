@@ -7,7 +7,8 @@
  * /v1/chat/completions を受けてエージェントループ (ツール判断→実行→最終応答) を回す。
  *
  * 対応ツール: ml_* (5), rl_* (6), web_search, read_file, list_files,
- *             search_documents(簡易RAG), gdrive_* (Google Drive)
+ *             search_documents(簡易RAG), gdrive_* (Google Drive),
+ *             git_* (GitHub / Gitea / GitLab / ローカル git。定義と実行は system/git/git_repo.js)
  * 非対応: generate_image ツール, python実行 (セキュリティ・複雑性のため外部公開しない)
  * 画像生成はツールではなく OpenAI 互換の POST /v1/images/generations として、
  * tools に 'image' を指定した時だけ公開する (LLM が勝手に生成することはない)。
@@ -30,6 +31,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { createHarness, neutralHarnessConfig, HARNESS_VERSION } = require('./harness');
+const { GIT_TOOL_META } = require('../git/git_repo');
 
 /**
  * ツール対応エージェントサーバーを起動
@@ -701,6 +703,12 @@ function buildToolDefs(enabledTools, appConfig, deps = {}) {
     }
   }
 
+  // ─── Git (GitHub / Gitea / ローカル git) ───
+  // 定義は git_repo.js が設定 (読み取り専用 / 書き込み / push 許可) に応じて組み立てる
+  if (enabledTools.includes('git') && deps.gitRepos) {
+    try { tools.push(...deps.gitRepos.buildToolDefs()); } catch {}
+  }
+
   if (enabledTools.includes('rag')) {
     tools.push({
       type: 'function',
@@ -732,6 +740,7 @@ function buildChatSystemPrompt(enabledTools, appConfig) {
   const parts = [(sp.base || '').replace(/\{date\}/g, dateStr)];
   if (enabledTools.includes('web_search') && sp.webSearch) parts.push(sp.webSearch);
   if (enabledTools.includes('gdrive') && sp.googleDrive) parts.push(sp.googleDrive);
+  if (enabledTools.includes('git') && sp.git) parts.push(sp.git);
   if (sp.meta) parts.push(sp.meta);
   return parts.filter(t => t && t.trim()).join('\n\n');
 }
@@ -785,6 +794,10 @@ const TOOL_META = {
   gdrive_upload_from_server:   { readOnly: false },
   gdrive_create_folder:        { readOnly: false },
   gdrive_delete_file:          { readOnly: false, dangerous: true },
+  // git_* (git_read_file 等) は git_repo.js の GIT_TOOL_META を使う
+  ...Object.fromEntries(Object.entries(GIT_TOOL_META).map(([k, v]) => [k, {
+    readOnly: v.readOnly, dangerous: v.dangerous, untrustedOutput: v.untrustedOutput,
+  }])),
 };
 
 /**
@@ -845,6 +858,13 @@ async function executeTool(fnName, fnArgs, deps, ip) {
     searchDocumentsSimple,
     gdrive, gdriveImportToServer, gdriveUploadFromServer,
   } = deps;
+
+  // ─── Git ───
+  // 定義と同じく git_repo.js に任せる (uploads との受け渡しは server.js の gitToolContext)
+  if (typeof fnName === 'string' && fnName.startsWith('git_')) {
+    if (!deps.gitRepos) throw new Error('Git 連携が利用できません');
+    return await deps.gitRepos.executeTool(fnName, fnArgs, deps.gitToolContext ? deps.gitToolContext(ip) : { ip });
+  }
 
   // Google Drive ツールの共通ガード
   const needGdrive = () => {
